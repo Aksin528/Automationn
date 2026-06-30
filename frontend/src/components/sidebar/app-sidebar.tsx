@@ -6,6 +6,7 @@ import {
   BoxIcon,
   ChevronDown,
   KeyRound,
+  LayoutDashboardIcon,
   LayersIcon,
   ListChecksIcon,
   ListVideoIcon,
@@ -69,7 +70,6 @@ type NavItem = {
   icon: LucideIcon
   isActive?: boolean
   isLocked?: boolean
-  isPendingEntitlement?: boolean
   onSelect?: () => void
   locked?: boolean
   visible?: boolean
@@ -131,14 +131,9 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     canExecuteAgents === true ||
     canViewServiceAccounts === true ||
     canViewInbox === true
-  const {
-    hasEntitlement,
-    hasEntitlementData,
-    isLoading: entitlementsIsLoading,
-  } = useEntitlements({
+  const { hasEntitlement, isLoading: entitlementsIsLoading } = useEntitlements({
     enabled: shouldLoadEntitlements,
   })
-  const entitlementsKnown = !entitlementsIsLoading && hasEntitlementData
   const agentAddonsEnabled = hasEntitlement("agent_addons")
   const workspaceChatEnabled = hasEntitlement("workspace_chat")
   const serviceAccountsEnabled = hasEntitlement("service_accounts")
@@ -159,12 +154,10 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         tag: "Beta",
         isActive: pathname?.startsWith(`${basePath}/chat`),
         visible: canAccessMissionControl,
-        isLocked: entitlementsKnown && !workspaceChatEnabled,
-        isPendingEntitlement: !entitlementsKnown,
-        onSelect:
-          entitlementsKnown && !workspaceChatEnabled
-            ? () => setLockedFeatureDialogOpen(true)
-            : undefined,
+        isLocked: entitlementsIsLoading || !workspaceChatEnabled,
+        onSelect: entitlementsIsLoading
+          ? undefined
+          : () => setLockedFeatureDialogOpen(true),
       },
       {
         title: "Workflows",
@@ -186,12 +179,10 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         icon: MousePointerClickIcon,
         isActive: pathname?.startsWith(`${basePath}/agents`),
         visible: canViewAgents === true,
-        isLocked: entitlementsKnown && !agentAddonsEnabled,
-        isPendingEntitlement: !entitlementsKnown,
-        onSelect:
-          entitlementsKnown && !agentAddonsEnabled
-            ? () => setLockedFeatureDialogOpen(true)
-            : undefined,
+        isLocked: entitlementsIsLoading || !agentAddonsEnabled,
+        onSelect: entitlementsIsLoading
+          ? undefined
+          : () => setLockedFeatureDialogOpen(true),
       },
       {
         title: "Tables",
@@ -233,12 +224,10 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         url: `${basePath}/skills`,
         icon: Pyramid,
         isActive: pathname?.startsWith(`${basePath}/skills`),
-        isLocked: entitlementsKnown && !agentAddonsEnabled,
-        isPendingEntitlement: !entitlementsKnown,
-        onSelect:
-          entitlementsKnown && !agentAddonsEnabled
-            ? () => setLockedFeatureDialogOpen(true)
-            : undefined,
+        isLocked: entitlementsIsLoading || !agentAddonsEnabled,
+        onSelect: entitlementsIsLoading
+          ? undefined
+          : () => setLockedFeatureDialogOpen(true),
         visible: canViewAgents === true,
       },
       {
@@ -259,7 +248,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       canViewVariables,
       canViewSecrets,
       canViewIntegrations,
-      entitlementsKnown,
+      entitlementsIsLoading,
       agentAddonsEnabled,
       workspaceChatEnabled,
       canViewAgents,
@@ -276,7 +265,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       visible: canViewWorkflows === true,
     },
     {
-      title: "Inbox",
+      title: "Approvals",
       url: `${basePath}/inbox`,
       icon: ListChecksIcon,
       isActive: pathname?.startsWith(`${basePath}/inbox`),
@@ -346,20 +335,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                               <item.icon />
                               <span>{item.title}</span>
                               <LockedFeatureChip className="ml-auto shrink-0" />
-                            </SidebarMenuButton>
-                          ) : item.isPendingEntitlement ? (
-                            <SidebarMenuButton
-                              type="button"
-                              isActive={item.isActive}
-                              disabled
-                            >
-                              <item.icon />
-                              <span>{item.title}</span>
-                              {item.tag ? (
-                                <span className="ml-auto shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium leading-none text-muted-foreground">
-                                  {item.tag}
-                                </span>
-                              ) : null}
                             </SidebarMenuButton>
                           ) : (
                             <SidebarMenuButton asChild isActive={item.isActive}>
@@ -433,6 +408,34 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
             </SidebarGroup>
           </Collapsible>
         )}
+        <Collapsible defaultOpen className="group/collapsible">
+          <SidebarGroup>
+            <SidebarGroupLabel asChild>
+              <CollapsibleTrigger className="w-full">
+                Analytics
+                <ChevronDown className="ml-auto size-4 transition-transform group-data-[state=open]/collapsible:rotate-180" />
+              </CollapsibleTrigger>
+            </SidebarGroupLabel>
+            <CollapsibleContent>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton asChild>
+                      <a
+                        href={`${typeof window !== "undefined" ? `${window.location.protocol}//${window.location.hostname}:3001` : "http://localhost:3001"}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <LayoutDashboardIcon />
+                        <span>Dashboard</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </CollapsibleContent>
+          </SidebarGroup>
+        </Collapsible>
       </SidebarContent>
       <SidebarFooter>
         <SidebarUserNav
