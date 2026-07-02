@@ -580,6 +580,24 @@ class AgentManagementService(BaseOrgService):
             runtime_credentials,
         )
 
+    async def resolve_catalog_id(
+        self, model_provider: str, model_name: str
+    ) -> uuid.UUID | None:
+        """Find catalog_id by model_provider + model_name when preset has no catalog_id."""
+        stmt = (
+            select(AgentCatalog.id)
+            .where(
+                AgentCatalog.model_provider == model_provider,
+                AgentCatalog.model_name == model_name,
+                sa.or_(
+                    AgentCatalog.organization_id.is_(None),
+                    AgentCatalog.organization_id == self.organization_id,
+                ),
+            )
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def get_catalog_credentials(
         self, catalog_id: uuid.UUID
     ) -> dict[str, str] | None:
