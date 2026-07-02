@@ -158,7 +158,7 @@ async def run_agent_endpoint(
             await check_entitlement(session, role, Entitlement.AGENT_ADDONS)
 
         async with _provider_secrets_context(
-            agent_svc, config.model_provider, config.catalog_id
+            agent_svc, config.model_provider, config.catalog_id, config.model_name
         ):
             result: AgentOutput = await runtime_run_agent(
                 user_prompt=params.user_prompt,
