@@ -1,0 +1,62 @@
+services:
+  api:
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+    volumes:
+      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
+      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+    entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
+    command: ["python3", "-m", "uvicorn", "tracecat.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  worker:
+    volumes:
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+
+  executor:
+    volumes:
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+
+  agent-executor:
+    volumes:
+      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
+      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+    entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
+
+  agent-worker:
+    volumes:
+      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
+      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+    entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
+
+  litellm:
+    environment:
+      GROQ_API_KEY: "${GROQ_API_KEY}"
+    volumes:
+      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
+      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
+      - /home/kali/Desktop/SOC/tracecat/tracecat/agent/litellm_config.yaml:/app/tracecat/agent/litellm_config.yaml:ro
+      - /home/kali/Desktop/SOC/tracecat/tracecat/agent/gateway.py:/app/tracecat/agent/gateway.py:ro
+    entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
+
+  soc-mcp:
+    image: soc-mcp
+    environment:
+      SPLUNK_BASE_URL: "${SPLUNK_BASE_URL}"
+      SPLUNK_TOKEN: "${SPLUNK_TOKEN}"
+      SPLUNK_VERIFY_SSL: "${SPLUNK_VERIFY_SSL}"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8100"
+    ports:
+      - "8100:8100"
+    networks:
+      - core
+    restart: unless-stopped
