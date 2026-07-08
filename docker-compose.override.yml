@@ -4,47 +4,49 @@ services:
       HOST: "0.0.0.0"
       PORT: "8000"
     volumes:
-      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
-      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+      - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./ca_wrapper.sh:/ca_wrapper.sh:ro
+      - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
     entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
     command: ["python3", "-m", "uvicorn", "tracecat.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
 
   worker:
     volumes:
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
 
   executor:
     volumes:
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
 
   agent-executor:
     volumes:
-      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
-      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+      - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./ca_wrapper.sh:/ca_wrapper.sh:ro
+      - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+      - ./tracecat/agent/sandbox/llm_proxy.py:/app/tracecat/agent/sandbox/llm_proxy.py:ro
     entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
 
   agent-worker:
     volumes:
-      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
-      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/tracecat/tiers/defaults.py:ro
-      - /home/kali/Desktop/SOC/tracecat/defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+      - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./ca_wrapper.sh:/ca_wrapper.sh:ro
+      - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+      - ./tracecat/agent/sandbox/llm_proxy.py:/app/tracecat/agent/sandbox/llm_proxy.py:ro
     entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
 
   litellm:
     environment:
       GROQ_API_KEY: "${GROQ_API_KEY}"
     volumes:
-      - /home/kali/Desktop/certnew.cer:/tmp/dgk_ca.pem:ro
-      - /home/kali/Desktop/SOC/tracecat/ca_wrapper.sh:/ca_wrapper.sh:ro
-      - /home/kali/Desktop/SOC/tracecat/tracecat/agent/litellm_config.yaml:/app/tracecat/agent/litellm_config.yaml:ro
-      - /home/kali/Desktop/SOC/tracecat/tracecat/agent/gateway.py:/app/tracecat/agent/gateway.py:ro
+      - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./ca_wrapper.sh:/ca_wrapper.sh:ro
+      - ./tracecat/agent/litellm_config.yaml:/app/tracecat/agent/litellm_config.yaml:ro
+      - ./tracecat/agent/gateway.py:/app/tracecat/agent/gateway.py:ro
     entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
 
   soc-mcp:
