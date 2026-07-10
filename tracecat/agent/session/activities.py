@@ -1,0 +1,428 @@
+"""Temporal activities for agent session management.
+
+These activities handle:
+- Loading session history from DB for runtime resume
+- Persisting session history from runtime for durability (atomic with chat messages)
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+from pydantic import BaseModel, Field
+from temporalio import activity
+from temporalio.exceptions import ApplicationError
+
+from tracecat.agent.common.stream_types import HarnessType, UnifiedStreamEvent
+from tracecat.agent.executor.schemas import ToolExecutionResult
+from tracecat.agent.session.schemas import AgentSessionCreate
+from tracecat.agent.session.service import AgentSessionService
+from tracecat.agent.session.types import AgentSessionEntity
+from tracecat.agent.stream.artifacts import artifact_stream_event
+from tracecat.agent.stream.connector import AgentStream
+from tracecat.agent.subagents import ResolvedAgentsConfig
+from tracecat.artifacts.bindings import artifact_side_effects_for_tool_result
+from tracecat.artifacts.resolution import resolve_artifact_side_effects
+from tracecat.auth.types import Role
+from tracecat.chat.schemas import ChatMessage
+from tracecat.contexts import ctx_role
+from tracecat.logger import logger
+from tracecat.storage.object import StoredObject, retrieve_stored_object
+
+
+class CreateSessionInput(BaseModel):
+    """Input for create_session_activity."""
+
+    role: Role
+    session_id: uuid.UUID
+    require_existing: bool = False
+    # Entity context
+    entity_type: AgentSessionEntity
+    entity_id: uuid.UUID
+    # Session config
+    title: str = "New Chat"
+    created_by: uuid.UUID | None = None
+    tools: list[str] | None = None
+    agent_preset_id: uuid.UUID | None = None
+    agent_preset_version_id: uuid.UUID | None = None
+    agents_binding: ResolvedAgentsConfig | None = None
+    harness_type: HarnessType = HarnessType.CLAUDE_CODE
+    # Workflow run tracking (for approval lookups)
+    curr_run_id: uuid.UUID | None = None
+    # First user prompt for best-effort auto-title
+    initial_user_prompt: str | None = None
+
+
+class CreateSessionResult(BaseModel):
+    """Result from create_session_activity."""
+
+    session_id: uuid.UUID
+    success: bool
+    error: str | None = None
+
+
+class PendingToolResult(BaseModel):
+    """Pending tool execution result that preserves approval ordering."""
+
+    tool_call_id: str
+    tool_name: str
+    tool_input: dict[str, Any] | None = None
+    stored_result: StoredObject | None = None
+    raw_result: Any = None
+    is_error: bool = False
+
+
+class ReconcileToolResultsInput(BaseModel):
+    """Input for reconciling approved tool results back into agent state."""
+
+    session_id: uuid.UUID
+    workspace_id: uuid.UUID
+    role: Role
+    pending_results: list[PendingToolResult]
+
+
+class ReconcileToolResultsResult(BaseModel):
+    """Result from reconciling approved tool results."""
+
+    results: list[ToolExecutionResult]
+
+
+class LoadSessionInput(BaseModel):
+    """Input for load_session_activity."""
+
+    role: Role
+    session_id: uuid.UUID
+
+
+class LoadSessionResult(BaseModel):
+    """Result from load_session_activity."""
+
+    found: bool
+    sdk_session_id: str | None = None
+    # Legacy replay compatibility only. New activity executions do not populate
+    # SDK JSONL across Temporal boundaries.
+    sdk_session_data: str | None = Field(default=None, deprecated=True)
+    is_fork: bool = False  # If True, runtime should use fork_session=True with SDK
+    error: str | None = None
+
+
+class LoadSessionMessagesInput(BaseModel):
+    """Input for load_session_messages_activity."""
+
+    role: Role
+    session_id: uuid.UUID
+
+
+class LoadSessionMessagesResult(BaseModel):
+    """Result from load_session_messages_activity."""
+
+    messages: list[ChatMessage] | None = None
+    error: str | None = None
+
+
+@activity.defn
+async def create_session_activity(input: CreateSessionInput) -> CreateSessionResult:
+    """Create or get an existing agent session in the database.
+
+    This is called at the start of an agent workflow to establish
+    the session record that will track the agent's execution.
+    Idempotent - safe to call multiple times for the same session_id.
+
+    If curr_run_id is provided, it will be set on the session to enable
+    approval submission to locate the running workflow.
+    """
+    ctx_role.set(input.role)
+
+    try:
+        async with AgentSessionService.with_session(role=input.role) as service:
+            if input.require_existing:
+                agent_session = await service.get_session(input.session_id)
+                if agent_session is None:
+                    raise ApplicationError(
+                        f"Session {input.session_id} does not exist",
+                        non_retryable=True,
+                    )
+                created = False
+            else:
+                agent_session, created = await service.get_or_create_session(
+                    AgentSessionCreate(
+                        id=input.session_id,
+                        title=input.title,
+                        created_by=input.created_by,
+                        entity_type=input.entity_type,
+                        entity_id=input.entity_id,
+                        tools=input.tools,
+                        agent_preset_id=input.agent_preset_id,
+                        agent_preset_version_id=input.agent_preset_version_id,
+                        harness_type=input.harness_type,
+                    ),
+                    agents_binding=input.agents_binding,
+                )
+
+            # Reconcile agents_binding for pre-existing sessions. Chat-created
+            # sessions may be inserted before the durable workflow resolves the
+            # current preset's subagent bindings, so a fresh session can have a
+            # NULL binding even though this run already has a concrete binding.
+            # Backfill that first-run case. Once an SDK session exists, or the
+            # row forks from a parent SDK history, the binding is part of the
+            # resumable runtime topology and explicit mismatches must continue
+            # to fail.
+            if not created:
+                disabled_agents_binding = ResolvedAgentsConfig()
+                requested_agents_binding = (
+                    input.agents_binding or disabled_agents_binding
+                )
+                if agent_session.agents_binding is None:
+                    has_resume_state = (
+                        agent_session.sdk_session_id is not None
+                        or agent_session.parent_session_id is not None
+                    )
+                    should_backfill_agents_binding = input.agents_binding is not None
+                    stored_agents_binding = (
+                        requested_agents_binding
+                        if should_backfill_agents_binding and not has_resume_state
+                        else disabled_agents_binding
+                    )
+                else:
+                    stored_agents_binding = ResolvedAgentsConfig.model_validate(
+                        agent_session.agents_binding
+                    )
+                    should_backfill_agents_binding = False
+
+                if stored_agents_binding != requested_agents_binding:
+                    # Non-retryable: retrying with the same mismatched input
+                    # will deterministically fail; surface to the caller.
+                    raise ApplicationError(
+                        "Agent session was created with a different agents binding",
+                        non_retryable=True,
+                    )
+                if should_backfill_agents_binding:
+                    agent_session.agents_binding = stored_agents_binding.model_dump(
+                        mode="json"
+                    )
+                    service.session.add(agent_session)
+                    await service.session.commit()
+
+            # Set curr_run_id if provided (for workflow-initiated sessions)
+            if input.curr_run_id is not None:
+                agent_session.curr_run_id = input.curr_run_id
+                service.session.add(agent_session)
+                await service.session.commit()
+
+            # Avoid duplicate title generation when run_turn already attempted
+            # first-prompt auto-title before spawning this workflow.
+            if created and input.initial_user_prompt is not None:
+                await service.auto_title_session_on_first_prompt(
+                    agent_session,
+                    input.initial_user_prompt,
+                )
+
+        if created:
+            logger.info(
+                "Created agent session",
+                session_id=input.session_id,
+                entity_type=input.entity_type,
+                entity_id=input.entity_id,
+            )
+        else:
+            logger.debug(
+                "Agent session already exists",
+                session_id=input.session_id,
+            )
+
+        # Initialize the Redis stream cursor so GET /stream returns events
+        # instead of 204. Chat sessions do this in send_message before the
+        # SSE response starts; workflow-based ai.* sessions must do it here,
+        # before the executor activity runs, so the frontend can connect as
+        # soon as it sees the session ID in the workflow history.
+        # Skip for require_existing (approval continuations) — they resume
+        # mid-stream and must not clear the existing Redis buffer.
+        if not input.require_existing and input.role.workspace_id is not None:
+            stream = await AgentStream.new(
+                session_id=input.session_id,
+                workspace_id=input.role.workspace_id,
+            )
+            await stream.reset_for_new_turn()
+
+        return CreateSessionResult(session_id=input.session_id, success=True)
+
+    except ApplicationError:
+        raise
+    except Exception as e:
+        logger.error("Failed to create agent session", error=str(e))
+        return CreateSessionResult(
+            session_id=input.session_id, success=False, error=str(e)
+        )
+
+
+@activity.defn
+async def load_session_activity(input: LoadSessionInput) -> LoadSessionResult:
+    """Load lightweight agent session resume metadata.
+
+    The full SDK JSONL history is loaded inside run_agent_activity. Keeping this
+    activity metadata-only avoids carrying joined session history through
+    Temporal workflow/activity payloads while preserving workflow command shape.
+    """
+    ctx_role.set(input.role)
+
+    try:
+        async with AgentSessionService.with_session(role=input.role) as service:
+            agent_session = await service.get_session(input.session_id)
+
+            if agent_session is None:
+                return LoadSessionResult(found=False)
+
+            is_fork = False
+            sdk_session_id = agent_session.sdk_session_id
+
+            # For forked sessions, only fork on the first turn (when child has
+            # no sdk_session_id yet). Subsequent turns resume the child's own
+            # SDK session normally.
+            if (
+                agent_session.parent_session_id is not None
+                and agent_session.sdk_session_id is None
+            ):
+                parent_session = await service.get_session(
+                    agent_session.parent_session_id
+                )
+                if parent_session is None:
+                    logger.warning(
+                        "Forked session references non-existent parent",
+                        session_id=input.session_id,
+                        parent_session_id=agent_session.parent_session_id,
+                    )
+                    return LoadSessionResult(found=True)
+                is_fork = True
+                sdk_session_id = parent_session.sdk_session_id
+
+            return LoadSessionResult(
+                found=True,
+                sdk_session_id=sdk_session_id,
+                is_fork=is_fork,
+            )
+
+    except Exception as e:
+        logger.error("Failed to load agent session", error=str(e))
+        return LoadSessionResult(found=False, error=str(e))
+
+
+@activity.defn
+async def load_session_messages_activity(
+    input: LoadSessionMessagesInput,
+) -> LoadSessionMessagesResult:
+    """Load the full chat message history for a completed agent session."""
+    ctx_role.set(input.role)
+
+    try:
+        async with AgentSessionService.with_session(role=input.role) as service:
+            messages = await service.list_messages(input.session_id)
+        return LoadSessionMessagesResult(messages=messages)
+
+    except Exception as e:
+        logger.warning(
+            "Failed to load agent session messages",
+            session_id=str(input.session_id),
+            error=str(e),
+        )
+        raise
+
+
+@activity.defn
+async def reconcile_tool_results_activity(
+    input: ReconcileToolResultsInput,
+) -> ReconcileToolResultsResult:
+    """Materialize executor results and clean interrupted approval state."""
+    ctx_role.set(input.role)
+    results: list[ToolExecutionResult] = []
+    stream = await AgentStream.new(
+        session_id=input.session_id,
+        workspace_id=input.workspace_id,
+    )
+
+    for pending in input.pending_results:
+        try:
+            if pending.stored_result is not None:
+                output = await retrieve_stored_object(pending.stored_result)
+                is_error = False
+            else:
+                output = pending.raw_result
+                is_error = pending.is_error
+        except Exception as e:
+            logger.exception(
+                "Failed to materialize tool result",
+                tool_call_id=pending.tool_call_id,
+                tool_name=pending.tool_name,
+                error=str(e),
+            )
+            raise
+
+        result = ToolExecutionResult(
+            tool_call_id=pending.tool_call_id,
+            tool_name=pending.tool_name,
+            result=output,
+            is_error=is_error,
+        )
+        results.append(result)
+        await stream.append(
+            UnifiedStreamEvent.tool_result_event(
+                tool_call_id=result.tool_call_id,
+                tool_name=result.tool_name,
+                output=result.result,
+                is_error=result.is_error,
+            )
+        )
+        artifact_effects = list(
+            artifact_side_effects_for_tool_result(
+                tool_name=result.tool_name,
+                tool_input=pending.tool_input,
+                tool_output=result.result,
+                is_error=result.is_error,
+                tool_call_id=result.tool_call_id,
+            )
+        )
+        if artifact_effects:
+            try:
+                async with AgentSessionService.with_session(role=input.role) as service:
+                    artifact_effects = await resolve_artifact_side_effects(
+                        artifact_effects,
+                        session=service.session,
+                        role=service.role,
+                    )
+                    if artifact_effects:
+                        await service.apply_artifact_side_effects(
+                            input.session_id,
+                            artifact_effects,
+                        )
+            except Exception as e:
+                logger.warning(
+                    "Failed to persist artifact side effects",
+                    session_id=input.session_id,
+                    tool_call_id=result.tool_call_id,
+                    error=str(e),
+                )
+                raise
+
+        for artifact_effect in artifact_effects:
+            await stream.append(
+                artifact_stream_event(artifact_effect.op, artifact_effect.artifact)
+            )
+
+    if results:
+        async with AgentSessionService.with_session(role=input.role) as service:
+            await service.replace_interrupt_with_tool_results(
+                input.session_id,
+                results,
+            )
+
+    return ReconcileToolResultsResult(results=results)
+
+
+def get_session_activities() -> list:
+    """Get all session-related activities for worker registration."""
+    return [
+        create_session_activity,
+        load_session_activity,
+        load_session_messages_activity,
+        reconcile_tool_results_activity,
+    ]

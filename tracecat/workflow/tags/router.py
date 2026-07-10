@@ -1,0 +1,65 @@
+from fastapi import APIRouter, HTTPException, status
+from pydantic import UUID4
+from sqlalchemy.exc import NoResultFound
+
+from tracecat.auth.dependencies import WorkspaceActorRouteRole
+from tracecat.authz.controls import require_scope
+from tracecat.db.dependencies import AsyncDBSession
+from tracecat.identifiers.workflow import AnyWorkflowIDPath
+from tracecat.tags.schemas import TagRead
+from tracecat.workflow.tags.schemas import WorkflowTagCreate
+from tracecat.workflow.tags.service import WorkflowTagsService
+
+# Create a FastAPI router for workflow tags
+router = APIRouter(prefix="/workflows", tags=["workflows"])
+
+
+@router.get("/{workflow_id}/tags", response_model=list[TagRead])
+@require_scope("workflow:read")
+async def list_tags(
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    workflow_id: AnyWorkflowIDPath,
+) -> list[TagRead]:
+    """List all tags for a workflow."""
+    service = WorkflowTagsService(session, role=role)
+    db_tags = await service.list_tags_for_workflow(workflow_id)
+    return [TagRead.model_validate(tag, from_attributes=True) for tag in db_tags]
+
+
+@router.post("/{workflow_id}/tags", status_code=status.HTTP_201_CREATED)
+@require_scope("workflow:update")
+async def add_tag(
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    workflow_id: AnyWorkflowIDPath,
+    params: WorkflowTagCreate,
+) -> None:
+    """Add a tag to a workflow."""
+    service = WorkflowTagsService(session, role=role)
+    try:
+        await service.add_workflow_tag(workflow_id, params.tag_id)
+    except NoResultFound as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workflow or tag not found",
+        ) from e
+
+
+@router.delete("/{workflow_id}/tags/{tag_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("workflow:update")
+async def remove_tag(
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    workflow_id: AnyWorkflowIDPath,
+    tag_id: UUID4,
+) -> None:
+    service = WorkflowTagsService(session, role=role)
+    try:
+        wf_tag = await service.get_workflow_tag(workflow_id, tag_id)
+    except NoResultFound as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tag not found",
+        ) from e
+    await service.remove_workflow_tag(wf_tag)

@@ -1,0 +1,831 @@
+"use client"
+
+import { Cross2Icon } from "@radix-ui/react-icons"
+import { format } from "date-fns"
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  CalendarIcon,
+  Check,
+  ChevronDown,
+  CircleIcon,
+  CircleSlashIcon,
+  ClockIcon,
+  ListIcon,
+  SearchIcon,
+  ShieldAlertIcon,
+  SignalHighIcon,
+  SignalIcon,
+  TagIcon,
+  UserIcon,
+} from "lucide-react"
+import { type ComponentType, useEffect, useMemo, useState } from "react"
+import type { DateRange } from "react-day-picker"
+import type {
+  CaseDropdownDefinitionRead,
+  CaseDurationDefinitionRead,
+  CaseFieldReadMinimal,
+  CasePriority,
+  CaseSeverity,
+  CaseStatus,
+  CaseTagRead,
+  WorkspaceMember,
+} from "@/client"
+import {
+  PRIORITIES,
+  SEVERITIES,
+  STATUSES,
+} from "@/components/cases/case-categories"
+import { CaseColumnPicker } from "@/components/cases/case-column-picker"
+import { UNASSIGNED } from "@/components/cases/case-panel-selectors"
+import {
+  type CaseSortField,
+  type CaseSortValue,
+  DEFAULT_CASE_SORT,
+} from "@/components/cases/case-sort"
+import { DynamicLucideIcon } from "@/components/dynamic-lucide-icon"
+import {
+  type FilterMode,
+  FilterMultiSelect,
+  type FilterOption,
+  type SortDirection,
+} from "@/components/filters/filter-multi-select"
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { Calendar } from "@/components/ui/calendar"
+import { Input } from "@/components/ui/input"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+} from "@/components/ui/select"
+import type {
+  CaseDateFilterValue,
+  CaseDatePreset,
+  DropdownFilterState,
+} from "@/hooks/use-cases"
+import { DEFAULT_CREATED_PRESET } from "@/hooks/use-cases"
+import { cn } from "@/lib/utils"
+
+const getIconTextClass = (color?: string) =>
+  color?.split(" ").find((token) => token.startsWith("text-")) ||
+  "text-muted-foreground"
+
+const DATE_PRESET_OPTIONS: Array<{
+  value: CaseDatePreset
+  label: string
+}> = [
+  { value: null, label: "Any time" },
+  { value: "1d", label: "1 day ago" },
+  { value: "3d", label: "3 days ago" },
+  { value: "1w", label: "1 week ago" },
+  { value: "1m", label: "1 month ago" },
+]
+
+function getDateFilterLabel(filter: CaseDateFilterValue): string | null {
+  if (filter.type === "preset") {
+    if (filter.value === null) return null
+    return (
+      DATE_PRESET_OPTIONS.find((o) => o.value === filter.value)?.label ?? null
+    )
+  }
+  // Custom range
+  if (filter.value.from) {
+    if (filter.value.to) {
+      return `${format(filter.value.from, "MMM d")} - ${format(filter.value.to, "MMM d")}`
+    }
+    return `From ${format(filter.value.from, "MMM d")}`
+  }
+  return null
+}
+
+function isDateFilterActive(filter: CaseDateFilterValue): boolean {
+  if (filter.type === "preset") {
+    return filter.value !== null
+  }
+  return filter.value.from !== undefined
+}
+
+interface DateFilterSelectProps {
+  placeholder: string
+  icon: typeof ClockIcon | typeof CalendarIcon
+  value: CaseDateFilterValue
+  onChange: (value: CaseDateFilterValue) => void
+  className?: string
+}
+
+function DateFilterSelect({
+  placeholder,
+  icon: Icon,
+  value,
+  onChange,
+  className,
+}: DateFilterSelectProps) {
+  const [open, setOpen] = useState(false)
+  const [showCalendar, setShowCalendar] = useState(false)
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(
+    value.type === "range" ? value.value : undefined
+  )
+
+  useEffect(() => {
+    if (value.type === "range") {
+      setDateRange(value.value)
+    } else {
+      setDateRange(undefined)
+    }
+  }, [value])
+
+  const label = getDateFilterLabel(value)
+  const isActive = isDateFilterActive(value)
+
+  const handlePresetSelect = (preset: CaseDatePreset) => {
+    onChange({ type: "preset", value: preset })
+    setShowCalendar(false)
+    if (preset !== null) {
+      setOpen(false)
+    }
+  }
+
+  const handleRangeChange = (range: DateRange | undefined) => {
+    setDateRange(range)
+    if (range?.from) {
+      onChange({ type: "range", value: range })
+    }
+  }
+
+  const handleOpenChange = (newOpen: boolean) => {
+    setOpen(newOpen)
+    if (!newOpen) {
+      setShowCalendar(false)
+    }
+  }
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className={cn(
+            "flex h-6 items-center gap-1.5 rounded-md border border-input bg-transparent px-2 text-xs font-medium transition-colors",
+            "hover:bg-muted/50",
+            isActive && "border-primary/50 bg-primary/5",
+            className
+          )}
+        >
+          <Icon className="size-3.5 text-muted-foreground" />
+          <span>{placeholder}</span>
+          {label && (
+            <span className="ml-0.5 max-w-[100px] truncate text-[10px] font-medium text-muted-foreground">
+              {label}
+            </span>
+          )}
+          <ChevronDown className="size-3 opacity-50" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        className="w-auto p-0 shadow-sm"
+        align="start"
+        sideOffset={4}
+      >
+        {showCalendar ? (
+          <div className="p-0">
+            <div className="flex items-center justify-between border-b px-3 py-2">
+              <span className="text-xs font-medium">Select date range</span>
+              <button
+                type="button"
+                className="text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setShowCalendar(false)}
+              >
+                Back
+              </button>
+            </div>
+            <Calendar
+              mode="range"
+              selected={dateRange}
+              onSelect={handleRangeChange}
+              numberOfMonths={2}
+              className="p-3"
+            />
+            {dateRange?.from && (
+              <div className="border-t px-3 py-2">
+                <button
+                  type="button"
+                  className="w-full rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                  onClick={() => setOpen(false)}
+                >
+                  Apply
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="py-1">
+            {DATE_PRESET_OPTIONS.map((option) => (
+              <button
+                key={option.value ?? "any"}
+                type="button"
+                className={cn(
+                  "flex w-full items-center justify-between px-3 py-1.5 text-xs transition-colors",
+                  "hover:bg-muted",
+                  value.type === "preset" && value.value === option.value
+                    ? "text-foreground"
+                    : "text-muted-foreground"
+                )}
+                onClick={() => handlePresetSelect(option.value)}
+              >
+                <span>{option.label}</span>
+                {value.type === "preset" && value.value === option.value && (
+                  <Check className="size-3.5" />
+                )}
+              </button>
+            ))}
+            <div className="my-1 border-t" />
+            <button
+              type="button"
+              className={cn(
+                "flex w-full items-center gap-2 px-3 py-1.5 text-xs transition-colors",
+                "hover:bg-muted",
+                value.type === "range"
+                  ? "text-foreground"
+                  : "text-muted-foreground"
+              )}
+              onClick={() => setShowCalendar(true)}
+            >
+              <CalendarIcon className="size-3.5" />
+              <span>Custom range...</span>
+              {value.type === "range" && <Check className="ml-auto size-3.5" />}
+            </button>
+          </div>
+        )}
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+const CASE_SORT_OPTIONS: Array<{
+  value: CaseSortField
+  label: string
+  icon: ComponentType<{ className?: string }>
+}> = [
+  { value: "updated_at", label: "Updated", icon: ClockIcon },
+  { value: "created_at", label: "Created", icon: CalendarIcon },
+  { value: "priority", label: "Priority", icon: SignalHighIcon },
+  { value: "severity", label: "Severity", icon: ShieldAlertIcon },
+  { value: "status", label: "Status", icon: SignalIcon },
+  { value: "tasks", label: "Tasks", icon: ListIcon },
+]
+
+function isDefaultCaseSort(value: CaseSortValue): boolean {
+  return (
+    value.field === DEFAULT_CASE_SORT.field &&
+    value.direction === DEFAULT_CASE_SORT.direction
+  )
+}
+
+interface CaseSortSelectProps {
+  value: CaseSortValue
+  onChange: (value: CaseSortValue) => void
+}
+
+function CaseSortSelect({ value, onChange }: CaseSortSelectProps) {
+  const selectedLabel =
+    CASE_SORT_OPTIONS.find((option) => option.value === value.field)?.label ??
+    "Updated"
+
+  return (
+    <div className="inline-flex items-center rounded-md border border-input bg-transparent">
+      <Select
+        value={value.field}
+        onValueChange={(nextField) =>
+          onChange({
+            field: nextField as CaseSortField,
+            direction: value.direction,
+          })
+        }
+      >
+        <SelectTrigger className="h-6 w-[140px] rounded-r-none border-0 bg-transparent px-2 text-xs font-medium shadow-none focus:ring-0">
+          <span className="text-muted-foreground">Sort by</span>
+          <span className="text-foreground">{selectedLabel}</span>
+        </SelectTrigger>
+        <SelectContent align="start">
+          {CASE_SORT_OPTIONS.map((option) => {
+            const Icon = option.icon
+            return (
+              <SelectItem key={option.value} value={option.value}>
+                <span className="flex items-center gap-2">
+                  <Icon className="size-3.5 text-muted-foreground" />
+                  <span>{option.label}</span>
+                </span>
+              </SelectItem>
+            )
+          })}
+        </SelectContent>
+      </Select>
+      <button
+        type="button"
+        className="flex h-6 w-7 items-center justify-center border-l border-input text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+        onClick={() =>
+          onChange({
+            field: value.field,
+            direction: value.direction === "asc" ? "desc" : "asc",
+          })
+        }
+        aria-label={
+          value.direction === "asc" ? "Sort ascending" : "Sort descending"
+        }
+      >
+        {value.direction === "asc" ? (
+          <ArrowUpIcon className="size-3.5" />
+        ) : (
+          <ArrowDownIcon className="size-3.5" />
+        )}
+      </button>
+    </div>
+  )
+}
+
+interface CasesHeaderProps {
+  searchQuery: string
+  onSearchChange: (query: string) => void
+  sortBy: CaseSortValue
+  onSortByChange: (value: CaseSortValue) => void
+  statusFilter: CaseStatus[]
+  onStatusChange: (value: CaseStatus[]) => void
+  statusMode: FilterMode
+  onStatusModeChange: (mode: FilterMode) => void
+  priorityFilter: CasePriority[]
+  onPriorityChange: (value: CasePriority[]) => void
+  priorityMode: FilterMode
+  onPriorityModeChange: (mode: FilterMode) => void
+  prioritySortDirection?: SortDirection
+  onPrioritySortDirectionChange?: (direction: SortDirection) => void
+  severityFilter: CaseSeverity[]
+  onSeverityChange: (value: CaseSeverity[]) => void
+  severityMode: FilterMode
+  onSeverityModeChange: (mode: FilterMode) => void
+  severitySortDirection?: SortDirection
+  onSeveritySortDirectionChange?: (direction: SortDirection) => void
+  assigneeFilter: string[]
+  onAssigneeChange: (value: string[]) => void
+  assigneeMode: FilterMode
+  onAssigneeModeChange: (mode: FilterMode) => void
+  assigneeSortDirection?: SortDirection
+  onAssigneeSortDirectionChange?: (direction: SortDirection) => void
+  tagFilter: string[]
+  onTagChange: (value: string[]) => void
+  tagMode: FilterMode
+  onTagModeChange: (mode: FilterMode) => void
+  tagSortDirection?: SortDirection
+  onTagSortDirectionChange?: (direction: SortDirection) => void
+  updatedAfter: CaseDateFilterValue
+  onUpdatedAfterChange: (value: CaseDateFilterValue) => void
+  createdAfter: CaseDateFilterValue
+  onCreatedAfterChange: (value: CaseDateFilterValue) => void
+  members?: WorkspaceMember[]
+  tags?: CaseTagRead[]
+  dropdownDefinitions?: CaseDropdownDefinitionRead[]
+  fieldDefinitions?: CaseFieldReadMinimal[]
+  durationDefinitions?: CaseDurationDefinitionRead[]
+  visibleColumnIds?: string[]
+  onToggleColumn?: (columnId: string) => void
+  dropdownFilters: Record<string, DropdownFilterState>
+  onDropdownFilterChange: (ref: string, values: string[]) => void
+  onDropdownModeChange: (ref: string, mode: FilterMode) => void
+  onDropdownSortDirectionChange: (ref: string, direction: SortDirection) => void
+  // Selection props
+  totalCaseCount?: number
+  displayCaseCount?: number | null
+  selectedCount?: number
+  onSelectAll?: () => void
+  onDeselectAll?: () => void
+}
+
+export function CasesHeader({
+  searchQuery,
+  onSearchChange,
+  sortBy,
+  onSortByChange,
+  statusFilter,
+  onStatusChange,
+  statusMode,
+  onStatusModeChange,
+  priorityFilter,
+  onPriorityChange,
+  priorityMode,
+  onPriorityModeChange,
+  prioritySortDirection,
+  onPrioritySortDirectionChange,
+  severityFilter,
+  onSeverityChange,
+  severityMode,
+  onSeverityModeChange,
+  severitySortDirection,
+  onSeveritySortDirectionChange,
+  assigneeFilter,
+  onAssigneeChange,
+  assigneeMode,
+  onAssigneeModeChange,
+  assigneeSortDirection,
+  onAssigneeSortDirectionChange,
+  tagFilter,
+  onTagChange,
+  tagMode,
+  onTagModeChange,
+  tagSortDirection,
+  onTagSortDirectionChange,
+  updatedAfter,
+  onUpdatedAfterChange,
+  createdAfter,
+  onCreatedAfterChange,
+  members,
+  tags,
+  dropdownDefinitions,
+  fieldDefinitions,
+  durationDefinitions,
+  visibleColumnIds,
+  onToggleColumn,
+  dropdownFilters,
+  onDropdownFilterChange,
+  onDropdownModeChange,
+  onDropdownSortDirectionChange,
+  totalCaseCount = 0,
+  displayCaseCount = null,
+  selectedCount = 0,
+  onSelectAll,
+  onDeselectAll,
+}: CasesHeaderProps) {
+  const statusOptions = useMemo<FilterOption<CaseStatus>[]>(() => {
+    return Object.values(STATUSES).map((status) => ({
+      value: status.value,
+      label: status.label,
+      icon: status.icon,
+      iconClassName: getIconTextClass(status.color),
+    }))
+  }, [])
+
+  const priorityOptions = useMemo<FilterOption<CasePriority>[]>(() => {
+    return Object.values(PRIORITIES).map((priority) => ({
+      value: priority.value,
+      label: priority.label,
+      icon: priority.icon,
+      iconClassName: getIconTextClass(priority.color),
+    }))
+  }, [])
+
+  const severityOptions = useMemo<FilterOption<CaseSeverity>[]>(() => {
+    return Object.values(SEVERITIES).map((severity) => ({
+      value: severity.value,
+      label: severity.label,
+      icon: severity.icon,
+      iconClassName: getIconTextClass(severity.color),
+    }))
+  }, [])
+
+  const assigneeOptions = useMemo<FilterOption<string>[]>(() => {
+    const workspaceMembers = members?.map((member) => {
+      const initials = member.email[0].toUpperCase()
+
+      return {
+        value: member.user_id,
+        label: member.email,
+        renderIcon: () => (
+          <Avatar className="size-5">
+            <AvatarFallback className="text-[10px] font-medium">
+              {initials}
+            </AvatarFallback>
+          </Avatar>
+        ),
+      }
+    })
+
+    return [
+      {
+        value: UNASSIGNED,
+        label: "Unassigned",
+        renderIcon: () => (
+          <div className="flex size-5 items-center justify-center">
+            <CircleSlashIcon className="size-3 text-muted-foreground/50" />
+          </div>
+        ),
+      },
+      ...(workspaceMembers || []),
+    ]
+  }, [members])
+
+  const tagOptions = useMemo<FilterOption<string>[]>(() => {
+    return (
+      tags?.map((tag) => ({
+        value: tag.ref,
+        label: tag.name,
+        renderIcon: () => (
+          <div
+            className="size-2 shrink-0 rounded-full"
+            style={{ backgroundColor: tag.color || undefined }}
+          />
+        ),
+      })) ?? []
+    )
+  }, [tags])
+
+  const hasDropdownFilters = Object.values(dropdownFilters).some(
+    (s) => s.values.length > 0
+  )
+  const hasDefaultCreatedAfter =
+    createdAfter.type === "preset" &&
+    createdAfter.value === DEFAULT_CREATED_PRESET
+
+  const hasFilters =
+    searchQuery.trim().length > 0 ||
+    !isDefaultCaseSort(sortBy) ||
+    statusFilter.length > 0 ||
+    priorityFilter.length > 0 ||
+    severityFilter.length > 0 ||
+    assigneeFilter.length > 0 ||
+    tagFilter.length > 0 ||
+    hasDropdownFilters ||
+    isDateFilterActive(updatedAfter) ||
+    (isDateFilterActive(createdAfter) && !hasDefaultCreatedAfter)
+
+  const handleReset = () => {
+    onSearchChange("")
+    onSortByChange(DEFAULT_CASE_SORT)
+    onStatusChange([])
+    onStatusModeChange("include")
+    onPriorityChange([])
+    onPriorityModeChange("include")
+    onPrioritySortDirectionChange?.(null)
+    onSeverityChange([])
+    onSeverityModeChange("include")
+    onSeveritySortDirectionChange?.(null)
+    onAssigneeChange([])
+    onAssigneeModeChange("include")
+    onAssigneeSortDirectionChange?.(null)
+    onTagChange([])
+    onTagModeChange("include")
+    onTagSortDirectionChange?.(null)
+    // Reset dropdown filters
+    const refs = dropdownDefinitions
+      ? dropdownDefinitions.map((d) => d.ref)
+      : Object.keys(dropdownFilters)
+    for (const ref of refs) {
+      onDropdownFilterChange(ref, [])
+      onDropdownModeChange(ref, "include")
+      onDropdownSortDirectionChange(ref, null)
+    }
+    onUpdatedAfterChange({ type: "preset", value: null })
+    onCreatedAfterChange({
+      type: "preset",
+      value: DEFAULT_CREATED_PRESET,
+    })
+  }
+
+  return (
+    <div className="shrink-0 border-b">
+      {/* Row 1: Search */}
+      <header className="flex h-10 items-center border-b pl-3 pr-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center">
+            <SearchIcon className="size-4 text-muted-foreground" />
+          </div>
+          <Input
+            type="text"
+            placeholder="Search cases..."
+            value={searchQuery}
+            onChange={(e) => onSearchChange(e.target.value)}
+            className={cn(
+              "h-7 w-48 border-none bg-transparent p-0",
+              "text-sm",
+              "shadow-none outline-none",
+              "placeholder:text-muted-foreground",
+              "focus-visible:ring-0 focus-visible:ring-offset-0"
+            )}
+          />
+        </div>
+
+        <div className="ml-auto flex items-center gap-2">
+          {onToggleColumn && visibleColumnIds && (
+            <CaseColumnPicker
+              dropdownDefinitions={dropdownDefinitions}
+              fieldDefinitions={fieldDefinitions}
+              durationDefinitions={durationDefinitions}
+              visibleColumnIds={visibleColumnIds}
+              onToggle={onToggleColumn}
+            />
+          )}
+          {(displayCaseCount ?? totalCaseCount) > 0 && (
+            <span className="text-xs text-muted-foreground">
+              {displayCaseCount ?? totalCaseCount} cases
+            </span>
+          )}
+        </div>
+      </header>
+
+      {/* Row 2: Filter dropdowns */}
+      <div className="flex flex-wrap items-center gap-2 py-2 pl-3 pr-4">
+        {/* Select all / Deselect all button - matches accordion chevron container (h-7 w-7) */}
+        {totalCaseCount > 0 && (
+          <button
+            type="button"
+            onClick={
+              selectedCount === totalCaseCount ? onDeselectAll : onSelectAll
+            }
+            className="flex h-7 w-7 shrink-0 items-center justify-center"
+            aria-label={
+              selectedCount === totalCaseCount ? "Deselect all" : "Select all"
+            }
+            title={
+              selectedCount === totalCaseCount ? "Deselect all" : "Select all"
+            }
+          >
+            <div
+              className={cn(
+                "flex size-4 shrink-0 items-center justify-center rounded-sm border transition-colors",
+                selectedCount === totalCaseCount
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-muted-foreground/40 bg-transparent"
+              )}
+            >
+              {selectedCount === totalCaseCount && (
+                <Check className="size-3" aria-hidden />
+              )}
+            </div>
+          </button>
+        )}
+
+        <FilterMultiSelect
+          placeholder="Status"
+          icon={SignalIcon}
+          value={statusFilter}
+          onChange={onStatusChange}
+          options={statusOptions}
+          mode={statusMode}
+          onModeChange={onStatusModeChange}
+        />
+
+        <FilterMultiSelect
+          placeholder="Priority"
+          icon={SignalHighIcon}
+          value={priorityFilter}
+          onChange={onPriorityChange}
+          options={priorityOptions}
+          mode={priorityMode}
+          onModeChange={onPriorityModeChange}
+          showSort
+          sortDirection={prioritySortDirection}
+          onSortDirectionChange={onPrioritySortDirectionChange}
+        />
+
+        <FilterMultiSelect
+          placeholder="Severity"
+          icon={ShieldAlertIcon}
+          value={severityFilter}
+          onChange={onSeverityChange}
+          options={severityOptions}
+          mode={severityMode}
+          onModeChange={onSeverityModeChange}
+          showSort
+          sortDirection={severitySortDirection}
+          onSortDirectionChange={onSeveritySortDirectionChange}
+        />
+
+        <FilterMultiSelect
+          placeholder="Assignee"
+          icon={UserIcon}
+          value={assigneeFilter}
+          onChange={onAssigneeChange}
+          options={assigneeOptions}
+          mode={assigneeMode}
+          onModeChange={onAssigneeModeChange}
+          allowExclude={false}
+          showSort
+          sortDirection={assigneeSortDirection}
+          onSortDirectionChange={onAssigneeSortDirectionChange}
+          emptyMessage={
+            members && members.length > 0
+              ? "No matching assignees."
+              : "No assignees found."
+          }
+        />
+
+        <FilterMultiSelect
+          placeholder="Tags"
+          icon={TagIcon}
+          value={tagFilter}
+          onChange={onTagChange}
+          options={tagOptions}
+          mode={tagMode}
+          onModeChange={onTagModeChange}
+          allowExclude={false}
+          showSort
+          sortDirection={tagSortDirection}
+          onSortDirectionChange={onTagSortDirectionChange}
+          emptyMessage={
+            tags && tags.length > 0 ? "No matching tags." : "No tags found."
+          }
+        />
+
+        {dropdownDefinitions?.map((def) => {
+          const state = dropdownFilters[def.ref] ?? {
+            values: [],
+            mode: "include" as FilterMode,
+            sortDirection: null as SortDirection,
+          }
+          const defIconName = def.icon_name ?? undefined
+          const options: FilterOption<string>[] =
+            def.options?.map((opt) => {
+              const optionColorStyle = opt.color
+                ? ({ color: opt.color } as React.CSSProperties)
+                : undefined
+              const fallbackIcon = opt.color ? (
+                <CircleIcon
+                  className="size-3.5 shrink-0"
+                  style={optionColorStyle}
+                />
+              ) : (
+                <CircleIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              )
+
+              return {
+                value: opt.ref,
+                label: opt.label,
+                renderIcon: () =>
+                  opt.icon_name ? (
+                    <DynamicLucideIcon
+                      name={opt.icon_name}
+                      className="size-3.5 shrink-0"
+                      style={optionColorStyle}
+                      fallback={fallbackIcon}
+                    />
+                  ) : (
+                    fallbackIcon
+                  ),
+                labelStyle: optionColorStyle,
+              }
+            }) ?? []
+          return (
+            <FilterMultiSelect
+              key={def.id}
+              placeholder={def.name}
+              renderTriggerIcon={
+                defIconName
+                  ? () => (
+                      <DynamicLucideIcon
+                        name={defIconName}
+                        className="size-3.5 text-muted-foreground"
+                        fallback={
+                          <ListIcon className="size-3.5 text-muted-foreground" />
+                        }
+                      />
+                    )
+                  : undefined
+              }
+              value={state.values}
+              onChange={(values) => onDropdownFilterChange(def.ref, values)}
+              options={options}
+              mode={state.mode}
+              onModeChange={(mode) => onDropdownModeChange(def.ref, mode)}
+              allowExclude={false}
+              showSort={def.is_ordered}
+              sortDirection={state.sortDirection}
+              onSortDirectionChange={(dir) =>
+                onDropdownSortDirectionChange(def.ref, dir)
+              }
+            />
+          )
+        })}
+
+        <DateFilterSelect
+          placeholder="Updated"
+          icon={ClockIcon}
+          value={updatedAfter}
+          onChange={onUpdatedAfterChange}
+        />
+
+        <DateFilterSelect
+          placeholder="Created"
+          icon={CalendarIcon}
+          value={createdAfter}
+          onChange={onCreatedAfterChange}
+        />
+
+        <CaseSortSelect value={sortBy} onChange={onSortByChange} />
+
+        {hasFilters && (
+          <button
+            type="button"
+            onClick={handleReset}
+            className="flex h-6 items-center gap-1.5 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          >
+            Reset
+            <Cross2Icon className="size-3" />
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}

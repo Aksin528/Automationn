@@ -1,0 +1,553 @@
+import type { Node, NodeProps } from "@xyflow/react"
+import {
+  AlertTriangleIcon,
+  CalendarCheck,
+  CalendarClockIcon,
+  Info,
+  Shield,
+  ShieldOff,
+  SquarePlay,
+  TimerOffIcon,
+  UnplugIcon,
+  WebhookIcon,
+} from "lucide-react"
+import React, { useCallback, useLayoutEffect, useMemo, useRef } from "react"
+import { TriggerSourceHandle } from "@/components/builder/canvas/custom-handle"
+import { nodeStyles } from "@/components/builder/canvas/node-styles"
+import {
+  DEFAULT_TRIGGER_PANEL_TAB,
+  type TriggerPanelTab,
+  TriggerPanelTabs,
+} from "@/components/builder/panel/trigger-panel-tabs"
+import { CodeEditor } from "@/components/editor/codemirror/code-editor"
+import { getIcon } from "@/components/icons"
+import {
+  Card,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card"
+import { Separator } from "@/components/ui/separator"
+import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+import { useTriggerNodeZoomBreakpoint } from "@/hooks/canvas"
+import { useEntitlements } from "@/hooks/use-entitlements"
+import { useCaseTrigger, useSchedules } from "@/lib/hooks"
+import { durationToHumanReadable } from "@/lib/time"
+import { cn } from "@/lib/utils"
+import { validateTriggerPayload } from "@/lib/workflow-trigger-payload"
+import { useWorkflowBuilder } from "@/providers/builder"
+import { useWorkflow } from "@/providers/workflow"
+
+export type TriggerNodeData = {
+  title: string
+}
+export type TriggerNodeType = Node<TriggerNodeData, "trigger">
+export const TriggerTypename = "trigger" as const
+
+const TRIGGER_NODE_WIDTH = 256
+const TRIGGER_PAYLOAD_PANEL_GAP = 16
+const TRIGGER_PAYLOAD_PANEL_MIN_WIDTH = 320
+const TRIGGER_PAYLOAD_PANEL_MIN_HEIGHT = 240
+const TRIGGER_PAYLOAD_PANEL_DEFAULT_WIDTH = 360
+const TRIGGER_PAYLOAD_PANEL_DEFAULT_HEIGHT = 320
+
+export default React.memo(function TriggerNode({
+  id,
+  type,
+  data: { title },
+  selected,
+}: NodeProps<TriggerNodeType>) {
+  const { workflow } = useWorkflow()
+  const {
+    reactFlow,
+    workspaceId,
+    workflowId,
+    actionPanelRef,
+    triggerPayload,
+    setTriggerPayload,
+    setTriggerPanelTab,
+  } = useWorkflowBuilder()
+  const { breakpoint, style } = useTriggerNodeZoomBreakpoint()
+  const { hasEntitlement } = useEntitlements()
+  const caseAddonsEnabled = hasEntitlement("case_addons")
+  const { data: caseTrigger } = useCaseTrigger(workspaceId, workflowId)
+  const isCaseTriggerEnabled = caseTrigger?.status === "online"
+  const eventKey = useMemo(
+    () => String(isCaseTriggerEnabled),
+    [isCaseTriggerEnabled]
+  )
+  const cardRef = useRef<HTMLDivElement>(null)
+  const previousHeightRef = useRef<number | null>(null)
+  const pendingHeightAdjustmentRef = useRef(false)
+  const lastEventKeyRef = useRef<string | null>(null)
+  const openTriggerPanel = useCallback(
+    (tab: TriggerPanelTab) => {
+      setTriggerPanelTab(tab)
+      if (actionPanelRef.current?.isCollapsed()) {
+        actionPanelRef.current.expand()
+      }
+    },
+    [actionPanelRef, setTriggerPanelTab]
+  )
+  const handleDefaultPanelOpen = useCallback(() => {
+    openTriggerPanel(DEFAULT_TRIGGER_PANEL_TAB)
+  }, [openTriggerPanel])
+
+  const pushNodesDown = useCallback(
+    (delta: number) => {
+      if (delta <= 0) return
+      reactFlow.setNodes((nodes) => {
+        const triggerNode = nodes.find((node) => node.id === id)
+        if (!triggerNode) {
+          return nodes
+        }
+        const triggerY = triggerNode.position.y
+        return nodes.map((node) => {
+          if (node.id === id) {
+            return node
+          }
+          if (node.position.y <= triggerY) {
+            return node
+          }
+          return {
+            ...node,
+            position: {
+              ...node.position,
+              y: node.position.y + delta,
+            },
+          }
+        })
+      })
+    },
+    [id, reactFlow]
+  )
+
+  useLayoutEffect(() => {
+    if (!cardRef.current) {
+      return
+    }
+    if (
+      eventKey === lastEventKeyRef.current &&
+      previousHeightRef.current !== null
+    ) {
+      return
+    }
+    lastEventKeyRef.current = eventKey
+    const currentHeight = cardRef.current.getBoundingClientRect().height
+
+    if (previousHeightRef.current == null) {
+      previousHeightRef.current = currentHeight
+      return
+    }
+
+    if (!style.showContent) {
+      pendingHeightAdjustmentRef.current = true
+      return
+    }
+
+    const delta = currentHeight - previousHeightRef.current
+    if (delta > 0) {
+      pushNodesDown(delta)
+      previousHeightRef.current = currentHeight
+    }
+    pendingHeightAdjustmentRef.current = false
+  }, [eventKey, pushNodesDown, style.showContent])
+
+  useLayoutEffect(() => {
+    if (!style.showContent || !pendingHeightAdjustmentRef.current) {
+      return
+    }
+    if (!cardRef.current) {
+      return
+    }
+    const currentHeight = cardRef.current.getBoundingClientRect().height
+    const previousHeight = previousHeightRef.current
+    if (previousHeight == null) {
+      previousHeightRef.current = currentHeight
+      pendingHeightAdjustmentRef.current = false
+      return
+    }
+    const delta = currentHeight - previousHeight
+    if (delta > 0) {
+      pushNodesDown(delta)
+      previousHeightRef.current = currentHeight
+    }
+    pendingHeightAdjustmentRef.current = false
+  }, [pushNodesDown, style.showContent])
+
+  if (!workflow) {
+    return null
+  }
+
+  const triggerPayloadError = validateTriggerPayload(triggerPayload)
+
+  return (
+    <div className="relative w-64 overflow-visible">
+      <Card
+        ref={cardRef}
+        onClickCapture={handleDefaultPanelOpen}
+        className={cn(
+          "w-64",
+          nodeStyles.common,
+          selected ? nodeStyles.selected : nodeStyles.hover
+        )}
+      >
+        <CardHeader className="p-4">
+          <div className="flex w-full items-center space-x-4">
+            {getIcon(type, {
+              className: "size-10 p-2",
+            })}
+
+            <div className="flex w-full flex-1 justify-between space-x-12">
+              <div className="flex flex-col">
+                <CardTitle className="flex w-full items-center justify-between text-xs font-medium leading-none">
+                  <div
+                    className={cn(
+                      style.fontSize,
+                      breakpoint !== "large" && "w-full"
+                    )}
+                  >
+                    {title}
+                  </div>
+                </CardTitle>
+                {style.showContent && (
+                  <CardDescription className="mt-2 text-xs text-muted-foreground">
+                    Workflow trigger
+                  </CardDescription>
+                )}
+              </div>
+              <div className="flex items-start gap-1">
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      {workflow.webhook.api_key?.is_active ? (
+                        <Shield className="size-4 text-emerald-400" />
+                      ) : workflow.webhook.api_key ? (
+                        <Shield className="size-4 text-amber-400" />
+                      ) : (
+                        <ShieldOff className="size-4 text-muted-foreground/70" />
+                      )}
+                    </TooltipTrigger>
+                    <TooltipContent side="top" sideOffset={4}>
+                      {workflow.webhook.api_key?.is_active
+                        ? "Webhook is protected"
+                        : workflow.webhook.api_key
+                          ? "API key revoked"
+                          : "Webhook is unprotected"}
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
+            </div>
+          </div>
+        </CardHeader>
+        {style.showContent && (
+          <>
+            <Separator />
+            <div className="p-4">
+              <div className="space-y-4">
+                {/* Webhook status */}
+                <div
+                  className={cn(
+                    "flex h-8 cursor-pointer items-center justify-center gap-1 rounded-lg border text-xs text-muted-foreground",
+                    workflow?.webhook.status === "offline"
+                      ? "bg-muted-foreground/5 text-muted-foreground/50"
+                      : "bg-background text-emerald-500"
+                  )}
+                  onClick={() => openTriggerPanel(TriggerPanelTabs.webhook)}
+                >
+                  <WebhookIcon className="size-3" />
+                  <span>Webhook</span>
+                  <span
+                    className={cn(
+                      "ml-2 inline-block size-2 rounded-full ",
+                      workflow.webhook.status === "online"
+                        ? "bg-emerald-500"
+                        : "bg-gray-300"
+                    )}
+                  />
+                </div>
+                {caseAddonsEnabled && (
+                  <div
+                    className={cn(
+                      "flex h-8 cursor-pointer items-center justify-center gap-1 rounded-lg border text-xs text-muted-foreground",
+                      isCaseTriggerEnabled
+                        ? "bg-background text-emerald-500"
+                        : "bg-muted-foreground/5 text-muted-foreground/50"
+                    )}
+                    onClick={() =>
+                      openTriggerPanel(TriggerPanelTabs.caseTriggers)
+                    }
+                  >
+                    <SquarePlay className="size-3" />
+                    <span>Case triggers</span>
+                    <span
+                      className={cn(
+                        "ml-2 inline-block size-2 rounded-full",
+                        isCaseTriggerEnabled ? "bg-emerald-500" : "bg-gray-300"
+                      )}
+                    />
+                  </div>
+                )}
+                {/* Schedule table */}
+                <div
+                  className="rounded-lg border cursor-pointer"
+                  onClick={() => openTriggerPanel(TriggerPanelTabs.schedules)}
+                >
+                  <TriggerNodeSchedulesTable workflowId={workflow.id} />
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+        <TriggerSourceHandle />
+      </Card>
+
+      {style.showContent && (
+        <div
+          className="nodrag nopan nowheel absolute left-0 top-0 z-10 resize overflow-hidden rounded-xl border bg-background p-2"
+          style={{
+            width: TRIGGER_PAYLOAD_PANEL_DEFAULT_WIDTH,
+            height: TRIGGER_PAYLOAD_PANEL_DEFAULT_HEIGHT,
+            minWidth: TRIGGER_PAYLOAD_PANEL_MIN_WIDTH,
+            minHeight: TRIGGER_PAYLOAD_PANEL_MIN_HEIGHT,
+            transform: `translate(${TRIGGER_NODE_WIDTH + TRIGGER_PAYLOAD_PANEL_GAP}px, 0px)`,
+          }}
+          onClick={(event) => {
+            event.stopPropagation()
+          }}
+        >
+          <div className="flex h-full min-h-0 flex-col">
+            <div className="mb-2 flex items-center gap-1 px-1">
+              <HoverCard openDelay={100} closeDelay={100}>
+                <HoverCardTrigger asChild className="hover:border-none">
+                  <button
+                    type="button"
+                    className="inline-flex items-center"
+                    aria-label="Explain trigger inputs"
+                  >
+                    <Info className="size-3 stroke-muted-foreground" />
+                  </button>
+                </HoverCardTrigger>
+                <HoverCardContent
+                  className="w-[300px] bg-white p-3 font-mono text-xs tracking-tight text-foreground"
+                  side="top"
+                  align="start"
+                  sideOffset={10}
+                >
+                  <div className="w-full space-y-4">
+                    <div className="flex w-full items-center justify-between text-muted-foreground">
+                      <span className="font-mono text-sm font-semibold">
+                        Trigger inputs
+                      </span>
+                    </div>
+                    <span className="text-muted-foreground">
+                      This JSON payload is passed to{" "}
+                      <code className="text-foreground">TRIGGER</code>{" "}
+                      expressions when you run the workflow.
+                    </span>
+                  </div>
+                </HoverCardContent>
+              </HoverCard>
+              <span className="text-xs font-medium text-foreground">
+                Trigger inputs
+              </span>
+            </div>
+            <CodeEditor
+              value={triggerPayload}
+              language="json"
+              onChange={setTriggerPayload}
+              className={cn(
+                "flex-1 [&_.cm-editor]:h-full [&_.cm-editor]:border-input [&_.cm-editor]:bg-background",
+                "[&_.cm-scroller]:h-full [&_.cm-scroller]:min-h-0 [&_.cm-scroller]:overflow-auto"
+              )}
+            />
+            {triggerPayloadError && (
+              <div className="mt-2 flex items-start gap-2 px-3 pb-3 text-[11px]">
+                <AlertTriangleIcon className="mt-0.5 size-3 shrink-0 text-rose-500" />
+                <span className="text-rose-500">{triggerPayloadError}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+})
+
+function TriggerNodeSchedulesTable({ workflowId }: { workflowId: string }) {
+  const { schedules, schedulesIsLoading, schedulesError } =
+    useSchedules(workflowId)
+
+  if (schedulesIsLoading) {
+    return (
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="h-8 text-center text-xs" colSpan={2}>
+              <div className="flex items-center justify-center gap-1">
+                <Skeleton className="size-3" />
+                <Skeleton className="h-3 w-16" />
+              </div>
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+
+        <TableBody>
+          <TableRow className="items-center text-center text-xs">
+            <TableCell>
+              <div className="flex w-full items-center justify-center gap-2">
+                <Skeleton className="h-3 w-24" />
+                <Skeleton className="size-2 rounded-full" />
+              </div>
+            </TableCell>
+          </TableRow>
+        </TableBody>
+      </Table>
+    )
+  }
+  if (schedulesError || !schedules) {
+    return <UnplugIcon className="size-4 text-muted-foreground" />
+  }
+
+  const now = new Date()
+
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="h-8 text-center text-xs" colSpan={2}>
+            <div className="flex items-center justify-center gap-1">
+              <CalendarCheck className="size-3" />
+              <span>Schedules</span>
+            </div>
+          </TableHead>
+        </TableRow>
+      </TableHeader>
+
+      <TableBody>
+        {schedules.length > 0 ? (
+          schedules.map(({ id, status, every, cron, start_at, end_at }) => {
+            const isCron = Boolean(cron)
+            const label = isCron
+              ? cron
+              : every
+                ? `Every ${durationToHumanReadable(every)}`
+                : "Scheduled"
+
+            const start = start_at ? new Date(start_at) : null
+            const end = end_at ? new Date(end_at) : null
+            const hasStart = start && !Number.isNaN(start.getTime())
+            const hasEnd = end && !Number.isNaN(end.getTime())
+
+            const isUpcoming =
+              status === "online" && hasStart && now < (start as Date)
+            const isExpired =
+              status === "online" && hasEnd && now > (end as Date)
+            const hasWindow = hasStart || hasEnd
+
+            return (
+              <TableRow
+                key={id}
+                className="items-center text-center text-xs text-muted-foreground"
+              >
+                <TableCell>
+                  <div className="flex w-full items-center justify-center gap-2">
+                    <span
+                      className={cn(
+                        "flex items-center gap-2",
+                        status === "offline" && "text-muted-foreground/80"
+                      )}
+                    >
+                      {hasWindow && (
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <CalendarClockIcon className="size-3 text-muted-foreground" />
+                            </TooltipTrigger>
+                            <TooltipContent side="top" sideOffset={4}>
+                              {hasStart && hasEnd && start && end
+                                ? `Active from ${start.toLocaleString()} to ${end.toLocaleString()}`
+                                : hasStart && start
+                                  ? `Starts at ${start.toLocaleString()}`
+                                  : hasEnd && end
+                                    ? `Ends at ${end.toLocaleString()}`
+                                    : "Time window configured"}
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      )}
+                      {isCron ? (
+                        <>
+                          <span className="font-medium">Cron</span>
+                          <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                            {label}
+                          </code>
+                        </>
+                      ) : (
+                        label
+                      )}
+                    </span>
+                    {status === "online" ? (
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span
+                              className={cn(
+                                "inline-block size-2 rounded-full",
+                                isUpcoming && "bg-amber-400",
+                                isExpired && "bg-muted-foreground",
+                                !isUpcoming && !isExpired && "bg-emerald-500"
+                              )}
+                            />
+                          </TooltipTrigger>
+                          <TooltipContent side="top" sideOffset={4}>
+                            {isUpcoming && start
+                              ? `Starts at ${start.toLocaleString()}`
+                              : isExpired && end
+                                ? `Ended at ${end.toLocaleString()}`
+                                : "Schedule active"}
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    ) : (
+                      <TimerOffIcon className="size-3 text-muted-foreground" />
+                    )}
+                  </div>
+                </TableCell>
+              </TableRow>
+            )
+          })
+        ) : (
+          <TableRow className="justify-center text-xs text-muted-foreground">
+            <TableCell
+              className="h-8 bg-muted-foreground/5 text-center"
+              colSpan={4}
+            >
+              No schedules
+            </TableCell>
+          </TableRow>
+        )}
+      </TableBody>
+    </Table>
+  )
+}

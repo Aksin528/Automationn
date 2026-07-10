@@ -1,0 +1,1099 @@
+import uuid
+from datetime import datetime
+from typing import Literal, NoReturn, TypedDict
+
+from asyncpg import DuplicateColumnError
+from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy.exc import DBAPIError, NoResultFound, ProgrammingError
+from starlette.status import (
+    HTTP_200_OK,
+    HTTP_201_CREATED,
+    HTTP_204_NO_CONTENT,
+    HTTP_400_BAD_REQUEST,
+    HTTP_403_FORBIDDEN,
+    HTTP_404_NOT_FOUND,
+    HTTP_409_CONFLICT,
+    HTTP_422_UNPROCESSABLE_ENTITY,
+    HTTP_500_INTERNAL_SERVER_ERROR,
+)
+
+from tracecat import config
+from tracecat.auth.dependencies import WorkspaceActorRouteRole
+from tracecat.auth.schemas import UserRead
+from tracecat.auth.users import search_users
+from tracecat.authz.controls import require_scope
+from tracecat.cases.dropdowns.service import CaseDropdownValuesService
+from tracecat.cases.enums import CasePriority, CaseSeverity, CaseStatus
+from tracecat.cases.filters import parse_assignee_filter
+from tracecat.cases.rows.service import CaseTableRowsService
+from tracecat.cases.schemas import (
+    AssigneeChangedEventRead,
+    CaseCommentCreate,
+    CaseCommentRead,
+    CaseCommentThreadRead,
+    CaseCommentUpdate,
+    CaseCreate,
+    CaseEventRead,
+    CaseEventsWithUsers,
+    CaseFieldCreate,
+    CaseFieldRead,
+    CaseFieldReadMinimal,
+    CaseFieldUpdate,
+    CaseRead,
+    CaseReadMinimal,
+    CaseSearchAggregateRead,
+    CaseTaskCreate,
+    CaseTaskRead,
+    CaseTaskUpdate,
+    CaseUpdate,
+    TaskAssigneeChangedEventRead,
+)
+from tracecat.cases.service import (
+    CaseCommentsService,
+    CaseFieldsService,
+    CasesService,
+    CaseTasksService,
+)
+from tracecat.cases.tags.schemas import CaseTagRead
+from tracecat.cases.tags.service import CaseTagsService
+from tracecat.db.dependencies import AsyncDBSession
+from tracecat.exceptions import (
+    TracecatAuthorizationError,
+    TracecatNotFoundError,
+    TracecatValidationError,
+)
+from tracecat.identifiers.workflow import WorkflowUUID
+from tracecat.logger import logger
+from tracecat.pagination import (
+    CursorPaginatedResponse,
+    CursorPaginationParams,
+)
+from tracecat.tiers.enums import Entitlement
+
+cases_router = APIRouter(prefix="/cases", tags=["cases"])
+case_fields_router = APIRouter(prefix="/case-fields", tags=["cases"])
+
+
+class ParsedCaseSearchFilters(TypedDict):
+    assignee_ids: list[uuid.UUID] | None
+    include_unassigned: bool
+    tag_ids: list[uuid.UUID] | None
+    dropdown_filters: dict[str, list[str]] | None
+
+
+def _raise_comment_http_error(
+    exc: TracecatValidationError | TracecatAuthorizationError,
+) -> NoReturn:
+    if isinstance(exc, TracecatValidationError):
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
+def _raise_case_field_http_error(
+    exc: ValueError | TracecatValidationError,
+) -> NoReturn:
+    """Convert case-field validation failures into HTTP 400 responses."""
+    raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+def _parse_dropdown_filter(
+    dropdown: list[str] | None,
+) -> dict[str, list[str]] | None:
+    parsed_dropdown_filters: dict[str, list[str]] | None = None
+    if dropdown:
+        parsed_dropdown_filters = {}
+        for entry in dropdown:
+            if ":" not in entry:
+                raise HTTPException(
+                    status_code=HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid dropdown filter format: {entry!r}. Expected 'definition_ref:option_ref'.",
+                )
+            def_ref, opt_ref = entry.split(":", 1)
+            parsed_dropdown_filters.setdefault(def_ref, []).append(opt_ref)
+    return parsed_dropdown_filters
+
+
+async def _resolve_tag_ids(
+    *,
+    tags: list[str] | None,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+) -> list[uuid.UUID] | None:
+    if not tags:
+        return None
+
+    tag_ids: list[uuid.UUID] = []
+    tags_service = CaseTagsService(session, role)
+    for tag_identifier in tags:
+        try:
+            tag = await tags_service.get_tag_by_ref_or_id(tag_identifier)
+            tag_ids.append(tag.id)
+        except NoResultFound:
+            continue
+    return tag_ids or None
+
+
+async def _parse_case_search_filters(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    assignee_id: list[str] | None,
+    tags: list[str] | None,
+    dropdown: list[str] | None,
+) -> ParsedCaseSearchFilters:
+    include_assignees = parse_assignee_filter(assignee_id)
+
+    return {
+        "assignee_ids": include_assignees["assignee_ids"],
+        "include_unassigned": include_assignees["include_unassigned"],
+        "tag_ids": await _resolve_tag_ids(tags=tags, role=role, session=session),
+        "dropdown_filters": _parse_dropdown_filter(dropdown),
+    }
+
+
+# Case Management
+
+
+@cases_router.get("")
+@require_scope("case:read")
+async def list_cases(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    limit: int = Query(
+        config.TRACECAT__LIMIT_DEFAULT,
+        ge=config.TRACECAT__LIMIT_MIN,
+        le=config.TRACECAT__LIMIT_CURSOR_MAX,
+        description="Maximum items per page",
+    ),
+    cursor: str | None = Query(None, description="Cursor for pagination"),
+    reverse: bool = Query(False, description="Reverse pagination direction"),
+    order_by: Literal[
+        "created_at", "updated_at", "priority", "severity", "status", "tasks"
+    ]
+    | None = Query(
+        None,
+        description="Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks). Default: created_at",
+    ),
+    sort: Literal["asc", "desc"] | None = Query(
+        None, description="Direction to sort (asc or desc)"
+    ),
+    include_rows: bool = Query(False, description="Include linked table rows"),
+    field_ids: list[str] | None = Query(
+        None, description="Include only the requested custom field IDs"
+    ),
+    include_durations: bool = Query(False, description="Include case duration values"),
+) -> CursorPaginatedResponse[CaseReadMinimal]:
+    """List cases with default filtering and sorting options."""
+    service = CasesService(session, role)
+
+    try:
+        cases = await service.list_cases(
+            limit=limit,
+            cursor=cursor,
+            reverse=reverse,
+            order_by=order_by,
+            sort=sort,
+            include_durations=include_durations,
+        )
+    except ValueError as e:
+        logger.warning(f"Invalid request for list cases: {e}")
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to list cases: {e}")
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve cases",
+        ) from e
+    if include_rows and cases.items:
+        try:
+            rows_service = CaseTableRowsService(session, role)
+            rows_by_case = await rows_service.hydrate_case_rows(
+                case_ids=[item.id for item in cases.items],
+                include_row_data=True,
+            )
+            cases.items = [
+                item.model_copy(update={"rows": rows_by_case.get(item.id, [])})
+                for item in cases.items
+            ]
+        except Exception as e:
+            logger.error(f"Failed to hydrate case rows: {e}")
+            raise HTTPException(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to hydrate linked rows",
+            ) from e
+    if field_ids:
+        try:
+            fields_service = CaseFieldsService(session, role)
+            fields_by_case = await fields_service.batch_get_fields(
+                case_ids=[item.id for item in cases.items],
+                field_ids=field_ids,
+            )
+            if cases.items:
+                cases.items = [
+                    item.model_copy(
+                        update={"field_values": fields_by_case.get(item.id)}
+                    )
+                    for item in cases.items
+                ]
+        except ValueError as e:
+            logger.warning(f"Invalid request for case field hydration: {e}")
+            raise HTTPException(
+                status_code=HTTP_400_BAD_REQUEST,
+                detail=str(e),
+            ) from e
+        except Exception as e:
+            logger.error(f"Failed to hydrate case fields: {e}")
+            raise HTTPException(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to hydrate case fields",
+            ) from e
+    return cases
+
+
+@cases_router.get("/search")
+@require_scope("case:read")
+async def search_cases(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    limit: int = Query(
+        config.TRACECAT__LIMIT_DEFAULT,
+        ge=config.TRACECAT__LIMIT_MIN,
+        le=config.TRACECAT__LIMIT_CURSOR_MAX,
+        description="Maximum items per page",
+    ),
+    cursor: str | None = Query(None, description="Cursor for pagination"),
+    reverse: bool = Query(False, description="Reverse pagination direction"),
+    search_term: str | None = Query(
+        None,
+        description="Text to search for in case summary, description, or short ID",
+    ),
+    short_id: str | None = Query(
+        None,
+        description="Search by exact case short ID (e.g. 42 or CASE-0042)",
+    ),
+    status: list[CaseStatus] | None = Query(None, description="Filter by case status"),
+    priority: list[CasePriority] | None = Query(
+        None, description="Filter by case priority"
+    ),
+    severity: list[CaseSeverity] | None = Query(
+        None, description="Filter by case severity"
+    ),
+    tags: list[str] | None = Query(
+        None, description="Filter by tag IDs or slugs (AND logic)"
+    ),
+    dropdown: list[str] | None = Query(
+        None,
+        description="Filter by dropdown values. Format: definition_ref:option_ref (AND across definitions, OR within)",
+    ),
+    start_time: datetime | None = Query(
+        None, description="Return cases created at or after this timestamp"
+    ),
+    end_time: datetime | None = Query(
+        None, description="Return cases created at or before this timestamp"
+    ),
+    updated_after: datetime | None = Query(
+        None, description="Return cases updated at or after this timestamp"
+    ),
+    updated_before: datetime | None = Query(
+        None, description="Return cases updated at or before this timestamp"
+    ),
+    assignee_id: list[str] | None = Query(
+        None, description="Filter by assignee ID or 'unassigned'"
+    ),
+    order_by: Literal[
+        "created_at", "updated_at", "priority", "severity", "status", "tasks"
+    ]
+    | None = Query(
+        None,
+        description="Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks). Default: created_at",
+    ),
+    sort: Literal["asc", "desc"] | None = Query(
+        None, description="Direction to sort (asc or desc)"
+    ),
+    include_rows: bool = Query(False, description="Include linked table rows"),
+    field_ids: list[str] | None = Query(
+        None, description="Include only the requested custom field IDs"
+    ),
+    include_durations: bool = Query(False, description="Include case duration values"),
+) -> CursorPaginatedResponse[CaseReadMinimal]:
+    """Search cases with cursor-based pagination, filtering, and sorting."""
+    service = CasesService(session, role)
+
+    pagination_params = CursorPaginationParams(
+        limit=limit,
+        cursor=cursor,
+        reverse=reverse,
+    )
+    parsed_filters = await _parse_case_search_filters(
+        role=role,
+        session=session,
+        assignee_id=assignee_id,
+        tags=tags,
+        dropdown=dropdown,
+    )
+
+    try:
+        cases = await service.search_cases(
+            pagination_params,
+            search_term=search_term,
+            short_id=short_id,
+            status=status,
+            priority=priority,
+            severity=severity,
+            assignee_ids=parsed_filters["assignee_ids"],
+            include_unassigned=parsed_filters["include_unassigned"],
+            tag_ids=parsed_filters["tag_ids"],
+            dropdown_filters=parsed_filters["dropdown_filters"],
+            start_time=start_time,
+            end_time=end_time,
+            updated_after=updated_after,
+            updated_before=updated_before,
+            order_by=order_by,
+            sort=sort,
+            include_durations=include_durations,
+        )
+    except ValueError as e:
+        logger.warning(f"Invalid request for search cases: {e}")
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to search cases: {e}")
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve cases",
+        ) from e
+    if include_rows and cases.items:
+        try:
+            rows_service = CaseTableRowsService(session, role)
+            rows_by_case = await rows_service.hydrate_case_rows(
+                case_ids=[item.id for item in cases.items],
+                include_row_data=True,
+            )
+            cases.items = [
+                item.model_copy(update={"rows": rows_by_case.get(item.id, [])})
+                for item in cases.items
+            ]
+        except Exception as e:
+            logger.error(f"Failed to hydrate case rows: {e}")
+            raise HTTPException(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to hydrate linked rows",
+            ) from e
+    if field_ids:
+        try:
+            fields_service = CaseFieldsService(session, role)
+            fields_by_case = await fields_service.batch_get_fields(
+                case_ids=[item.id for item in cases.items],
+                field_ids=field_ids,
+            )
+            if cases.items:
+                cases.items = [
+                    item.model_copy(
+                        update={"field_values": fields_by_case.get(item.id)}
+                    )
+                    for item in cases.items
+                ]
+        except ValueError as e:
+            logger.warning(f"Invalid request for case field hydration: {e}")
+            raise HTTPException(
+                status_code=HTTP_400_BAD_REQUEST,
+                detail=str(e),
+            ) from e
+        except Exception as e:
+            logger.error(f"Failed to hydrate case fields: {e}")
+            raise HTTPException(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to hydrate case fields",
+            ) from e
+    return cases
+
+
+@cases_router.get("/search/aggregate")
+@require_scope("case:read")
+async def search_case_aggregates(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    search_term: str | None = Query(
+        None,
+        description="Text to search for in case summary, description, or short ID",
+    ),
+    status: list[CaseStatus] | None = Query(None, description="Filter by case status"),
+    priority: list[CasePriority] | None = Query(
+        None, description="Filter by case priority"
+    ),
+    severity: list[CaseSeverity] | None = Query(
+        None, description="Filter by case severity"
+    ),
+    tags: list[str] | None = Query(
+        None, description="Filter by tag IDs or slugs (AND logic)"
+    ),
+    dropdown: list[str] | None = Query(
+        None,
+        description="Filter by dropdown values. Format: definition_ref:option_ref (AND across definitions, OR within)",
+    ),
+    start_time: datetime | None = Query(
+        None, description="Return cases created at or after this timestamp"
+    ),
+    end_time: datetime | None = Query(
+        None, description="Return cases created at or before this timestamp"
+    ),
+    updated_after: datetime | None = Query(
+        None, description="Return cases updated at or after this timestamp"
+    ),
+    updated_before: datetime | None = Query(
+        None, description="Return cases updated at or before this timestamp"
+    ),
+    assignee_id: list[str] | None = Query(
+        None, description="Filter by assignee ID or 'unassigned'"
+    ),
+) -> CaseSearchAggregateRead:
+    """Return global case totals and per-stage counts for the current filters."""
+    service = CasesService(session, role)
+    parsed_filters = await _parse_case_search_filters(
+        role=role,
+        session=session,
+        assignee_id=assignee_id,
+        tags=tags,
+        dropdown=dropdown,
+    )
+
+    try:
+        return await service.get_search_case_aggregates(
+            search_term=search_term,
+            status=status,
+            priority=priority,
+            severity=severity,
+            assignee_ids=parsed_filters["assignee_ids"],
+            include_unassigned=parsed_filters["include_unassigned"],
+            tag_ids=parsed_filters["tag_ids"],
+            dropdown_filters=parsed_filters["dropdown_filters"],
+            start_time=start_time,
+            end_time=end_time,
+            updated_after=updated_after,
+            updated_before=updated_before,
+        )
+    except ValueError as e:
+        logger.warning(f"Invalid request for case aggregate counts: {e}")
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch case aggregate counts: {e}")
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve case aggregate counts",
+        ) from e
+
+
+@cases_router.get("/{case_id}")
+@require_scope("case:read")
+async def get_case(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+    include_rows: bool = Query(False, description="Include linked table rows"),
+) -> CaseRead:
+    """Get a specific case."""
+    service = CasesService(session, role)
+    case = await service.get_case(case_id, track_view=True)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    fields = await service.fields.get_fields(case) or {}
+    field_definitions = await service.fields.list_fields()
+    field_schema = await service.fields.get_field_schema()
+    final_fields = []
+    for defn in field_definitions:
+        f = CaseFieldReadMinimal.from_sa(defn, field_schema=field_schema)
+        final_fields.append(
+            CaseFieldRead(
+                **f.model_dump(),
+                value=fields.get(f.id),
+            )
+        )
+
+    # Tags are already loaded via selectinload
+    tag_reads = [
+        CaseTagRead.model_validate(tag, from_attributes=True) for tag in case.tags
+    ]
+
+    # Dropdown values
+    dropdown_service = CaseDropdownValuesService(session, role)
+    dropdown_reads = []
+    if await dropdown_service.has_entitlement(Entitlement.CASE_ADDONS):
+        dropdown_reads = await dropdown_service.list_values_for_case(case.id)
+
+    # Match up the fields with the case field definitions
+    return CaseRead(
+        id=case.id,
+        short_id=case.short_id,
+        created_at=case.created_at,
+        updated_at=case.updated_at,
+        summary=case.summary,
+        status=case.status,
+        priority=case.priority,
+        severity=case.severity,
+        description=case.description,
+        assignee=UserRead.model_validate(case.assignee, from_attributes=True)
+        if case.assignee
+        else None,
+        fields=final_fields,
+        payload=case.payload,
+        tags=tag_reads,
+        dropdown_values=dropdown_reads,
+        rows=(
+            await CaseTableRowsService(session, role).hydrate_case_rows(
+                case_ids=[case.id], include_row_data=True
+            )
+        ).get(case.id, [])
+        if include_rows
+        else [],
+    )
+
+
+@cases_router.post("", status_code=HTTP_201_CREATED)
+@require_scope("case:create")
+async def create_case(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    params: CaseCreate,
+) -> None:
+    """Create a new case."""
+    service = CasesService(session, role)
+    try:
+        await service.create_case(params)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+@cases_router.patch("/{case_id}", status_code=HTTP_204_NO_CONTENT)
+@require_scope("case:update")
+async def update_case(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    params: CaseUpdate,
+    case_id: uuid.UUID,
+) -> None:
+    """Update a case."""
+    service = CasesService(session, role)
+    case = await service.get_case(case_id, for_update=True)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    try:
+        await service.update_case(case, params)
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(e),
+        ) from e
+    except ValueError as e:
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except DBAPIError as e:
+        logger.exception("Database error occurred during case operation")
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database operation failed",
+        ) from e
+
+
+@cases_router.delete("/{case_id}", status_code=HTTP_204_NO_CONTENT)
+@require_scope("case:delete")
+async def delete_case(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> None:
+    """Delete a case."""
+    service = CasesService(session, role)
+    case = await service.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    await service.delete_case(case)
+
+
+# Case Comments
+# Support comments as a first class activity type.
+# We anticipate having other complex comment functionality in the future.
+@cases_router.get("/{case_id}/comments", status_code=HTTP_200_OK)
+@require_scope("case:read")
+async def list_comments(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> list[CaseCommentRead]:
+    """List all comments for a case."""
+    # Get the case first
+    service = CasesService(session, role)
+    case = await service.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    # Execute join query directly in the endpoint
+    comments_svc = CaseCommentsService(session, role)
+    return await comments_svc.list_comments(case)
+
+
+@cases_router.get("/{case_id}/comments/threads", status_code=HTTP_200_OK)
+@require_scope("case:read")
+async def list_comment_threads(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> list[CaseCommentThreadRead]:
+    """List case comment threads."""
+    service = CasesService(session, role)
+    case = await service.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    comments_svc = CaseCommentsService(session, role)
+    return await comments_svc.list_comment_threads(case)
+
+
+@cases_router.post("/{case_id}/comments", status_code=HTTP_201_CREATED)
+@require_scope("case:update")
+async def create_comment(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+    params: CaseCommentCreate,
+) -> None:
+    """Create a new comment on a case."""
+    cases_svc = CasesService(session, role)
+    case = await cases_svc.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    comments_svc = CaseCommentsService(session, role)
+    try:
+        await comments_svc.create_comment(case, params)
+    except (TracecatAuthorizationError, TracecatValidationError) as exc:
+        _raise_comment_http_error(exc)
+
+
+@cases_router.patch(
+    "/{case_id}/comments/{comment_id}",
+    status_code=HTTP_204_NO_CONTENT,
+)
+@require_scope("case:update")
+async def update_comment(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+    comment_id: uuid.UUID,
+    params: CaseCommentUpdate,
+) -> None:
+    """Update an existing comment."""
+    cases_svc = CasesService(session, role)
+    case = await cases_svc.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    comments_svc = CaseCommentsService(session, role)
+    comment = await comments_svc.get_comment_in_case(case.id, comment_id)
+    if comment is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Comment with ID {comment_id} not found",
+        )
+    try:
+        await comments_svc.update_comment(comment, params)
+    except (TracecatAuthorizationError, TracecatValidationError) as exc:
+        _raise_comment_http_error(exc)
+
+
+@cases_router.delete(
+    "/{case_id}/comments/{comment_id}", status_code=HTTP_204_NO_CONTENT
+)
+@require_scope("case:delete")
+async def delete_comment(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+    comment_id: uuid.UUID,
+) -> None:
+    """Delete a comment."""
+    cases_svc = CasesService(session, role)
+    case = await cases_svc.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    comments_svc = CaseCommentsService(session, role)
+    comment = await comments_svc.get_comment_in_case(case.id, comment_id)
+    if comment is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Comment with ID {comment_id} not found",
+        )
+    try:
+        await comments_svc.delete_comment(comment)
+    except (TracecatAuthorizationError, TracecatValidationError) as exc:
+        _raise_comment_http_error(exc)
+
+
+# Case Fields
+
+
+@case_fields_router.get("")
+@require_scope("case:read")
+async def list_fields(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+) -> list[CaseFieldReadMinimal]:
+    """List all case fields."""
+    service = CaseFieldsService(session, role)
+    columns = await service.list_fields()
+    field_schema = await service.get_field_schema()
+    return [
+        CaseFieldReadMinimal.from_sa(column, field_schema=field_schema)
+        for column in columns
+    ]
+
+
+@case_fields_router.post("", status_code=HTTP_201_CREATED)
+@require_scope("case:create")
+async def create_field(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    params: CaseFieldCreate,
+) -> None:
+    """Create a new case field."""
+    service = CaseFieldsService(session, role)
+    try:
+        await service.create_field(params)
+    except (ValueError, TracecatValidationError) as exc:
+        _raise_case_field_http_error(exc)
+    except ProgrammingError as e:
+        # Drill down to the root cause
+        while (cause := e.__cause__) is not None:
+            e = cause
+        if isinstance(e, DuplicateColumnError):
+            raise HTTPException(
+                status_code=HTTP_409_CONFLICT,
+                detail=f"A field with the name '{params.name}' already exists",
+            ) from e
+        raise
+
+
+@case_fields_router.patch("/{field_id}", status_code=HTTP_204_NO_CONTENT)
+@require_scope("case:update")
+async def update_field(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    field_id: str,
+    params: CaseFieldUpdate,
+) -> None:
+    """Update a case field."""
+    service = CaseFieldsService(session, role)
+    try:
+        await service.update_field(field_id, params)
+    except (ValueError, TracecatValidationError) as exc:
+        _raise_case_field_http_error(exc)
+    except ProgrammingError as err:
+        while (cause := err.__cause__) is not None:
+            err = cause
+        if isinstance(err, DuplicateColumnError):
+            raise HTTPException(
+                status_code=HTTP_409_CONFLICT,
+                detail=f"A field with the name '{params.name}' already exists",
+            ) from err
+        raise
+
+
+@case_fields_router.delete("/{field_id}", status_code=HTTP_204_NO_CONTENT)
+@require_scope("case:delete")
+async def delete_field(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    field_id: str,
+) -> None:
+    """Delete a case field."""
+    service = CaseFieldsService(session, role)
+    try:
+        await service.delete_field(field_id)
+    except (ValueError, TracecatValidationError) as exc:
+        _raise_case_field_http_error(exc)
+
+
+# Case Events
+
+
+@cases_router.get(
+    "/{case_id}/events",
+    status_code=HTTP_200_OK,
+    response_model_exclude_none=True,
+)
+@require_scope("case:read")
+async def list_events_with_users(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> CaseEventsWithUsers:
+    """List all users for a case."""
+    service = CasesService(session, role)
+    case = await service.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    db_events = await service.events.list_events(case)
+    # Get user ids
+    user_ids: set[uuid.UUID] = set()
+    events: list[CaseEventRead] = []
+
+    for db_evt in db_events:
+        evt = CaseEventRead.model_validate(
+            {
+                "type": db_evt.type,
+                "user_id": db_evt.user_id,
+                "created_at": db_evt.created_at,
+                **db_evt.data,
+            }
+        )
+        root_evt = evt.root
+        if isinstance(root_evt, AssigneeChangedEventRead):
+            if root_evt.old is not None:
+                user_ids.add(root_evt.old)
+            if root_evt.new is not None:
+                user_ids.add(root_evt.new)
+        if isinstance(root_evt, TaskAssigneeChangedEventRead):
+            if root_evt.old is not None:
+                user_ids.add(root_evt.old)
+            if root_evt.new is not None:
+                user_ids.add(root_evt.new)
+        if root_evt.user_id is not None:
+            user_ids.add(root_evt.user_id)
+        events.append(evt)
+
+    # Get users
+    users = (
+        [
+            UserRead.model_validate(u, from_attributes=True)
+            for u in await search_users(session=session, user_ids=user_ids)
+        ]
+        if user_ids
+        else []
+    )
+
+    return CaseEventsWithUsers(events=events, users=users)
+
+
+# Case Tasks
+
+
+@cases_router.get(
+    "/{case_id}/tasks",
+    status_code=HTTP_200_OK,
+)
+@require_scope("case:read")
+async def list_tasks(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> list[CaseTaskRead]:
+    """List all tasks for a case."""
+    service = CaseTasksService(session, role)
+    tasks = await service.list_tasks(case_id)
+    return [
+        CaseTaskRead(
+            id=task.id,
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+            case_id=task.case_id,
+            title=task.title,
+            description=task.description,
+            priority=task.priority,
+            status=task.status,
+            assignee=UserRead.model_validate(task.assignee, from_attributes=True)
+            if task.assignee
+            else None,
+            workflow_id=WorkflowUUID.new(task.workflow_id).short()
+            if task.workflow_id
+            else None,
+            default_trigger_values=task.default_trigger_values,
+        )
+        for task in tasks
+    ]
+
+
+@cases_router.post(
+    "/{case_id}/tasks",
+    status_code=HTTP_201_CREATED,
+)
+@require_scope("case:create")
+async def create_task(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+    params: CaseTaskCreate,
+) -> CaseTaskRead:
+    """Create a new task for a case."""
+    service = CaseTasksService(session, role)
+    try:
+        task = await service.create_task(case_id, params)
+        return CaseTaskRead(
+            id=task.id,
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+            case_id=task.case_id,
+            title=task.title,
+            description=task.description,
+            priority=task.priority,
+            status=task.status,
+            assignee=UserRead.model_validate(task.assignee, from_attributes=True)
+            if task.assignee
+            else None,
+            workflow_id=WorkflowUUID.new(task.workflow_id).short()
+            if task.workflow_id
+            else None,
+            default_trigger_values=task.default_trigger_values,
+        )
+    except TracecatNotFoundError as e:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail="Case not found",
+        ) from e
+    except Exception as e:
+        logger.exception("Failed to create task")
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="Failed to create task",
+        ) from e
+
+
+@cases_router.patch(
+    "/{case_id}/tasks/{task_id}",
+    status_code=HTTP_200_OK,
+)
+@require_scope("case:update")
+async def update_task(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+    task_id: uuid.UUID,
+    params: CaseTaskUpdate,
+) -> CaseTaskRead:
+    """Update a task."""
+    service = CaseTasksService(session, role)
+    try:
+        existing = await service.get_task(task_id)
+        if existing.case_id != case_id:
+            raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="Task not found")
+        task = await service.update_task(task_id, params)
+        return CaseTaskRead(
+            id=task.id,
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+            case_id=task.case_id,
+            title=task.title,
+            description=task.description,
+            priority=task.priority,
+            status=task.status,
+            assignee=UserRead.model_validate(task.assignee, from_attributes=True)
+            if task.assignee
+            else None,
+            workflow_id=WorkflowUUID.new(task.workflow_id).short()
+            if task.workflow_id
+            else None,
+            default_trigger_values=task.default_trigger_values,
+        )
+    except TracecatNotFoundError as e:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        ) from e
+    except Exception as e:
+        logger.exception(f"Failed to update task: {e}")
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="Failed to update task",
+        ) from e
+
+
+@cases_router.delete(
+    "/{case_id}/tasks/{task_id}",
+    status_code=HTTP_204_NO_CONTENT,
+)
+@require_scope("case:delete")
+async def delete_task(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+    task_id: uuid.UUID,
+) -> None:
+    """Delete a task."""
+    service = CaseTasksService(session, role)
+    try:
+        existing = await service.get_task(task_id)
+        if existing.case_id != case_id:
+            raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="Task not found")
+        await service.delete_task(task_id)
+    except TracecatNotFoundError as e:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        ) from e
+    except Exception as e:
+        logger.exception(f"Failed to delete task: {e}")
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete task",
+        ) from e

@@ -1,0 +1,1557 @@
+"""Tracecat authn credentials."""
+
+from __future__ import annotations
+
+import secrets
+import uuid
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from functools import partial
+from typing import Annotated, Any, Literal
+
+from async_lru import alru_cache
+from fastapi import (
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Security,
+    status,
+)
+from fastapi.security import (
+    APIKeyHeader,
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+    OAuth2PasswordBearer,
+)
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from tracecat import config
+from tracecat.auth.api_keys import (
+    ORG_API_KEY_PREFIX,
+    WORKSPACE_API_KEY_PREFIX,
+    parse_managed_api_key,
+    verify_api_key,
+)
+from tracecat.auth.executor_tokens import verify_executor_token
+from tracecat.auth.secrets import get_service_key
+from tracecat.auth.types import PlatformRole, Role
+from tracecat.auth.users import (
+    current_active_user,
+    optional_current_active_user,
+)
+from tracecat.authz.controls import has_scope
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
+from tracecat.authz.service import MembershipService, MembershipWithOrg
+from tracecat.contexts import ctx_role
+from tracecat.db.dependencies import AsyncDBSession
+from tracecat.db.engine import get_async_session_bypass_rls_context_manager
+from tracecat.db.models import (
+    GroupMember,
+    GroupRoleAssignment,
+    Organization,
+    OrganizationMembership,
+    RoleScope,
+    Scope,
+    ServiceAccount,
+    ServiceAccountApiKey,
+    User,
+    UserRoleAssignment,
+    Workspace,
+)
+from tracecat.db.models import (
+    Role as DBRole,
+)
+from tracecat.db.rls import set_rls_context, set_rls_context_from_role
+from tracecat.identifiers import InternalServiceID
+from tracecat.logger import logger
+from tracecat.organization.management import (
+    ensure_single_tenant_user_defaults_for_session,
+)
+from tracecat.tiers.access import is_org_entitled
+from tracecat.tiers.enums import Entitlement
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
+internal_service_key_header_scheme = APIKeyHeader(
+    name="x-tracecat-service-key", auto_error=False
+)
+service_account_api_key_bearer_scheme = HTTPBearer(
+    scheme_name="ServiceAccountApiKeyBearer",
+    description="Tracecat service account API key.",
+    auto_error=False,
+)
+
+# Maximum number of memberships to cache per user to prevent memory exhaustion
+MAX_CACHED_MEMBERSHIPS = 1000
+
+
+@alru_cache(maxsize=10000)
+async def _get_workspace_org_id(workspace_id: uuid.UUID) -> uuid.UUID | None:
+    """Get organization_id for a workspace (cached).
+
+    The workspace→organization mapping is immutable, so this can be cached
+    indefinitely without TTL.
+    """
+    async with get_async_session_bypass_rls_context_manager() as session:
+        stmt = select(Workspace.organization_id).where(Workspace.id == workspace_id)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+
+UNAUTHORIZED_EXCEPTION = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Unauthorized",
+    headers={"WWW-Authenticate": "Cookie"},
+)
+
+HTTP_EXC = partial(
+    lambda msg: HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=msg or "Unauthorized",
+        headers={"WWW-Authenticate": "Cookie"},
+    )
+)
+
+
+async def compute_effective_scopes(role: Role) -> frozenset[str]:
+    """Compute the effective scopes for a role.
+
+    Results are cached by (user_id, organization_id, workspace_id) with a
+    30-second TTL so that repeated requests from the same user don't
+    re-run the multi-table JOIN query every time.
+
+    Queries UserRoleAssignment and GroupRoleAssignment tables to resolve
+    scopes through Role → RoleScope → Scope.
+
+    Scope computation follows this hierarchy:
+    1. Roles explicitly executing with platform-superuser privileges get "*"
+    2. Service principals (non-user flows) use static allowlist scopes
+    3. Direct user role assignments (org-wide and workspace-specific)
+    4. Group role assignments (org-wide and workspace-specific)
+    """
+    if role.is_platform_superuser:
+        return frozenset({"*"})
+
+    if role.type == "service_account":
+        return role.scopes or frozenset()
+
+    if role.type == "service":
+        service_scopes = SERVICE_PRINCIPAL_SCOPES.get(role.service_id)
+        if service_scopes is None:
+            logger.warning(
+                "Unknown service principal for scope derivation",
+                service_id=role.service_id,
+                source="service_allowlist",
+            )
+            return frozenset()
+        logger.debug(
+            "Resolved effective scopes from service allowlist",
+            service_id=role.service_id,
+            scope_count=len(service_scopes),
+            source="service_allowlist",
+        )
+        return service_scopes
+
+    if role.user_id is None or role.organization_id is None:
+        return frozenset()
+
+    scopes = await _compute_effective_scopes_cached(
+        role.user_id, role.organization_id, role.workspace_id
+    )
+    logger.debug(
+        "Resolved effective scopes from user RBAC",
+        user_id=role.user_id,
+        organization_id=role.organization_id,
+        workspace_id=role.workspace_id,
+        scope_count=len(scopes),
+        source="user_rbac",
+    )
+    return scopes
+
+
+@alru_cache(maxsize=10000, ttl=30)
+async def _compute_effective_scopes_cached(
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    workspace_id: uuid.UUID | None,
+) -> frozenset[str]:
+    async with get_async_session_bypass_rls_context_manager() as session:
+        user_workspace_condition = (
+            or_(
+                UserRoleAssignment.workspace_id.is_(None),
+                UserRoleAssignment.workspace_id == workspace_id,
+            )
+            if workspace_id is not None
+            else UserRoleAssignment.workspace_id.is_(None)
+        )
+
+        group_workspace_condition = (
+            or_(
+                GroupRoleAssignment.workspace_id.is_(None),
+                GroupRoleAssignment.workspace_id == workspace_id,
+            )
+            if workspace_id is not None
+            else GroupRoleAssignment.workspace_id.is_(None)
+        )
+        # Direct user role assignments → Role → RoleScope → Scope
+        user_scopes = (
+            select(Scope.name)
+            .join(RoleScope, RoleScope.scope_id == Scope.id)
+            .join(DBRole, DBRole.id == RoleScope.role_id)
+            .join(UserRoleAssignment, UserRoleAssignment.role_id == DBRole.id)
+            .where(
+                UserRoleAssignment.user_id == user_id,
+                UserRoleAssignment.organization_id == organization_id,
+                user_workspace_condition,
+            )
+        )
+
+        # Group role assignments → GroupMember → GroupRoleAssignment → Role → RoleScope → Scope
+        group_scopes = (
+            select(Scope.name)
+            .join(RoleScope, RoleScope.scope_id == Scope.id)
+            .join(DBRole, DBRole.id == RoleScope.role_id)
+            .join(GroupRoleAssignment, GroupRoleAssignment.role_id == DBRole.id)
+            .join(GroupMember, GroupMember.group_id == GroupRoleAssignment.group_id)
+            .where(
+                GroupMember.user_id == user_id,
+                GroupRoleAssignment.organization_id == organization_id,
+                group_workspace_condition,
+            )
+        )
+
+        # Single atomic query: union both assignment paths
+        combined = user_scopes.union(group_scopes)
+        result = await session.execute(combined)
+        return frozenset(result.scalars().all())
+
+
+def get_role_from_user(
+    user: User,
+    organization_id: uuid.UUID,
+    workspace_id: uuid.UUID | None = None,
+    service_id: InternalServiceID = "tracecat-api",
+    is_platform_superuser: bool = False,
+) -> Role:
+    return Role(
+        type="user",
+        workspace_id=workspace_id,
+        organization_id=organization_id,
+        user_id=user.id,
+        service_id=service_id,
+        is_platform_superuser=is_platform_superuser,
+    )
+
+
+def _get_bearer_token(request: Request) -> str | None:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return None
+    scheme, _, token = auth_header.partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        return None
+    return token
+
+
+ServiceAccountApiKeyBearerCredentialsDep = Annotated[
+    HTTPAuthorizationCredentials | None,
+    Security(service_account_api_key_bearer_scheme),
+]
+
+
+def _get_service_account_api_key_from_bearer(
+    credentials: ServiceAccountApiKeyBearerCredentialsDep,
+) -> str | None:
+    if credentials is None:
+        return None
+    token = credentials.credentials.strip()
+    if token.startswith((ORG_API_KEY_PREFIX, WORKSPACE_API_KEY_PREFIX)):
+        return token
+    return None
+
+
+async def _authenticate_service(
+    request: Request, api_key: str | None = None
+) -> Role | None:
+    if not api_key:
+        return None
+
+    service_role_id = request.headers.get("x-tracecat-role-service-id")
+    if service_role_id is None:
+        msg = "Missing x-tracecat-role-service-id header"
+        logger.error(msg)
+        raise HTTP_EXC(msg)
+    if service_role_id not in config.TRACECAT__SERVICE_ROLES_WHITELIST:
+        msg = f"x-tracecat-role-service-id {service_role_id!r} invalid or not allowed"
+        logger.error(msg)
+        raise HTTP_EXC(msg)
+    if not secrets.compare_digest(api_key, get_service_key()):
+        logger.error("Could not validate service key")
+        raise UNAUTHORIZED_EXCEPTION
+    user_id = (
+        uuid.UUID(uid)
+        if (uid := request.headers.get("x-tracecat-role-user-id")) is not None
+        else None
+    )
+    workspace_id = (
+        uuid.UUID(ws_id)
+        if (ws_id := request.headers.get("x-tracecat-role-workspace-id")) is not None
+        else None
+    )
+    bound_workspace_id = (
+        uuid.UUID(bound_ws_id)
+        if (bound_ws_id := request.headers.get("x-tracecat-role-bound-workspace-id"))
+        is not None
+        else None
+    )
+    organization_id = (
+        uuid.UUID(org_id)
+        if (org_id := request.headers.get("x-tracecat-role-organization-id"))
+        is not None
+        else None
+    )
+    # Backward compatibility: derive org from workspace when older callers
+    # don't propagate x-tracecat-role-organization-id yet.
+    if (
+        organization_id is None
+        and (context_workspace_id := workspace_id or bound_workspace_id) is not None
+    ):
+        organization_id = await _get_workspace_org_id(context_workspace_id)
+    # Parse scopes from header if present (for inter-service calls)
+    scopes: frozenset[str] = frozenset()
+    if scopes_header := request.headers.get("x-tracecat-role-scopes"):
+        scopes = frozenset(
+            stripped for s in scopes_header.split(",") if (stripped := s.strip())
+        )
+    service_account_id = (
+        uuid.UUID(raw_service_account_id)
+        if (
+            raw_service_account_id := request.headers.get(
+                "x-tracecat-role-service-account-id"
+            )
+        )
+        is not None
+        else None
+    )
+    role_type: Literal["service", "service_account"] = "service"
+    if request.headers.get("x-tracecat-role-type") == "service_account":
+        if service_account_id is None:
+            raise HTTP_EXC("Missing x-tracecat-role-service-account-id header")
+        if organization_id is None:
+            raise HTTP_EXC("Missing x-tracecat-role-organization-id header")
+        if user_id is not None:
+            raise HTTP_EXC("Service account role must not include user_id")
+        role_type = "service_account"
+    service_id: InternalServiceID = service_role_id  # type: ignore[assignment]
+    return Role(
+        type=role_type,
+        service_id=service_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        bound_workspace_id=bound_workspace_id,
+        organization_id=organization_id,
+        service_account_id=service_account_id,
+        scopes=scopes,
+    )
+
+
+async def _authenticate_api_key(
+    *,
+    api_key: str,
+    workspace_id: uuid.UUID | None,
+) -> Role | None:
+    parsed = parse_managed_api_key(api_key)
+    if parsed is None:
+        return None
+
+    async with get_async_session_bypass_rls_context_manager() as session:
+        stmt = (
+            select(ServiceAccountApiKey)
+            .where(ServiceAccountApiKey.key_id == parsed.key_id)
+            .options(
+                selectinload(ServiceAccountApiKey.service_account).selectinload(
+                    ServiceAccount.scopes
+                )
+            )
+        )
+        result = await session.execute(stmt)
+        record = result.scalar_one_or_none()
+        if record is None or record.revoked_at is not None:
+            raise UNAUTHORIZED_EXCEPTION
+        if not verify_api_key(api_key, record.salt, record.hashed):
+            raise UNAUTHORIZED_EXCEPTION
+        service_account = record.service_account
+        if service_account.disabled_at is not None:
+            raise UNAUTHORIZED_EXCEPTION
+        if not await is_org_entitled(
+            session, service_account.organization_id, Entitlement.SERVICE_ACCOUNTS
+        ):
+            raise UNAUTHORIZED_EXCEPTION
+
+        # `workspace_id` is the effective request context. `bound_workspace_id`
+        # preserves the actor's intrinsic workspace binding for the few places
+        # that need to distinguish actor scope from resolved request scope.
+        bound_workspace_id = service_account.workspace_id
+        resolved_workspace_id: uuid.UUID | None
+        if bound_workspace_id is None:
+            if parsed.prefix != ORG_API_KEY_PREFIX:
+                raise UNAUTHORIZED_EXCEPTION
+            if workspace_id is not None:
+                workspace_org_id = await _get_workspace_org_id(workspace_id)
+                if workspace_org_id is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Workspace not found",
+                    )
+                if workspace_org_id != service_account.organization_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+                    )
+            resolved_workspace_id = workspace_id
+        else:
+            if parsed.prefix != WORKSPACE_API_KEY_PREFIX:
+                raise UNAUTHORIZED_EXCEPTION
+            workspace_org_id = await _get_workspace_org_id(bound_workspace_id)
+            if workspace_org_id is None:
+                raise UNAUTHORIZED_EXCEPTION
+            if workspace_org_id != service_account.organization_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+                )
+            if workspace_id is not None and bound_workspace_id != workspace_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+                )
+            resolved_workspace_id = workspace_id or bound_workspace_id
+
+        record.last_used_at = datetime.now(UTC)
+        session.add(record)
+        await session.commit()
+        return Role(
+            type="service_account",
+            service_id="tracecat-api",
+            organization_id=service_account.organization_id,
+            workspace_id=resolved_workspace_id,
+            bound_workspace_id=bound_workspace_id,
+            service_account_id=service_account.id,
+            scopes=frozenset(scope.name for scope in service_account.scopes),
+        )
+
+
+@contextmanager
+def TemporaryRole(
+    type: Literal["user", "service", "service_account"] = "service",
+    user_id: uuid.UUID | None = None,
+    service_id: InternalServiceID = "tracecat-service",
+):
+    """An async context manager to authenticate a user or service."""
+    prev_role = ctx_role.get()
+    temp_role = Role(
+        type=type,
+        user_id=user_id,
+        service_id=service_id,
+        scopes=(
+            SERVICE_PRINCIPAL_SCOPES.get(service_id, frozenset())
+            if type == "service"
+            else frozenset()
+        ),
+    )
+    ctx_role.set(temp_role)
+    try:
+        yield temp_role
+    finally:
+        ctx_role.set(prev_role)
+
+
+OptionalUserDep = Annotated[User | None, Depends(optional_current_active_user)]
+OptionalInternalServiceKeyDep = Annotated[
+    str | None, Security(internal_service_key_header_scheme)
+]
+OptionalTracecatApiKeyDep = Annotated[
+    str | None, Depends(_get_service_account_api_key_from_bearer)
+]
+
+
+# --- Helper Functions for Auth ---
+
+
+async def _get_membership_with_cache(
+    *,
+    request: Request,
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    user: User,
+) -> MembershipWithOrg:
+    """Resolve workspace membership using cache when available.
+
+    Uses request-scoped cache from middleware if present, otherwise falls back
+    to direct database query.
+
+    Raises:
+        HTTPException(403): If user is not a member of the workspace.
+    """
+    membership_with_org: MembershipWithOrg | None = None
+    auth_cache = getattr(request.state, "auth_cache", None)
+
+    if auth_cache is not None:
+        cached_membership = auth_cache["memberships"].get(str(workspace_id))
+        # Validate cached membership belongs to requesting user
+        if cached_membership is not None and cached_membership.user_id == user.id:
+            # Convert cached Membership to MembershipWithOrg by fetching org_id
+            svc = MembershipService(session)
+            membership_with_org = await svc.get_membership(
+                workspace_id=workspace_id, user_id=user.id
+            )
+            logger.debug(
+                "Using cached membership",
+                user_id=user.id,
+                workspace_id=workspace_id,
+                cached=True,
+            )
+        elif not auth_cache["membership_checked"]:
+            # Load all memberships once if not already done
+            svc = MembershipService(session)
+            all_memberships = await svc.list_user_memberships(user_id=user.id)
+
+            # Check cache size limit to prevent memory exhaustion
+            if len(all_memberships) > MAX_CACHED_MEMBERSHIPS:
+                logger.warning(
+                    "User has excessive memberships, caching disabled for security",
+                    user_id=user.id,
+                    membership_count=len(all_memberships),
+                    max_allowed=MAX_CACHED_MEMBERSHIPS,
+                )
+                # Find membership without caching - fetch with org_id
+                membership_with_org = await svc.get_membership(
+                    workspace_id=workspace_id, user_id=user.id
+                )
+            else:
+                # Cache all memberships with user context
+                auth_cache["user_id"] = user.id
+                auth_cache["memberships"] = {
+                    str(m.workspace_id): m for m in all_memberships
+                }
+                auth_cache["membership_checked"] = True
+                auth_cache["all_memberships"] = all_memberships
+
+                # Get the specific membership with org_id
+                membership_with_org = await svc.get_membership(
+                    workspace_id=workspace_id, user_id=user.id
+                )
+
+                logger.debug(
+                    "Loaded and cached all user memberships",
+                    user_id=user.id,
+                    workspace_count=len(all_memberships),
+                    workspace_id=workspace_id,
+                    found=membership_with_org is not None,
+                )
+        elif auth_cache.get("user_id") != user.id:
+            # Cache belongs to different user - security fallback
+            logger.warning(
+                "Cache user mismatch, falling back to direct query",
+                cache_user_id=auth_cache.get("user_id"),
+                request_user_id=user.id,
+            )
+            svc = MembershipService(session)
+            membership_with_org = await svc.get_membership(
+                workspace_id=workspace_id, user_id=user.id
+            )
+    else:
+        # No cache available (e.g., in tests), fall back to direct query
+        svc = MembershipService(session)
+        membership_with_org = await svc.get_membership(
+            workspace_id=workspace_id, user_id=user.id
+        )
+        logger.debug(
+            "No cache available, using direct query",
+            user_id=user.id,
+            workspace_id=workspace_id,
+        )
+
+    if membership_with_org is None:
+        logger.debug(
+            "User is not a member of this workspace",
+            user=user,
+            workspace_id=workspace_id,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    return membership_with_org
+
+
+ACTIVE_ORG_COOKIE = "tracecat:active-org-id"
+
+
+async def _resolve_org_for_regular_user(
+    request: Request,
+    session: AsyncSession,
+    user: User,
+) -> uuid.UUID:
+    """Resolve organization context for a regular user from their memberships.
+
+    Honors the ``tracecat:active-org-id`` cookie when the user is a confirmed
+    member of the cookie's organization. The cookie is an untrusted hint —
+    membership is re-validated here on every request, so a tampered or stale
+    value cannot grant access to an org the user does not belong to.
+
+    Raises:
+        HTTPException(400): If user has no org memberships.
+    """
+    if cookie_value := request.cookies.get(ACTIVE_ORG_COOKIE):
+        try:
+            cookie_org_id = uuid.UUID(cookie_value)
+        except ValueError:
+            cookie_org_id = None
+        if cookie_org_id is not None:
+            membership_stmt = (
+                select(OrganizationMembership.organization_id)
+                .join(
+                    Organization,
+                    Organization.id == OrganizationMembership.organization_id,
+                )
+                .where(
+                    OrganizationMembership.user_id == user.id,
+                    OrganizationMembership.organization_id == cookie_org_id,
+                    Organization.is_active.is_(True),
+                )
+            )
+            membership_row = (
+                await session.execute(membership_stmt)
+            ).scalar_one_or_none()
+            if membership_row is not None:
+                return cookie_org_id
+
+    org_mem_stmt = (
+        select(OrganizationMembership.organization_id)
+        .join(Organization, Organization.id == OrganizationMembership.organization_id)
+        .where(
+            OrganizationMembership.user_id == user.id,
+            Organization.is_active.is_(True),
+        )
+        .order_by(Organization.created_at.asc(), Organization.id.asc())
+    )
+    org_membership_result = await session.execute(org_mem_stmt)
+    org_ids = org_membership_result.scalars().all()
+
+    if len(org_ids) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User has no organization memberships",
+        )
+    # If no explicit active-org cookie/workspace context is available, choose a
+    # stable active membership instead of blocking login for multi-org users.
+    # Callers that need a specific org can still pass workspace_id or set the
+    # active-org cookie; both are re-validated above/before this fallback.
+    return org_ids[0]
+
+
+def _invalidate_user_scope_cache(
+    *,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    workspace_id: uuid.UUID | None,
+) -> None:
+    _compute_effective_scopes_cached.cache_invalidate(user_id, organization_id, None)
+    if workspace_id is not None:
+        _compute_effective_scopes_cached.cache_invalidate(
+            user_id, organization_id, workspace_id
+        )
+
+
+async def _is_org_admin_via_rbac(
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    workspace_id: uuid.UUID | None,
+) -> bool:
+    """Check if user has an org-scoped member-management role in this org/workspace."""
+    role = Role(
+        type="user",
+        user_id=user_id,
+        organization_id=organization_id,
+        workspace_id=workspace_id,
+        service_id="tracecat-api",
+    )
+    return has_scope(
+        await compute_effective_scopes(role),
+        "org:member:invite",
+    )
+
+
+async def _authenticate_user(
+    *,
+    request: Request,
+    session: AsyncSession,
+    user: User,
+    workspace_id: uuid.UUID | None,
+) -> Role:
+    """Authenticate user, resolve workspace/org context, and return Role.
+
+    Handles:
+    1. Workspace membership validation (if workspace_id provided)
+    2. Organization context resolution from tenant memberships
+    3. Role construction (authorization is enforced via scopes, not enum roles)
+    """
+    organization_id: uuid.UUID
+    single_tenant_org_id: uuid.UUID | None = None
+    single_tenant_defaults = await ensure_single_tenant_user_defaults_for_session(
+        session=session,
+        user_id=user.id,
+        is_superuser=user.is_superuser,
+    )
+    single_tenant_org_id = single_tenant_defaults.organization_id
+    if single_tenant_org_id is not None:
+        if single_tenant_defaults.changed:
+            await session.commit()
+            await set_rls_context(
+                session,
+                org_id=None,
+                workspace_id=None,
+                user_id=user.id,
+                bypass=True,
+            )
+            _invalidate_user_scope_cache(
+                user_id=user.id,
+                organization_id=single_tenant_org_id,
+                workspace_id=workspace_id,
+            )
+
+    if workspace_id is not None:
+        resolved_org_id = await _get_workspace_org_id(workspace_id)
+        if resolved_org_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workspace not found",
+            )
+        organization_id = resolved_org_id
+        if single_tenant_org_id is not None and organization_id != single_tenant_org_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+            )
+
+        # Check if user is an org owner/admin via RBAC - they can access all workspaces
+        is_org_admin = await _is_org_admin_via_rbac(
+            user.id,
+            organization_id,
+            workspace_id,
+        )
+
+        if is_org_admin:
+            logger.debug(
+                "Org admin bypassing workspace membership check",
+                user_id=user.id,
+                workspace_id=workspace_id,
+            )
+        else:
+            # Workspace member - validate direct workspace membership.
+            await _get_membership_with_cache(
+                request=request,
+                session=session,
+                workspace_id=workspace_id,
+                user=user,
+            )
+    else:
+        organization_id = single_tenant_org_id or await _resolve_org_for_regular_user(
+            request, session, user
+        )
+
+    return get_role_from_user(
+        user,
+        workspace_id=workspace_id,
+        organization_id=organization_id,
+    )
+
+
+async def _authenticate_executor(
+    *,
+    request: Request,
+    workspace_id: uuid.UUID | None,
+    require_workspace: Literal["yes", "no", "optional"],
+) -> Role:
+    """Authenticate executor via JWT bearer token and return Role."""
+    token = _get_bearer_token(request)
+    if not token:
+        logger.info("Missing executor bearer token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+        )
+
+    try:
+        token_payload = verify_executor_token(token)
+    except ValueError as exc:
+        logger.info("Invalid executor token", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+        ) from exc
+
+    # Look up organization_id from workspace (cached, immutable relationship)
+    organization_id = None
+    if token_payload.workspace_id is not None:
+        organization_id = await _get_workspace_org_id(token_payload.workspace_id)
+
+    executor_service_id: InternalServiceID = (
+        token_payload.service_id or "tracecat-executor"
+    )
+
+    # Construct Role from token payload and organization_id.
+    role = Role(
+        type="service",
+        service_id=executor_service_id,
+        workspace_id=token_payload.workspace_id,
+        organization_id=organization_id,
+        user_id=token_payload.user_id,
+    )
+
+    # Validate workspace requirements for executor
+    if require_workspace == "yes":
+        if role.workspace_id is None:
+            logger.warning("Executor role missing workspace_id", role=role)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+            )
+        if workspace_id is not None and str(role.workspace_id) != str(workspace_id):
+            logger.warning(
+                "Executor role workspace mismatch",
+                role_workspace_id=role.workspace_id,
+                request_workspace_id=workspace_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+            )
+
+    return role
+
+
+async def _validate_role(
+    role: Role,
+    *,
+    require_workspace: Literal["yes", "no", "optional"],
+) -> Role:
+    """Validate structural requirements and compute scopes for the authenticated role.
+
+    Authorization is enforced via DB-driven scopes, not enum role checks.
+
+    Raises:
+        HTTPException(403): If workspace required but missing.
+    """
+    if require_workspace == "yes" and role.workspace_id is None:
+        logger.warning("User does not have access to this workspace", role=role)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    # Compute effective scopes and create new role with scopes included
+    scopes = await compute_effective_scopes(role)
+    logger.debug(
+        "Computed effective scopes",
+        scope_count=len(scopes),
+    )
+    return role.model_copy(update={"scopes": scopes})
+
+
+# --- Main Auth Orchestrator ---
+
+
+async def _role_dependency(
+    *,
+    request: Request,
+    session: AsyncSession,
+    workspace_id: uuid.UUID | None = None,
+    user: User | None = None,
+    api_key: str | None = None,
+    internal_service_key: str | None = None,
+    tracecat_api_key: str | None = None,
+    allow_user: bool,
+    allow_service: bool,
+    allow_api_key: bool = False,
+    allow_executor: bool = False,
+    require_workspace: Literal["yes", "no", "optional"],
+) -> Role:
+    """Main dependency that orchestrates authentication and authorization.
+
+    Delegates to the appropriate auth handler based on credentials and allowed
+    auth types, then validates the resulting role.
+    """
+    # Dispatch to appropriate auth handler
+    role: Role | None = None
+    service_key = internal_service_key or api_key
+
+    if user and allow_user:
+        # Membership and org resolution happen before we know the final role.
+        # Use an auth-safe context for this phase so deny-default RLS does not
+        # block legitimate membership checks.
+        await set_rls_context(
+            session,
+            org_id=None,
+            workspace_id=None,
+            user_id=user.id,
+            bypass=True,
+        )
+        try:
+            role = await _authenticate_user(
+                request=request,
+                session=session,
+                user=user,
+                workspace_id=workspace_id,
+            )
+        except Exception:
+            # Preserve the original auth error if cleanup cannot run.
+            try:
+                await set_rls_context_from_role(session, None)
+            except Exception:
+                logger.warning("Failed to clear RLS context after auth failure")
+            raise
+    elif tracecat_api_key and allow_api_key:
+        role = await _authenticate_api_key(
+            api_key=tracecat_api_key,
+            workspace_id=workspace_id,
+        )
+    elif service_key and allow_service:
+        role = await _authenticate_service(request, service_key)
+    elif allow_executor:
+        role = await _authenticate_executor(
+            request=request,
+            workspace_id=workspace_id,
+            require_workspace=require_workspace,
+        )
+    else:
+        logger.debug("Invalid authentication or authorization", user=user)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    if role is None:
+        logger.warning("Invalid role", role=role)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+        )
+    # Validate structural requirements and compute scopes
+    role = await _validate_role(
+        role,
+        require_workspace=require_workspace,
+    )
+
+    ctx_role.set(role)
+    if config.TRACECAT__RLS_MODE == config.RLSMode.ENFORCE:
+        await set_rls_context_from_role(session, role)
+    else:
+        await set_rls_context(
+            session,
+            org_id=None,
+            workspace_id=None,
+            user_id=role.user_id,
+            bypass=True,
+        )
+    return role
+
+
+def _resolve_workspace_id_from_path_or_query(
+    request: Request,
+    workspace_id_query: uuid.UUID | None,
+) -> uuid.UUID:
+    path_value = request.path_params.get("workspace_id")
+    path_workspace_id: uuid.UUID | None = None
+    if path_value is not None:
+        try:
+            path_workspace_id = (
+                path_value
+                if isinstance(path_value, uuid.UUID)
+                else uuid.UUID(str(path_value))
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid workspace_id path parameter",
+            ) from e
+
+    if (
+        path_workspace_id is not None
+        and workspace_id_query is not None
+        and path_workspace_id != workspace_id_query
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Path and query workspace_id values must match",
+        )
+    workspace_id = path_workspace_id or workspace_id_query
+    if workspace_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="workspace_id is required",
+        )
+    return workspace_id
+
+
+def RoleACL(
+    *,
+    allow_user: bool = True,
+    allow_service: bool = False,
+    allow_api_key: bool = False,
+    allow_executor: bool = False,
+    require_workspace: Literal["yes", "no", "optional"] = "yes",
+    workspace_id_in_path: bool | Literal["auto"] = False,
+) -> Any:
+    """
+    Factory for FastAPI dependency that enforces role-based access control.
+
+    This function creates a dependency for authenticating and authorizing requests
+    based on user/service role and workspace membership.
+    It ensures that the caller meets specified requirements and, if successful,
+    returns a validated `Role` object describing their permissions.
+
+    Args:
+        allow_user (bool, optional): Allow authentication via user session/JWT. Defaults to True.
+        allow_service (bool, optional): Allow internal service-key authentication. Defaults to False.
+        allow_api_key (bool, optional): Allow managed service-account API-key authentication.
+            Defaults to False.
+        require_workspace (Literal["yes", "no", "optional"], optional): Specifies if a workspace ID is required.
+            - "yes": Workspace ID is required.
+            - "no": Workspace ID is not required.
+            - "optional": Workspace ID may be omitted.
+            Defaults to "yes".
+        workspace_id_in_path: Whether to extract `workspace_id` from the path
+            rather than the query string. When set to `"auto"`, resolves path
+            `workspace_id` first and falls back to the legacy query parameter.
+            Defaults to False.
+    Returns:
+        Any: A FastAPI dependency that yields a `Role` instance upon successful
+        authentication and authorization. `Role.workspace_id` is the effective
+        workspace context for the request, while `bound_workspace_id` preserves
+        the actor's intrinsic workspace binding when that distinction matters.
+        If validation fails, raises an HTTPException (401 or 403).
+
+    Raises:
+        ValueError: If invalid or conflicting options are provided (such as `workspace_id_in_path=True`
+            with `require_workspace="optional"`).
+        HTTPException: If authentication fails or the caller lacks required permissions.
+
+    """
+    if not any((allow_user, allow_service, allow_api_key, allow_executor)):
+        raise ValueError(
+            "Must allow either user, service, API key, or executor authentication"
+        )
+
+    # Executor-only auth: workspace_id comes from JWT, not query param
+    is_executor_only = allow_executor and not allow_user and not allow_service
+    if is_executor_only and require_workspace == "yes":
+
+        async def role_dependency_executor_only(
+            request: Request,
+            session: AsyncDBSession,
+        ) -> Role:
+            return await _role_dependency(
+                request=request,
+                session=session,
+                workspace_id=None,  # Comes from JWT
+                user=None,
+                internal_service_key=None,
+                tracecat_api_key=None,
+                allow_user=False,
+                allow_service=False,
+                allow_api_key=False,
+                allow_executor=True,
+                require_workspace=require_workspace,
+            )
+
+        return Depends(role_dependency_executor_only)
+
+    if require_workspace == "yes":
+        if workspace_id_in_path == "auto":
+            if allow_service and allow_api_key:
+
+                async def role_dependency_req_ws_auto(
+                    request: Request,
+                    session: AsyncDBSession,
+                    workspace_id_query: uuid.UUID | None = Query(
+                        default=None,
+                        alias="workspace_id",
+                        include_in_schema=False,
+                    ),
+                    user: OptionalUserDep = None,
+                    internal_service_key: OptionalInternalServiceKeyDep = None,
+                    tracecat_api_key: OptionalTracecatApiKeyDep = None,
+                ) -> Role:
+                    workspace_id = _resolve_workspace_id_from_path_or_query(
+                        request, workspace_id_query
+                    )
+                    return await _role_dependency(
+                        request=request,
+                        session=session,
+                        workspace_id=workspace_id,
+                        user=user,
+                        internal_service_key=internal_service_key,
+                        tracecat_api_key=tracecat_api_key,
+                        allow_user=allow_user,
+                        allow_service=allow_service,
+                        allow_api_key=allow_api_key,
+                        allow_executor=allow_executor,
+                        require_workspace=require_workspace,
+                    )
+
+                return Depends(role_dependency_req_ws_auto)
+
+            if allow_service:
+
+                async def role_dependency_req_ws_auto_service(
+                    request: Request,
+                    session: AsyncDBSession,
+                    workspace_id_query: uuid.UUID | None = Query(
+                        default=None,
+                        alias="workspace_id",
+                        include_in_schema=False,
+                    ),
+                    user: OptionalUserDep = None,
+                    internal_service_key: OptionalInternalServiceKeyDep = None,
+                ) -> Role:
+                    workspace_id = _resolve_workspace_id_from_path_or_query(
+                        request, workspace_id_query
+                    )
+                    return await _role_dependency(
+                        request=request,
+                        session=session,
+                        workspace_id=workspace_id,
+                        user=user,
+                        internal_service_key=internal_service_key,
+                        tracecat_api_key=None,
+                        allow_user=allow_user,
+                        allow_service=allow_service,
+                        allow_api_key=allow_api_key,
+                        allow_executor=allow_executor,
+                        require_workspace=require_workspace,
+                    )
+
+                return Depends(role_dependency_req_ws_auto_service)
+
+            if allow_api_key:
+
+                async def role_dependency_req_ws_auto_api_key(
+                    request: Request,
+                    session: AsyncDBSession,
+                    workspace_id_query: uuid.UUID | None = Query(
+                        default=None,
+                        alias="workspace_id",
+                        include_in_schema=False,
+                    ),
+                    user: OptionalUserDep = None,
+                    tracecat_api_key: OptionalTracecatApiKeyDep = None,
+                ) -> Role:
+                    workspace_id = _resolve_workspace_id_from_path_or_query(
+                        request, workspace_id_query
+                    )
+                    return await _role_dependency(
+                        request=request,
+                        session=session,
+                        workspace_id=workspace_id,
+                        user=user,
+                        internal_service_key=None,
+                        tracecat_api_key=tracecat_api_key,
+                        allow_user=allow_user,
+                        allow_service=allow_service,
+                        allow_api_key=allow_api_key,
+                        allow_executor=allow_executor,
+                        require_workspace=require_workspace,
+                    )
+
+                return Depends(role_dependency_req_ws_auto_api_key)
+
+            async def role_dependency_req_ws_auto_user(
+                request: Request,
+                session: AsyncDBSession,
+                workspace_id_query: uuid.UUID | None = Query(
+                    default=None,
+                    alias="workspace_id",
+                    include_in_schema=False,
+                ),
+                user: OptionalUserDep = None,
+            ) -> Role:
+                workspace_id = _resolve_workspace_id_from_path_or_query(
+                    request, workspace_id_query
+                )
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    workspace_id=workspace_id,
+                    user=user,
+                    internal_service_key=None,
+                    tracecat_api_key=None,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_req_ws_auto_user)
+
+        GetWsDep = Path if workspace_id_in_path else Query
+
+        if allow_service and allow_api_key:
+
+            async def role_dependency_req_ws(
+                request: Request,
+                session: AsyncDBSession,
+                workspace_id: uuid.UUID = GetWsDep(...),
+                user: OptionalUserDep = None,
+                internal_service_key: OptionalInternalServiceKeyDep = None,
+                tracecat_api_key: OptionalTracecatApiKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    workspace_id=workspace_id,
+                    user=user,
+                    internal_service_key=internal_service_key,
+                    tracecat_api_key=tracecat_api_key,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_req_ws)
+
+        if allow_service:
+
+            async def role_dependency_req_ws_service(
+                request: Request,
+                session: AsyncDBSession,
+                workspace_id: uuid.UUID = GetWsDep(...),
+                user: OptionalUserDep = None,
+                internal_service_key: OptionalInternalServiceKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    workspace_id=workspace_id,
+                    user=user,
+                    internal_service_key=internal_service_key,
+                    tracecat_api_key=None,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_req_ws_service)
+
+        if allow_api_key:
+
+            async def role_dependency_req_ws_api_key(
+                request: Request,
+                session: AsyncDBSession,
+                workspace_id: uuid.UUID = GetWsDep(...),
+                user: OptionalUserDep = None,
+                tracecat_api_key: OptionalTracecatApiKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    workspace_id=workspace_id,
+                    user=user,
+                    internal_service_key=None,
+                    tracecat_api_key=tracecat_api_key,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_req_ws_api_key)
+
+        async def role_dependency_req_ws_user(
+            request: Request,
+            session: AsyncDBSession,
+            workspace_id: uuid.UUID = GetWsDep(...),
+            user: OptionalUserDep = None,
+        ) -> Role:
+            return await _role_dependency(
+                request=request,
+                session=session,
+                workspace_id=workspace_id,
+                user=user,
+                internal_service_key=None,
+                tracecat_api_key=None,
+                allow_user=allow_user,
+                allow_service=allow_service,
+                allow_api_key=allow_api_key,
+                allow_executor=allow_executor,
+                require_workspace=require_workspace,
+            )
+
+        return Depends(role_dependency_req_ws_user)
+
+    elif require_workspace == "optional":
+        if workspace_id_in_path:
+            raise ValueError(
+                "workspace_id_in_path is not allowed with optional workspace"
+            )
+
+        if allow_service and allow_api_key:
+
+            async def role_dependency_opt_ws(
+                request: Request,
+                session: AsyncDBSession,
+                workspace_id: uuid.UUID | None = Query(None),
+                user: OptionalUserDep = None,
+                internal_service_key: OptionalInternalServiceKeyDep = None,
+                tracecat_api_key: OptionalTracecatApiKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    workspace_id=workspace_id,
+                    user=user,
+                    internal_service_key=internal_service_key,
+                    tracecat_api_key=tracecat_api_key,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_opt_ws)
+
+        if allow_service:
+
+            async def role_dependency_opt_ws_service(
+                request: Request,
+                session: AsyncDBSession,
+                workspace_id: uuid.UUID | None = Query(None),
+                user: OptionalUserDep = None,
+                internal_service_key: OptionalInternalServiceKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    workspace_id=workspace_id,
+                    user=user,
+                    internal_service_key=internal_service_key,
+                    tracecat_api_key=None,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_opt_ws_service)
+
+        if allow_api_key:
+
+            async def role_dependency_opt_ws_api_key(
+                request: Request,
+                session: AsyncDBSession,
+                workspace_id: uuid.UUID | None = Query(None),
+                user: OptionalUserDep = None,
+                tracecat_api_key: OptionalTracecatApiKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    workspace_id=workspace_id,
+                    user=user,
+                    internal_service_key=None,
+                    tracecat_api_key=tracecat_api_key,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_opt_ws_api_key)
+
+        async def role_dependency_opt_ws_user(
+            request: Request,
+            session: AsyncDBSession,
+            workspace_id: uuid.UUID | None = Query(None),
+            user: OptionalUserDep = None,
+        ) -> Role:
+            return await _role_dependency(
+                request=request,
+                session=session,
+                workspace_id=workspace_id,
+                user=user,
+                internal_service_key=None,
+                tracecat_api_key=None,
+                allow_user=allow_user,
+                allow_service=allow_service,
+                allow_api_key=allow_api_key,
+                allow_executor=allow_executor,
+                require_workspace=require_workspace,
+            )
+
+        return Depends(role_dependency_opt_ws_user)
+    elif require_workspace == "no":
+        if workspace_id_in_path:
+            raise ValueError("workspace_id_in_path is not allowed with no workspace")
+
+        if allow_service and allow_api_key:
+
+            async def role_dependency_not_req_ws(
+                request: Request,
+                session: AsyncDBSession,
+                user: OptionalUserDep = None,
+                internal_service_key: OptionalInternalServiceKeyDep = None,
+                tracecat_api_key: OptionalTracecatApiKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    user=user,
+                    internal_service_key=internal_service_key,
+                    tracecat_api_key=tracecat_api_key,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_not_req_ws)
+
+        if allow_service:
+
+            async def role_dependency_not_req_ws_service(
+                request: Request,
+                session: AsyncDBSession,
+                user: OptionalUserDep = None,
+                internal_service_key: OptionalInternalServiceKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    user=user,
+                    internal_service_key=internal_service_key,
+                    tracecat_api_key=None,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_not_req_ws_service)
+
+        if allow_api_key:
+
+            async def role_dependency_not_req_ws_api_key(
+                request: Request,
+                session: AsyncDBSession,
+                user: OptionalUserDep = None,
+                tracecat_api_key: OptionalTracecatApiKeyDep = None,
+            ) -> Role:
+                return await _role_dependency(
+                    request=request,
+                    session=session,
+                    user=user,
+                    internal_service_key=None,
+                    tracecat_api_key=tracecat_api_key,
+                    allow_user=allow_user,
+                    allow_service=allow_service,
+                    allow_api_key=allow_api_key,
+                    allow_executor=allow_executor,
+                    require_workspace=require_workspace,
+                )
+
+            return Depends(role_dependency_not_req_ws_api_key)
+
+        async def role_dependency_not_req_ws_user(
+            request: Request,
+            session: AsyncDBSession,
+            user: OptionalUserDep = None,
+        ) -> Role:
+            return await _role_dependency(
+                request=request,
+                session=session,
+                user=user,
+                internal_service_key=None,
+                tracecat_api_key=None,
+                allow_user=allow_user,
+                allow_service=allow_service,
+                allow_api_key=allow_api_key,
+                allow_executor=allow_executor,
+                require_workspace=require_workspace,
+            )
+
+        return Depends(role_dependency_not_req_ws_user)
+    else:
+        raise ValueError(f"Invalid require_workspace value: {require_workspace}")
+
+
+# --- Platform-level (Superuser) Authentication ---
+
+
+async def _require_superuser(
+    user: Annotated[User, Depends(current_active_user)],
+) -> PlatformRole:
+    """Require superuser access for platform admin operations.
+
+    This dependency is used for /admin routes that require platform-level access.
+    Superusers can manage organizations, platform settings, and platform-level
+    registry sync operations.
+
+    Returns a PlatformRole (not Role) to enforce type separation between
+    platform and org-scoped operations.
+    """
+    if not user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden",
+        )
+    return PlatformRole(
+        type="user",
+        user_id=user.id,
+        service_id="tracecat-api",
+    )
+
+
+SuperuserRole = Annotated[PlatformRole, Depends(_require_superuser)]
+"""Dependency for platform admin (superuser) operations.
+
+Returns a PlatformRole which is distinct from Role - platform operations
+are not scoped to any organization or workspace.
+"""
+
+
+# --- Authenticated User Only (No Organization Context) ---
+
+
+async def authenticated_user_only(
+    user: Annotated[User, Depends(current_active_user)],
+) -> Role:
+    """Dependency for endpoints requiring only an authenticated user.
+
+    No organization context required. Use this for operations like:
+    - Accepting invitations (user may not belong to any org yet)
+    - User profile operations that don't require org context
+
+    Sets ctx_role for consistency but organization_id will be None.
+    This intentionally does not activate platform-superuser privileges; use
+    SuperuserRole for routes that need platform admin access.
+    """
+    role = Role(
+        type="user",
+        user_id=user.id,
+        service_id="tracecat-api",
+        # organization_id intentionally None - user may not belong to any org
+    )
+    scopes = await compute_effective_scopes(role)
+    role = role.model_copy(update={"scopes": scopes})
+    ctx_role.set(role)
+    return role
+
+
+AuthenticatedUserOnly = Annotated[Role, Depends(authenticated_user_only)]
+"""Dependency for an authenticated user without organization context.
+
+Use this for endpoints where the user is authenticated but may not
+belong to any organization (e.g., accepting invitations).
+
+Sets the `ctx_role` context variable.
+"""

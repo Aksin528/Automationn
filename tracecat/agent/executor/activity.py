@@ -1,0 +1,922 @@
+"""Temporal activities for agent runtime execution."""
+
+from __future__ import annotations
+
+import asyncio
+import shutil
+import tempfile
+import uuid
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from time import perf_counter
+from typing import Any, cast
+
+from pydantic import AliasChoices, BaseModel, Field
+from temporalio import activity
+from tracecat_ee.workspace_chat.policy import (
+    is_workspace_chat_entitled,
+)
+
+from tracecat import config as app_config
+from tracecat.agent.artifacts.working_set import ArtifactWorkingSetInput
+from tracecat.agent.common.config import (
+    TRACECAT__AGENT_SANDBOX_MEMORY_MB,
+    TRACECAT__AGENT_SANDBOX_TIMEOUT,
+    TRACECAT__DISABLE_NSJAIL,
+)
+from tracecat.agent.common.exceptions import AgentSandboxExecutionError
+from tracecat.agent.common.protocol import RuntimeInitPayload
+from tracecat.agent.common.stream_types import ToolCallContent
+from tracecat.agent.common.types import (
+    MCPServerConfig,
+    MCPToolDefinition,
+    SandboxAgentConfig,
+    SandboxSubagentConfig,
+    is_stdio_mcp_server,
+)
+from tracecat.agent.executor.loopback import (
+    LoopbackHandler,
+    LoopbackInput,
+    LoopbackResult,
+)
+from tracecat.agent.filesystem import hydrate_agent_work_dir, persist_agent_work_dir
+from tracecat.agent.llm_routing import get_litellm_route_model
+from tracecat.agent.preset.service import AgentPresetService
+from tracecat.agent.runtime.claude_code.broker import (
+    ClaudeTurnRequest,
+    ConcurrentSessionTurnError,
+)
+from tracecat.agent.runtime.session_paths import build_agent_sandbox_path_mapping
+from tracecat.agent.runtime_services import get_claude_runtime_broker
+from tracecat.agent.sandbox.llm_proxy import (
+    LLM_SOCKET_NAME,
+    LLMRoute,
+    LLMRoutingPlan,
+    LLMSocketProxy,
+)
+from tracecat.agent.session.service import AgentSessionService
+from tracecat.agent.session.types import AgentSessionEntity
+from tracecat.agent.skill.service import SkillService
+from tracecat.agent.types import AgentConfig
+from tracecat.auth.types import Role
+from tracecat.chat.schemas import ChatMessage
+from tracecat.config import (
+    TRACECAT__AGENT_SKILL_CACHE_DIR,
+    TRACECAT__AGENT_SKILL_CACHE_MAX_CONCURRENT_DOWNLOADS,
+)
+from tracecat.feature_flags import FeatureFlag, is_feature_enabled
+from tracecat.logger import logger
+from tracecat.registry.lock.types import RegistryLock
+from tracecat.storage import blob
+
+from .schemas import (
+    ApprovedToolCall,
+    DeniedToolCall,
+    ToolExecutionResult,
+)
+
+BROKER_TASK_CANCEL_TIMEOUT_SECONDS = 5.0
+
+
+class AgentExecutorInput(BaseModel):
+    """Input for the agent executor activity."""
+
+    # ``extra="ignore"`` keeps Temporal activity replay working after the
+    # legacy ``use_workspace_credentials`` field was removed: activity input
+    # stored in history still carries the old key and pydantic will silently
+    # drop it instead of raising.
+    model_config = {"arbitrary_types_allowed": True, "extra": "ignore"}
+
+    session_id: uuid.UUID
+    workspace_id: uuid.UUID
+    user_prompt: str
+    config: AgentConfig
+    # Role for context
+    role: Role
+    # Authentication tokens (minted by workflow before calling activity)
+    mcp_auth_token: str
+    llm_gateway_auth_token: str = Field(
+        validation_alias=AliasChoices("llm_gateway_auth_token", "litellm_auth_token"),
+    )
+    # Resolved tool definitions
+    allowed_actions: dict[str, MCPToolDefinition] | None = None
+    # Fully resolved subagent definitions, each with scoped tools/tokens/routes.
+    subagents: list[SandboxSubagentConfig] = Field(default_factory=list)
+    # Session resume data from previous runs
+    sdk_session_id: str | None = None
+    # Legacy replay compatibility only. New executions hydrate this inside
+    # run_agent_activity instead of passing it over Temporal boundaries.
+    sdk_session_data: str | None = Field(default=None, deprecated=True)
+    # True when resuming after an approval decision.
+    is_approval_continuation: bool = False
+    # True when forking from parent session (SDK should use fork_session=True)
+    is_fork: bool = False
+
+
+class AgentExecutorResult(BaseModel):
+    """Result from the agent executor activity."""
+
+    success: bool
+    error: str | None = None
+    # None means a legacy activity result did not carry this field. The
+    # workflow treats unknown failed results as already terminal-emitted so old
+    # histories keep their original command shape.
+    terminal_stream_error_emitted: bool | None = None
+    approval_requested: bool = False
+    approval_items: list[ToolCallContent] | None = None
+    # Legacy replay compatibility only. New executions load terminal message
+    # history in the durable workflow after the final executor turn completes.
+    messages: list[ChatMessage] | None = None
+    output: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("output", "structured_output", "result_output"),
+        serialization_alias="output",
+    )
+    result_usage: dict[str, Any] | None = None
+    result_num_turns: int | None = None
+
+
+class ExecuteApprovedToolsInput(BaseModel):
+    """Deprecated compatibility input for approval-path tool execution."""
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    session_id: uuid.UUID
+    workspace_id: uuid.UUID
+    role: Role
+    approved_tools: list[ApprovedToolCall]
+    denied_tools: list[DeniedToolCall]
+    allowed_actions: list[str]
+    registry_lock: RegistryLock
+
+
+class ExecuteApprovedToolsResult(BaseModel):
+    """Deprecated compatibility result for approval-path tool execution."""
+
+    results: list[ToolExecutionResult]
+    success: bool = True
+    error: str | None = None
+
+
+def _agent_fs_persistence_enabled() -> bool:
+    """Return whether durable agent work-dir snapshots should run."""
+    return is_feature_enabled(FeatureFlag.AGENT_FS_PERSISTENCE)
+
+
+async def _cancel_task_with_timeout(
+    task: asyncio.Task[Any] | None,
+    *,
+    task_name: str,
+    timeout_seconds: float = BROKER_TASK_CANCEL_TIMEOUT_SECONDS,
+) -> None:
+    """Cancel an asyncio task without allowing cleanup to hang this activity."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    done, pending = await asyncio.wait({task}, timeout=timeout_seconds)
+    if pending:
+        logger.warning(
+            "Timed out waiting for cancelled task",
+            task_name=task_name,
+            timeout_seconds=timeout_seconds,
+        )
+        return
+    [completed_task] = done
+    try:
+        await completed_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.debug(
+            "Cancelled task finished with error",
+            task_name=task_name,
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+
+
+@dataclass
+class SandboxedAgentExecutor:
+    """Executes an agent turn through the worker-global runtime broker.
+
+    This executor:
+    1. Creates a job directory with Unix sockets
+    2. Starts the host-side LLM proxy
+    3. Dispatches the turn to the runtime broker
+    4. Cleans up on completion
+    """
+
+    input: AgentExecutorInput
+    timeout_seconds: int = field(
+        default_factory=lambda: TRACECAT__AGENT_SANDBOX_TIMEOUT
+    )
+    memory_mb: int = field(default_factory=lambda: TRACECAT__AGENT_SANDBOX_MEMORY_MB)
+
+    # Internal state
+    _job_dir: Path | None = field(default=None, init=False, repr=False)
+    _llm_proxy: LLMSocketProxy | None = field(default=None, init=False, repr=False)
+    _fatal_error: str | None = field(default=None, init=False, repr=False)
+    _fatal_error_event: asyncio.Event = field(
+        default_factory=asyncio.Event, init=False, repr=False
+    )
+    _agent_fs_hydration_failed: bool = field(default=False, init=False, repr=False)
+    _turn_started_at: float = field(
+        default_factory=perf_counter, init=False, repr=False
+    )
+
+    def _log_benchmark_phase(self, phase: str, **extra: object) -> None:
+        """Emit a temporary structured benchmark log for this turn."""
+        logger.info(
+            "Agent benchmark phase",
+            phase=phase,
+            elapsed_ms=round((perf_counter() - self._turn_started_at) * 1000, 2),
+            session_id=self.input.session_id,
+            sandbox_mode="direct" if TRACECAT__DISABLE_NSJAIL else "nsjail",
+            **extra,
+        )
+
+    async def _create_llm_socket_proxy(self, socket_path: Path) -> LLMSocketProxy:
+        """Create the host-side LiteLLM transport proxy for this execution."""
+
+        def on_error(error_msg: str) -> None:
+            self._fatal_error = error_msg
+            self._fatal_error_event.set()
+
+        routing_plan = self._llm_routing_plan()
+        runtime_routing_plan = await routing_plan.materialize(self.input.role)
+
+        logger.info(
+            "Creating LLM socket proxy",
+            passthrough=bool(routing_plan.direct_routes),
+        )
+
+        return LLMSocketProxy(
+            socket_path=socket_path,
+            routing_plan=runtime_routing_plan,
+            on_error=on_error,
+        )
+
+    def _llm_routing_plan(self) -> LLMRoutingPlan:
+        """Build the socket proxy routing table from each agent's model config.
+
+        Agent config decides routing, not root/subagent position. The managed
+        route is the fallback for every request model that does not have a
+        direct passthrough entry. Direct passthrough traffic bypasses managed
+        LiteLLM, so each passthrough root/subagent needs its own exact-model
+        route to preserve its custom provider base URL, credentials, and
+        upstream model name.
+
+        Returns:
+            Routing plan for the host-side LLM socket proxy.
+        """
+        # Keep all root/subagent semantics on the executor side. The proxy only
+        # receives model-key routes and does not know which agent emitted them.
+        config = cast(Any, self.input.config)
+        return LLMRoutingPlan(
+            managed_route=LLMRoute(
+                base_url=app_config.TRACECAT__LITELLM_BASE_URL.rstrip("/"),
+                model_provider=config.model_provider,
+                mode="managed",
+                # Managed subagent requests use synthetic LiteLLM route keys, so
+                # the proxy should let LiteLLM do provider-specific body cleanup.
+                local_provider_cleanup=not self.input.subagents,
+            ),
+            direct_routes=self._direct_passthrough_routes(),
+        )
+
+    def _direct_passthrough_routes(self) -> dict[str, LLMRoute]:
+        """Build direct passthrough routes from each agent's own model config.
+
+        Each entry is keyed by the exact model string the runtime will send in
+        the request body. The proxy can then make a local routing decision
+        without needing to know which agent produced the request.
+
+        A single execution can include a passthrough root agent and multiple
+        passthrough subagents. Since passthrough skips the managed LiteLLM
+        fallback, the shared proxy needs one direct route per exact runtime
+        model key rather than one global passthrough destination.
+
+        Returns:
+            Direct passthrough routes keyed by request model.
+        """
+        routes: dict[str, LLMRoute] = {}
+        config = cast(Any, self.input.config)
+        if config.passthrough:
+            # Root routing is keyed by the model string the root agent sends.
+            routes[config.model_name] = self._direct_passthrough_route(
+                config.base_url,
+                model_provider=config.model_provider,
+                catalog_id=config.catalog_id,
+            )
+
+        for subagent in self.input.subagents:
+            config = subagent.config
+            if not config.passthrough:
+                continue
+            # Subagents usually send a synthetic scoped model key. If that subagent
+            # is passthrough, the scoped key should direct-route to its own gateway.
+            request_model = subagent.model_route or get_litellm_route_model(
+                model_provider=config.model_provider,
+                model_name=config.model_name,
+                passthrough=True,
+            )
+            routes[request_model] = self._direct_passthrough_route(
+                config.base_url,
+                model_provider=config.model_provider,
+                catalog_id=config.catalog_id,
+                upstream_model_name=config.model_name,
+            )
+        return routes
+
+    @staticmethod
+    def _direct_passthrough_route(
+        base_url: str | None,
+        *,
+        model_provider: str,
+        catalog_id: uuid.UUID | None,
+        upstream_model_name: str | None = None,
+    ) -> LLMRoute:
+        """Create one direct passthrough route.
+
+        Args:
+            base_url: Resolved custom provider base URL.
+            model_provider: Provider behind the custom route.
+            catalog_id: Optional custom-provider catalog row for credentials.
+            upstream_model_name: Optional model name to send to the upstream.
+
+        Returns:
+            Direct route for the model config.
+
+        Raises:
+            AgentSandboxExecutionError: If passthrough is enabled without a
+                resolved base URL.
+        """
+        if base_url is None:
+            raise AgentSandboxExecutionError(
+                "Custom model provider passthrough requires a resolved base_url."
+            )
+        return LLMRoute(
+            base_url=base_url,
+            model_provider=model_provider,
+            catalog_id=catalog_id,
+            upstream_model_name=upstream_model_name,
+        )
+
+    def _build_runtime_init_payload(self) -> RuntimeInitPayload:
+        """Build the runtime init payload for this execution."""
+        return RuntimeInitPayload(
+            session_id=self.input.session_id,
+            mcp_auth_token=self.input.mcp_auth_token,
+            config=SandboxAgentConfig.from_agent_config(self.input.config),
+            user_prompt=self.input.user_prompt,
+            llm_gateway_auth_token=self.input.llm_gateway_auth_token,
+            allowed_actions=self.input.allowed_actions,
+            subagents=self.input.subagents,
+            sdk_session_id=self.input.sdk_session_id,
+            sdk_session_data=self.input.sdk_session_data,
+            is_approval_continuation=self.input.is_approval_continuation,
+            is_fork=self.input.is_fork,
+        )
+
+    async def run(self) -> AgentExecutorResult:
+        """Execute the agent through the brokered runtime.
+
+        Returns:
+            AgentExecutorResult with success status and any session updates.
+        """
+        result = AgentExecutorResult(
+            success=False,
+            terminal_stream_error_emitted=False,
+        )
+        self._log_benchmark_phase("activity_start")
+
+        try:
+            # Create job directory with sockets
+            self._job_dir = await self._create_job_directory()
+            socket_dir = self._job_dir / "sockets"
+            init_payload = self._build_runtime_init_payload()
+            self._log_benchmark_phase(
+                "job_dir_ready",
+                job_dir=str(self._job_dir),
+                socket_dir=str(socket_dir),
+            )
+
+            # Create loopback handler
+            loopback_input = LoopbackInput(
+                session_id=self.input.session_id,
+                workspace_id=self.input.workspace_id,
+            )
+            handler = LoopbackHandler(input=loopback_input)
+
+            llm_socket_path = socket_dir / LLM_SOCKET_NAME
+            self._llm_proxy = await self._create_llm_socket_proxy(llm_socket_path)
+            artifact_working_set = await self._load_artifact_working_set()
+
+            await self._run_with_broker(
+                result=result,
+                handler=handler,
+                init_payload=init_payload,
+                socket_dir=socket_dir,
+                llm_socket_path=llm_socket_path,
+                artifact_working_set=artifact_working_set,
+            )
+
+        except AgentSandboxExecutionError as e:
+            logger.error("Agent sandbox execution failed", error=str(e))
+            result.error = str(e)
+        except Exception as e:
+            logger.exception("Unexpected error in agent executor", error=str(e))
+            result.error = f"Unexpected error: {e}"
+        finally:
+            await self._cleanup()
+
+        return result
+
+    async def _hydrate_agent_filesystem(self, work_dir: Path) -> None:
+        """Hydrate the persistent agent work dir before runtime startup."""
+        self._log_benchmark_phase("agent_fs_hydrate_start")
+        self._agent_fs_hydration_failed = False
+        try:
+            await hydrate_agent_work_dir(
+                role=self.input.role,
+                session_id=self.input.session_id,
+                work_dir=work_dir,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to hydrate agent filesystem snapshot; using empty work dir",
+                session_id=str(self.input.session_id),
+                workspace_id=str(self.input.workspace_id),
+                error=str(e),
+            )
+            self._agent_fs_hydration_failed = True
+            shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir.mkdir(parents=True, exist_ok=True)
+        self._log_benchmark_phase("agent_fs_hydrate_complete")
+
+    async def _persist_agent_filesystem(self, work_dir: Path) -> None:
+        """Persist the agent work dir after a successful runtime turn.
+
+        Best-effort: a persistence failure is logged but does not fail the turn.
+        The next turn falls back to the previous snapshot or an empty work dir.
+        """
+        self._log_benchmark_phase("agent_fs_snapshot_start")
+        try:
+            await persist_agent_work_dir(
+                role=self.input.role,
+                session_id=self.input.session_id,
+                workspace_id=self.input.workspace_id,
+                work_dir=work_dir,
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to persist agent filesystem snapshot",
+                session_id=str(self.input.session_id),
+                workspace_id=str(self.input.workspace_id),
+                error=str(e),
+            )
+            return
+
+        self._log_benchmark_phase("agent_fs_snapshot_complete")
+
+    @staticmethod
+    def _apply_loopback_result(
+        result: AgentExecutorResult, loopback_result: LoopbackResult
+    ) -> None:
+        """Copy loopback result fields into the activity result."""
+        result.success = loopback_result.success
+        result.error = loopback_result.error
+        result.approval_requested = loopback_result.approval_requested
+        result.approval_items = loopback_result.approval_items or None
+        result.terminal_stream_error_emitted = (
+            loopback_result.terminal_stream_error_emitted
+        )
+        # Approval turns pause before a final answer exists. Preserve the
+        # existing output until the continuation completes and returns one.
+        if not loopback_result.approval_requested:
+            result.output = loopback_result.output
+        result.result_usage = loopback_result.result_usage
+        result.result_num_turns = loopback_result.result_num_turns
+
+    async def _run_with_broker(
+        self,
+        *,
+        result: AgentExecutorResult,
+        handler: LoopbackHandler,
+        init_payload: RuntimeInitPayload,
+        socket_dir: Path,
+        llm_socket_path: Path,
+        artifact_working_set: ArtifactWorkingSetInput | None,
+    ) -> None:
+        """Execute the Claude turn through the worker-global warm broker."""
+        if self._job_dir is None:
+            raise RuntimeError("Job directory must exist before broker execution")
+
+        broker = get_claude_runtime_broker()
+
+        if self._llm_proxy is None:
+            raise RuntimeError("LLM proxy must exist before broker startup")
+        await self._llm_proxy.start()
+        logger.info(
+            "Started LLM socket proxy",
+            socket_path=str(llm_socket_path),
+        )
+        self._log_benchmark_phase("broker_llm_proxy_ready")
+
+        request = ClaudeTurnRequest(
+            init_payload=init_payload,
+            job_dir=self._job_dir,
+            socket_dir=socket_dir,
+            llm_socket_path=llm_socket_path,
+            enable_internet_access=init_payload.config.enable_internet_access,
+            artifact_working_set=artifact_working_set,
+            skills_dir=self._skills_dir(),
+            hydrate_work_dir=self._hydrate_agent_filesystem
+            if _agent_fs_persistence_enabled()
+            else None,
+        )
+
+        async def wait_fatal_error() -> str:
+            await self._fatal_error_event.wait()
+            return self._fatal_error or "Unknown LLM error"
+
+        broker_task: asyncio.Task[None] | None = None
+        fatal_error_task: asyncio.Task[str] | None = None
+        try:
+            async with broker.session_turn_lease(str(self.input.session_id)):
+                broker_task = asyncio.create_task(
+                    broker.run_turn_in_session_lease(request, handler)
+                )
+                self._log_benchmark_phase("broker_turn_dispatched")
+
+                fatal_error_task = asyncio.create_task(wait_fatal_error())
+                heartbeat_interval = 30
+                elapsed = 0
+
+                while elapsed < self.timeout_seconds:
+                    done, _ = await asyncio.wait(
+                        [broker_task, fatal_error_task],
+                        timeout=heartbeat_interval,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if not done:
+                        elapsed += heartbeat_interval
+                        activity.heartbeat(
+                            f"Agent running: {self.input.session_id} ({elapsed}s elapsed)"
+                        )
+                        continue
+
+                    if fatal_error_task in done:
+                        error_msg = fatal_error_task.result()
+                        result.error = error_msg
+                        result.terminal_stream_error_emitted = (
+                            await handler.emit_terminal_error(error_msg)
+                        )
+                        await broker.cancel_turn(str(self.input.session_id))
+                        await _cancel_task_with_timeout(
+                            broker_task,
+                            task_name="broker_task",
+                        )
+                        broker_task = None
+                        break
+
+                    await broker_task
+                    self._apply_loopback_result(result, handler.build_result())
+                    self._log_benchmark_phase(
+                        "broker_activity_complete",
+                        success=result.success,
+                        approval_requested=result.approval_requested,
+                    )
+                    if _agent_fs_persistence_enabled() and result.success:
+                        if self._agent_fs_hydration_failed:
+                            logger.warning(
+                                "Skipping agent filesystem snapshot after hydrate fallback",
+                                session_id=str(self.input.session_id),
+                                workspace_id=str(self.input.workspace_id),
+                            )
+                        else:
+                            path_mapping = build_agent_sandbox_path_mapping(
+                                session_id=str(self.input.session_id),
+                                disable_nsjail=TRACECAT__DISABLE_NSJAIL,
+                            )
+                            await self._persist_agent_filesystem(
+                                path_mapping.host_work_dir
+                            )
+                    break
+                else:
+                    result.error = (
+                        f"Agent execution timed out after {self.timeout_seconds}s"
+                    )
+                    result.terminal_stream_error_emitted = (
+                        await handler.emit_terminal_error(result.error)
+                    )
+                    await broker.cancel_turn(str(self.input.session_id))
+                    await _cancel_task_with_timeout(
+                        broker_task,
+                        task_name="broker_task",
+                    )
+                    broker_task = None
+        except Exception as e:
+            result.error = str(e)
+            result.terminal_stream_error_emitted = await handler.emit_terminal_error(
+                result.error
+            )
+            if not isinstance(e, ConcurrentSessionTurnError):
+                raise
+        except asyncio.CancelledError:
+            await broker.cancel_turn(str(self.input.session_id))
+            raise
+        finally:
+            for task in (fatal_error_task, broker_task):
+                await _cancel_task_with_timeout(task, task_name="agent_executor_task")
+
+    async def _create_job_directory(self) -> Path:
+        """Create a temporary job directory with socket subdirectory."""
+        job_id = str(self.input.session_id)[:12]
+        # Hardcoded job socket directory for per-job control sockets
+        base_dir = Path("/tmp/tracecat-agent-jobs")
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        job_dir = Path(tempfile.mkdtemp(prefix=f"agent-job-{job_id}-", dir=base_dir))
+        try:
+            socket_dir = job_dir / "sockets"
+            socket_dir.mkdir(mode=0o700)
+            skills_dir = job_dir / "home" / ".claude" / "skills"
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            await self._stage_resolved_skills(skills_dir)
+
+            # Note: The MCP socket directory is mounted directly into NSJail at /mcp-sockets
+            # so we don't need to symlink it here
+            logger.debug(
+                "Created job directory",
+                job_dir=str(job_dir),
+                socket_dir=str(socket_dir),
+            )
+            return job_dir
+        except BaseException:
+            await asyncio.to_thread(shutil.rmtree, job_dir, True)
+            raise
+
+    async def _load_artifact_working_set(self) -> ArtifactWorkingSetInput | None:
+        """Load Workspace Chat artifact projection for the mount-only provider."""
+        if (
+            self.input.role.organization_id is None
+            or self.input.role.workspace_id is None
+        ):
+            return None
+
+        async with AgentSessionService.with_session(role=self.input.role) as svc:
+            agent_session = await svc.get_session(self.input.session_id)
+            if agent_session is None:
+                return None
+            if agent_session.entity_type != AgentSessionEntity.WORKSPACE_CHAT:
+                return None
+            if not await is_workspace_chat_entitled(svc.session, self.input.role):
+                return None
+            return ArtifactWorkingSetInput(
+                workspace_id=self.input.workspace_id,
+                role=self.input.role,
+                artifacts=tuple(svc.list_artifacts(agent_session)),
+            )
+
+    def _skills_dir(self) -> Path | None:
+        """Return the per-run staged skills directory."""
+        if self._job_dir is None:
+            return None
+        skills_dir = self._job_dir / "home" / ".claude" / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        return skills_dir
+
+    async def _stage_resolved_skills(self, skills_dir: Path) -> None:
+        """Stage resolved published skills into the per-run home directory."""
+
+        config = cast(Any, self.input.config)
+        resolved_skills = config.resolved_skills or []
+        if not resolved_skills:
+            return
+        duplicate_names = sorted(
+            name
+            for name, count in Counter(
+                resolved_skill.skill_name for resolved_skill in resolved_skills
+            ).items()
+            if count > 1
+        )
+        if duplicate_names:
+            raise ValueError(
+                f"Resolved preset contains duplicate skill names: {duplicate_names}"
+            )
+
+        async with SkillService.with_session(role=self.input.role) as service:
+            for resolved_skill in resolved_skills:
+                cached_dir = await self._ensure_cached_skill_dir(
+                    service=service,
+                    manifest_sha256=resolved_skill.manifest_sha256,
+                    skill_version_id=resolved_skill.skill_version_id,
+                )
+                await asyncio.to_thread(
+                    shutil.copytree,
+                    cached_dir,
+                    skills_dir / resolved_skill.skill_name,
+                    dirs_exist_ok=True,
+                )
+
+    async def _ensure_cached_skill_dir(
+        self,
+        *,
+        service: SkillService,
+        manifest_sha256: str,
+        skill_version_id: uuid.UUID,
+    ) -> Path:
+        """Populate the worker-local extracted skill cache if needed."""
+
+        cache_root = Path(TRACECAT__AGENT_SKILL_CACHE_DIR)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_dir = cache_root / manifest_sha256
+        if cache_dir.exists():
+            return cache_dir
+
+        temp_dir = cache_root / f".tmp-{manifest_sha256}-{uuid.uuid4().hex}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            version_files = await service.get_version_file_materialization(
+                skill_version_id
+            )
+            if not version_files:
+                try:
+                    temp_dir.rename(cache_dir)
+                except FileExistsError:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                return cache_dir
+            max_concurrent_downloads = max(
+                1,
+                min(
+                    len(version_files),
+                    TRACECAT__AGENT_SKILL_CACHE_MAX_CONCURRENT_DOWNLOADS,
+                ),
+            )
+            semaphore = asyncio.Semaphore(max_concurrent_downloads)
+
+            async def download_version_file(path: str, blob_row: Any) -> None:
+                async with semaphore:
+                    await blob.download_file_to_path(
+                        key=blob_row.key,
+                        bucket=blob_row.bucket,
+                        output_path=temp_dir / path,
+                        expected_sha256=blob_row.sha256,
+                        max_bytes=blob_row.size_bytes,
+                    )
+
+            async with asyncio.TaskGroup() as task_group:
+                for path, blob_row in version_files:
+                    task_group.create_task(download_version_file(path, blob_row))
+            try:
+                temp_dir.rename(cache_dir)
+            except FileExistsError:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+        return cache_dir
+
+    async def _cleanup(self) -> None:
+        """Clean up resources after execution."""
+        # Stop LLM socket proxy
+        if self._llm_proxy:
+            try:
+                await self._llm_proxy.stop()
+            except Exception as e:
+                logger.warning("Failed to stop LLM proxy", error=str(e))
+            self._llm_proxy = None
+
+        # Clean up job directory
+        if self._job_dir and self._job_dir.exists():
+            try:
+                await asyncio.to_thread(shutil.rmtree, self._job_dir)
+                logger.debug("Cleaned up job directory", job_dir=str(self._job_dir))
+            except Exception as e:
+                logger.warning(
+                    "Failed to clean up job directory",
+                    job_dir=str(self._job_dir),
+                    error=str(e),
+                )
+
+
+async def _hydrate_stdio_env(
+    mcp_servers: list[MCPServerConfig] | None, *, role: Role
+) -> list[MCPServerConfig] | None:
+    """Resolve stdio ``env`` secrets and return a new list before the runtime starts.
+
+    HTTP MCP servers route through the trusted MCP server, which re-resolves
+    secrets per call. Stdio servers are spawned directly by the Claude
+    runtime from ``payload.config.mcp_servers``, so there's no later
+    rehydration hook — env secrets must be present on the config dict when
+    the runtime reads it.
+
+    Returns a new list with hydrated stdio configs; HTTP configs are passed
+    through unchanged. Secret data lives only for the lifetime of this
+    activity frame.
+    """
+    if not mcp_servers:
+        return mcp_servers
+
+    result: list[MCPServerConfig] = []
+    async with AgentPresetService.with_session(role=role) as svc:
+        for cfg in mcp_servers:
+            if not is_stdio_mcp_server(cfg):
+                result.append(cfg)
+            else:
+                cfg_id = cfg.get("id")
+                if not cfg_id:
+                    raise ValueError(
+                        f"Stdio MCP server {cfg.get('name')!r} is missing a source integration id"
+                    )
+                try:
+                    env = await svc.resolve_mcp_integration_secrets(uuid.UUID(cfg_id))
+                except ValueError:
+                    env = None
+                result.append({**cfg, "env": env} if env else cfg)
+    return result
+
+
+@activity.defn
+async def run_agent_activity(input: AgentExecutorInput) -> AgentExecutorResult:
+    """Temporal activity that runs one brokered agent turn.
+
+    This activity:
+    1. Creates a SandboxedAgentExecutor
+    2. Dispatches the turn through the worker-global runtime broker
+    3. Returns runtime status, approval state, usage, and terminal output
+
+    The broker-owned transport decides whether the runtime shim runs with nsjail
+    or as a direct subprocess based on TRACECAT__DISABLE_NSJAIL.
+
+    The activity is designed to be retryable - if it fails due to transient
+    errors, Temporal will retry it. Session state is persisted on success
+    so resumption works correctly.
+
+    Args:
+        input: Agent executor configuration and tokens.
+
+    Returns:
+        AgentExecutorResult with execution status and terminal output.
+    """
+    sandbox_mode = "direct" if TRACECAT__DISABLE_NSJAIL else "nsjail"
+    activity.heartbeat(
+        f"Starting agent execution ({sandbox_mode} mode): {input.session_id}"
+    )
+
+    input = await _hydrate_sdk_session_history(input)
+
+    # Stdio MCP servers are spawned directly by the runtime; unlike HTTP
+    # servers they have no per-call secret resolution hook downstream. The
+    # configs in ``input.config.mcp_servers`` arrive in refs-only shape
+    # (no ``env``) — hydrate from the DB here so the spawned process gets
+    # its credentials.
+    config = cast(Any, input.config)
+    config.mcp_servers = await _hydrate_stdio_env(config.mcp_servers, role=input.role)
+
+    executor = SandboxedAgentExecutor(input=input)
+    result = await executor.run()
+
+    if result.success:
+        activity.heartbeat(f"Agent execution completed: {input.session_id}")
+    else:
+        activity.heartbeat(f"Agent execution failed: {result.error}")
+
+    return result
+
+
+async def _hydrate_sdk_session_history(input: AgentExecutorInput) -> AgentExecutorInput:
+    """Inject SDK JSONL into activity input before runtime startup."""
+    # sdk_session_data is deprecated for new Temporal payloads, but old
+    # scheduled/replayed activity inputs may still carry it and must remain
+    # executable.
+    if input.sdk_session_id and input.sdk_session_data:
+        return input
+
+    if input.sdk_session_id is None:
+        return input.model_copy(
+            update={"sdk_session_data": None, "is_fork": False},
+        )
+
+    async with AgentSessionService.with_session(role=input.role) as svc:
+        history = await svc.load_session_history(input.session_id)
+
+    if history is None:
+        return input.model_copy(
+            update={
+                "sdk_session_id": None,
+                "sdk_session_data": None,
+                "is_fork": False,
+            },
+        )
+
+    return input.model_copy(
+        update={
+            "sdk_session_id": history.sdk_session_id,
+            "sdk_session_data": history.sdk_session_data,
+            "is_fork": history.is_fork,
+        },
+    )

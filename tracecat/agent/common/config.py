@@ -1,0 +1,85 @@
+"""Sandbox configuration constants.
+
+This module defines configuration constants for the agent sandbox by reading
+directly from os.environ. It does NOT import from tracecat.config to keep
+the import footprint minimal for fast sandbox cold start.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# === Agent Sandbox Config (read directly from env) === #
+
+TRACECAT__AGENT_SANDBOX_TIMEOUT = int(
+    os.environ.get("TRACECAT__AGENT_SANDBOX_TIMEOUT") or 1800
+)
+"""Default timeout for agent sandbox execution in seconds (30 minutes)."""
+
+TRACECAT__AGENT_SANDBOX_MEMORY_MB = int(
+    os.environ.get("TRACECAT__AGENT_SANDBOX_MEMORY_MB") or 4096
+)
+"""Default memory limit for agent sandbox execution in megabytes (4 GiB)."""
+
+TRACECAT__DISABLE_NSJAIL = os.environ.get(
+    "TRACECAT__DISABLE_NSJAIL", "true"
+).lower() in ("true", "1")
+"""Disable nsjail sandbox and use the unsafe PID executor instead."""
+
+# === Well-known runtime paths (internal to agent worker) === #
+
+AGENT_RUNTIME_DIR = Path("/run/tracecat")
+"""Tracecat-owned runtime namespace for agent sandbox mountpoints and sockets."""
+
+TRUSTED_MCP_SOCKET_PATH = AGENT_RUNTIME_DIR / "mcp.sock"
+"""Path to the trusted MCP socket (shared across jobs)."""
+
+TRACECAT__AGENT_MCP_SOCKET_PATH = Path(
+    os.environ.get("TRACECAT__AGENT_MCP_SOCKET_PATH") or str(TRUSTED_MCP_SOCKET_PATH)
+)
+"""Path to the trusted MCP socket visible to the runtime shim."""
+
+TRACECAT__AGENT_MCP_BRIDGE_PORT = int(
+    os.environ.get("TRACECAT__AGENT_MCP_BRIDGE_PORT") or 4101
+)
+"""Loopback port for the in-sandbox trusted MCP HTTP bridge."""
+
+CONTROL_SOCKET_NAME = "control.sock"
+"""Name of the per-job control socket."""
+
+JAILED_CONTROL_SOCKET_PATH = AGENT_RUNTIME_DIR / "control.sock"
+"""Path to the control socket inside the jail."""
+
+LLM_SOCKET_NAME = "llm.sock"
+"""Name of the LLM socket for proxied LLM gateway access."""
+
+JAILED_LLM_SOCKET_PATH = AGENT_RUNTIME_DIR / "llm.sock"
+"""Path to the LLM socket inside the jail."""
+
+# === Runtime socket overrides (primarily for direct subprocess mode) === #
+#
+# In NSJail mode, the orchestrator mounts per-job sockets into the jailed paths above.
+# In direct subprocess mode (TRACECAT__DISABLE_NSJAIL=true), there is no mount, so the
+# runtime must connect to the orchestrator's real socket paths.
+TRACECAT__AGENT_CONTROL_SOCKET_PATH = Path(
+    os.environ.get(
+        "TRACECAT__AGENT_CONTROL_SOCKET_PATH", str(JAILED_CONTROL_SOCKET_PATH)
+    )
+)
+"""Path to the orchestrator control socket for the runtime to connect to."""
+
+TRACECAT__AGENT_LLM_SOCKET_PATH = Path(
+    os.environ.get("TRACECAT__AGENT_LLM_SOCKET_PATH", str(JAILED_LLM_SOCKET_PATH))
+)
+"""Path to the orchestrator LLM socket for the runtime bridge to connect to."""
+
+# === Managed LiteLLM defaults === #
+
+TRACECAT__LITELLM_PORT = int(os.environ.get("TRACECAT__LITELLM_PORT") or 4000)
+"""Bind port for the managed LiteLLM service."""
+
+TRACECAT__LITELLM_BASE_URL = os.environ.get(
+    "TRACECAT__LITELLM_BASE_URL", f"http://127.0.0.1:{TRACECAT__LITELLM_PORT}"
+)
+"""Internal base URL for the managed LiteLLM service."""

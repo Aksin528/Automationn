@@ -1,0 +1,395 @@
+"""Mock tests for admin commands."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any, cast
+
+import pytest
+import respx
+from httpx import Response
+from sqlalchemy.ext.asyncio import AsyncSession
+from tracecat_admin.cli import app
+from typer.testing import CliRunner
+
+from .conftest import API_URL
+
+runner = CliRunner()
+
+
+@pytest.fixture
+def sample_users() -> list[dict]:
+    """Sample user data."""
+    return [
+        {
+            "id": str(uuid.uuid4()),
+            "email": "admin@example.com",
+            "first_name": "Admin",
+            "last_name": "User",
+            "role": "ADMIN",
+            "is_active": True,
+            "is_superuser": True,
+            "is_verified": True,
+            "last_login_at": datetime.now(UTC).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+        {
+            "id": str(uuid.uuid4()),
+            "email": "basic@example.com",
+            "first_name": "Basic",
+            "last_name": "User",
+            "role": "BASIC",
+            "is_active": True,
+            "is_superuser": False,
+            "is_verified": True,
+            "last_login_at": None,
+            "created_at": datetime.now(UTC).isoformat(),
+        },
+    ]
+
+
+class TestListUsers:
+    """Tests for list-users command."""
+
+    @respx.mock
+    def test_list_users_success(self, mock_env: None, sample_users: list[dict]) -> None:
+        """Test successful user listing."""
+        respx.get(f"{API_URL}/admin/users").mock(
+            return_value=Response(200, json=sample_users)
+        )
+
+        result = runner.invoke(app, ["admin", "list-users"])
+
+        assert result.exit_code == 0
+        assert "admin@example.com" in result.stdout
+        assert "basic@example.com" in result.stdout
+
+    @respx.mock
+    def test_list_users_json_output(
+        self, mock_env: None, sample_users: list[dict]
+    ) -> None:
+        """Test JSON output format."""
+        respx.get(f"{API_URL}/admin/users").mock(
+            return_value=Response(200, json=sample_users)
+        )
+
+        result = runner.invoke(app, ["admin", "list-users", "--json"])
+
+        assert result.exit_code == 0
+        assert '"email": "admin@example.com"' in result.stdout
+
+    @respx.mock
+    def test_list_users_empty(self, mock_env: None) -> None:
+        """Test empty user list."""
+        respx.get(f"{API_URL}/admin/users").mock(return_value=Response(200, json=[]))
+
+        result = runner.invoke(app, ["admin", "list-users"])
+
+        assert result.exit_code == 0
+        assert "No users found" in result.stdout
+
+    @respx.mock
+    def test_list_users_api_error(self, mock_env: None) -> None:
+        """Test API error handling."""
+        respx.get(f"{API_URL}/admin/users").mock(
+            return_value=Response(500, json={"detail": "Internal server error"})
+        )
+
+        result = runner.invoke(app, ["admin", "list-users"])
+
+        assert result.exit_code == 1
+        assert "Error" in result.stdout
+
+
+class TestGetUser:
+    """Tests for get-user command."""
+
+    @respx.mock
+    def test_get_user_success(self, mock_env: None, sample_users: list[dict]) -> None:
+        """Test successful user retrieval."""
+        user = sample_users[0]
+        user_id = user["id"]
+
+        respx.get(f"{API_URL}/admin/users/{user_id}").mock(
+            return_value=Response(200, json=user)
+        )
+
+        result = runner.invoke(app, ["admin", "get-user", user_id])
+
+        assert result.exit_code == 0
+        assert "admin@example.com" in result.stdout
+
+    @respx.mock
+    def test_get_user_not_found(self, mock_env: None) -> None:
+        """Test user not found."""
+        user_id = str(uuid.uuid4())
+
+        respx.get(f"{API_URL}/admin/users/{user_id}").mock(
+            return_value=Response(404, json={"detail": f"User {user_id} not found"})
+        )
+
+        result = runner.invoke(app, ["admin", "get-user", user_id])
+
+        assert result.exit_code == 1
+        assert "not found" in result.stdout
+
+
+class TestPromoteUser:
+    """Tests for promote-user command."""
+
+    @respx.mock
+    def test_promote_user_success(
+        self, mock_env: None, sample_users: list[dict]
+    ) -> None:
+        """Test successful user promotion."""
+        user = sample_users[1].copy()  # Basic user
+        email = user["email"]
+
+        # Mock list users to find by email
+        respx.get(f"{API_URL}/admin/users").mock(
+            return_value=Response(200, json=sample_users)
+        )
+
+        # Mock promote endpoint
+        promoted_user = {**user, "is_superuser": True}
+        respx.post(f"{API_URL}/admin/users/{user['id']}/promote").mock(
+            return_value=Response(200, json=promoted_user)
+        )
+
+        result = runner.invoke(app, ["admin", "promote-user", "--email", email])
+
+        assert result.exit_code == 0
+        assert "promoted to superuser" in result.stdout
+
+    @respx.mock
+    def test_promote_user_not_found(self, mock_env: None) -> None:
+        """Test promoting non-existent user."""
+        respx.get(f"{API_URL}/admin/users").mock(return_value=Response(200, json=[]))
+
+        result = runner.invoke(
+            app, ["admin", "promote-user", "--email", "nonexistent@example.com"]
+        )
+
+        assert result.exit_code == 1
+        assert "not found" in result.stdout
+
+    @respx.mock
+    def test_promote_already_superuser(
+        self, mock_env: None, sample_users: list[dict]
+    ) -> None:
+        """Test promoting user who is already superuser."""
+        respx.get(f"{API_URL}/admin/users").mock(
+            return_value=Response(200, json=sample_users)
+        )
+
+        # Admin user is already superuser
+        result = runner.invoke(
+            app, ["admin", "promote-user", "--email", "admin@example.com"]
+        )
+
+        assert result.exit_code == 1
+        assert "already a superuser" in result.stdout
+
+
+class TestDemoteUser:
+    """Tests for demote-user command."""
+
+    @respx.mock
+    def test_demote_user_success(
+        self, mock_env: None, sample_users: list[dict]
+    ) -> None:
+        """Test successful user demotion."""
+        user = sample_users[0].copy()  # Admin user (superuser)
+        email = user["email"]
+
+        respx.get(f"{API_URL}/admin/users").mock(
+            return_value=Response(200, json=sample_users)
+        )
+
+        demoted_user = {**user, "is_superuser": False}
+        respx.post(f"{API_URL}/admin/users/{user['id']}/demote").mock(
+            return_value=Response(200, json=demoted_user)
+        )
+
+        result = runner.invoke(app, ["admin", "demote-user", "--email", email])
+
+        assert result.exit_code == 0
+        assert "demoted from superuser" in result.stdout
+
+    @respx.mock
+    def test_demote_user_not_superuser(
+        self, mock_env: None, sample_users: list[dict]
+    ) -> None:
+        """Test demoting user who is not superuser."""
+        respx.get(f"{API_URL}/admin/users").mock(
+            return_value=Response(200, json=sample_users)
+        )
+
+        # Basic user is not superuser
+        result = runner.invoke(
+            app, ["admin", "demote-user", "--email", "basic@example.com"]
+        )
+
+        assert result.exit_code == 1
+        assert "not a superuser" in result.stdout
+
+
+class TestCreateDevUser:
+    """Tests for create-dev-user command."""
+
+    def test_create_dev_user_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test successful dev user creation."""
+        captured: dict[str, Any] = {}
+
+        async def fake_create_dev_user(**kwargs: Any) -> SimpleNamespace:
+            captured.update(kwargs)
+            return SimpleNamespace(
+                email=kwargs["email"],
+                superuser_email=kwargs["superuser_email"],
+                superuser_created=True,
+                organization_id=str(uuid.uuid4()),
+                workspace_id=str(uuid.uuid4()),
+                default_tier_id=str(uuid.uuid4()),
+                default_tier_entitlements={
+                    "custom_registry": True,
+                    "case_addons": True,
+                },
+                org_role=kwargs["org_role"],
+                workspace_role=kwargs["workspace_role"],
+                created=True,
+            )
+
+        monkeypatch.setattr(
+            "tracecat_admin.services.bootstrap.create_dev_user",
+            fake_create_dev_user,
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "create-dev-user",
+                "--email",
+                "dev@example.com",
+                "--password",
+                "password1234",
+                "--superuser-email",
+                "test@tracecat.com",
+                "--superuser-password",
+                "password1234",
+                "--default-tier-entitlements",
+                "custom_registry,case_addons",
+                "--org-role",
+                "organization-admin",
+                "--workspace-role",
+                "workspace-editor",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert (
+            "[dev-seed] Created platform superuser 'test@tracecat.com'" in result.stdout
+        )
+        assert "[dev-seed] Created dev user 'dev@example.com'" in result.stdout
+        assert (
+            "[dev-seed] Default tier entitlements: custom_registry, case_addons"
+            in result.stdout
+        )
+        assert captured == {
+            "email": "dev@example.com",
+            "password": "password1234",
+            "superuser_email": "test@tracecat.com",
+            "superuser_password": "password1234",
+            "default_tier_entitlements": "custom_registry,case_addons",
+            "org_role": "organization-admin",
+            "workspace_role": "workspace-editor",
+        }
+
+    def test_create_dev_user_rejects_short_password(self) -> None:
+        """Test password length validation."""
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "create-dev-user",
+                "--email",
+                "dev@example.com",
+                "--password",
+                "short",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Password must be at least 12 characters" in result.stdout
+
+    def test_create_dev_user_rejects_short_superuser_password(self) -> None:
+        """Test superuser password length validation."""
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "create-dev-user",
+                "--email",
+                "dev@example.com",
+                "--password",
+                "password1234",
+                "--superuser-password",
+                "short",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Superuser password must be at least 12 characters" in result.stdout
+
+    def test_default_tier_entitlement_selection(self) -> None:
+        """Test default tier entitlement selector modes."""
+        from tracecat_admin.services.bootstrap import (
+            ALL_ENTITLEMENTS,
+            resolve_default_tier_entitlements,
+        )
+
+        assert all(resolve_default_tier_entitlements("all").values())
+        assert not any(resolve_default_tier_entitlements("none").values())
+
+        selected = resolve_default_tier_entitlements("custom_registry,case-addons")
+        assert selected["custom_registry"] is True
+        assert selected["case_addons"] is True
+        assert {name for name in ALL_ENTITLEMENTS if not selected[name]} == set(
+            ALL_ENTITLEMENTS
+        ) - {"custom_registry", "case_addons"}
+
+    @pytest.mark.anyio
+    async def test_role_assignment_lookup_is_organization_scoped(self) -> None:
+        """Ensure role assignment upserts never match across organizations."""
+        from tracecat_admin.services.bootstrap import _ensure_role_assignment
+
+        class FakeResult:
+            def scalar_one_or_none(self) -> SimpleNamespace:
+                return SimpleNamespace()
+
+        class FakeSession:
+            statement: Any | None = None
+
+            async def execute(self, statement: Any) -> FakeResult:
+                self.statement = statement
+                return FakeResult()
+
+            def add(self, value: Any) -> None:
+                raise AssertionError("No insert expected")
+
+        session = FakeSession()
+
+        await _ensure_role_assignment(
+            session=cast(AsyncSession, session),
+            user_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            workspace_id=None,
+            role_id=uuid.uuid4(),
+        )
+
+        assert session.statement is not None
+        assert "user_role_assignment.organization_id =" in str(
+            session.statement.compile()
+        )

@@ -1,0 +1,172 @@
+import textwrap
+from typing import Any
+
+import pytest
+from tracecat_registry import ActionIsInterfaceError
+from tracecat_registry.core.agent import action, agent, bedrock_secret
+from tracecat_registry.fields import ModelSelection
+
+from tracecat.auth.types import Role
+from tracecat.registry.repository import RegisterKwargs, generate_model_from_function
+
+requires_openai_mocks = pytest.mark.usefixtures("mock_openai_secrets")
+
+
+PRIMITIVE_OUTPUT_TYPES = [
+    pytest.param(None, id="default-str"),
+    pytest.param("list[str]", id="primitive-list"),
+]
+
+JSON_SCHEMA_OUTPUT_TYPES = [
+    pytest.param(
+        {
+            "name": "IncidentSummary",
+            "type": "object",
+            "description": "Summarized incident report.",
+            "properties": {
+                "summary": {"type": "string"},
+                "confidence": {"type": "number"},
+            },
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+        id="json-schema",
+    )
+]
+
+
+def _input_schema_for(fn: Any) -> dict[str, Any]:
+    kwargs = RegisterKwargs.model_validate(getattr(fn, "__tracecat_udf_kwargs"))
+    args_cls, _, _ = generate_model_from_function(fn, kwargs)
+    return args_cls.model_json_schema()
+
+
+def _prompt_for_output_type(output_type: Any, base_prompt: str) -> str:
+    """Craft a targeted prompt to help the model satisfy the output_type."""
+    if isinstance(output_type, str) and output_type == "list[str]":
+        return f"{base_prompt} Respond only with a Python list of short strings (3-5 items)."
+    if isinstance(output_type, dict):
+        return f"{base_prompt} Respond as a JSON object with keys 'summary' and 'confidence'."
+    return base_prompt
+
+
+def test_agent_schema_marks_legacy_model_fields_deprecated() -> None:
+    schema = _input_schema_for(agent)
+    properties = schema["properties"]
+
+    assert "model" not in schema.get("required", [])
+    assert properties["model_name"]["deprecated"] is True
+    assert properties["model_provider"]["deprecated"] is True
+    assert (
+        properties["model_provider"]["x-tracecat-deprecation-message"]
+        == "Use `model` instead."
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.live_secret
+@requires_openai_mocks
+@pytest.mark.parametrize("output_type", PRIMITIVE_OUTPUT_TYPES)
+async def test_agent_primitives(output_type: Any, test_role: Role) -> None:
+    # Import here to avoid any accidental test-time patching/import shenanigans
+
+    user_prompt = _prompt_for_output_type(
+        output_type,
+        "Summarize the latest incident in 1-2 sentences:\n\n"
+        + textwrap.dedent("""
+        ```json
+        {
+            "title": "Latest Incident Report",
+            "summary": "Systems experienced a brief outage; services recovered within 5 minutes.",
+            "recommendations": ["Review auto-scaling thresholds", "Notify affected customers"],
+        }
+        ```
+        """),
+    )
+
+    with pytest.raises(ActionIsInterfaceError):
+        await agent(
+            user_prompt=user_prompt,
+            model=ModelSelection(model_name="gpt-4o-mini", model_provider="openai"),
+            actions=[],
+            instructions="Be concise and factual.",
+            output_type=output_type,
+            max_tool_calls=0,
+            max_requests=3,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.live_secret
+@requires_openai_mocks
+@pytest.mark.parametrize("output_type", JSON_SCHEMA_OUTPUT_TYPES)
+async def test_agent_json_schema(output_type: Any, test_role: Role) -> None:
+    # Import here to avoid any accidental test-time patching/import shenanigans
+
+    user_prompt = _prompt_for_output_type(
+        output_type,
+        "Summarize the latest incident in 1-2 sentences:\n\n"
+        + textwrap.dedent(
+            """
+        ```json
+        {
+            "title": "Latest Incident Report",
+            "summary": "Systems experienced a brief outage; services recovered within 5 minutes.",
+            "recommendations": ["Review auto-scaling thresholds", "Notify affected customers"],
+        }
+        ```
+        """
+        ),
+    )
+
+    with pytest.raises(ActionIsInterfaceError):
+        await agent(
+            user_prompt=user_prompt,
+            model=ModelSelection(model_name="gpt-4o-mini", model_provider="openai"),
+            actions=[],
+            instructions="Be concise and factual.",
+            output_type=output_type,
+            max_tool_calls=0,
+            max_requests=3,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("output_type", PRIMITIVE_OUTPUT_TYPES)
+async def test_action_primitives(output_type: Any) -> None:
+    user_prompt = _prompt_for_output_type(
+        output_type,
+        "Draft a brief, empathetic customer update about a resolved incident.",
+    )
+
+    with pytest.raises(ActionIsInterfaceError):
+        await action(
+            user_prompt=user_prompt,
+            model=ModelSelection(model_name="gpt-4o-mini", model_provider="openai"),
+            instructions="Be empathetic and concise.",
+            output_type=output_type,
+            max_requests=3,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("output_type", JSON_SCHEMA_OUTPUT_TYPES)
+async def test_action_json_schema(output_type: Any) -> None:
+    user_prompt = _prompt_for_output_type(
+        output_type,
+        "Draft a brief, empathetic customer update about a resolved incident.",
+    )
+
+    with pytest.raises(ActionIsInterfaceError):
+        await action(
+            user_prompt=user_prompt,
+            model=ModelSelection(model_name="gpt-4o-mini", model_provider="openai"),
+            instructions="Be empathetic and concise.",
+            output_type=output_type,
+            max_requests=3,
+        )
+
+
+def test_bedrock_secret_does_not_advertise_aws_profile() -> None:
+    assert bedrock_secret.optional_keys is not None
+    assert "AWS_PROFILE" not in bedrock_secret.optional_keys

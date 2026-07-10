@@ -1,0 +1,1810 @@
+"""Tests for OrgService with organization-scoped queries."""
+
+import secrets
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from typing import cast as type_cast
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.exc import NoResultFound
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from tracecat import config
+from tracecat.auth.api_keys import ORG_API_KEY_PREFIX, generate_managed_api_key
+from tracecat.auth.schemas import UserRole
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import ORG_ADMIN_SCOPES, ORG_MEMBER_SCOPES, ORG_OWNER_SCOPES
+from tracecat.db.models import (
+    AccessToken,
+    Group,
+    GroupMember,
+    MCPRefreshToken,
+    Membership,
+    Organization,
+    OrganizationInvitation,
+    OrganizationMembership,
+    ServiceAccount,
+    ServiceAccountApiKey,
+    User,
+    UserRoleAssignment,
+    WatchtowerAgent,
+    WatchtowerAgentSession,
+    WatchtowerAgentToolCall,
+    Workspace,
+)
+from tracecat.db.models import (
+    Role as DBRole,
+)
+from tracecat.exceptions import (
+    TracecatAuthorizationError,
+    TracecatNotFoundError,
+    TracecatValidationError,
+)
+from tracecat.invitations.enums import InvitationStatus
+from tracecat.organization.service import OrgService, accept_invitation_for_user
+
+
+@pytest.fixture
+async def org1(session: AsyncSession) -> Organization:
+    """Create first test organization."""
+    org = Organization(
+        id=uuid.uuid4(),
+        name="Test Organization 1",
+        slug=f"test-org1-{uuid.uuid4().hex[:8]}",
+        is_active=True,
+    )
+    session.add(org)
+    await session.commit()
+    return org
+
+
+@pytest.fixture
+async def org2(session: AsyncSession) -> Organization:
+    """Create second test organization."""
+    org = Organization(
+        id=uuid.uuid4(),
+        name="Test Organization 2",
+        slug=f"test-org2-{uuid.uuid4().hex[:8]}",
+        is_active=True,
+    )
+    session.add(org)
+    await session.commit()
+    return org
+
+
+@pytest.fixture
+async def user_in_org1(session: AsyncSession, org1: Organization) -> User:
+    """Create a user that belongs to org1."""
+    user = User(
+        id=uuid.uuid4(),
+        email=f"user-org1-{uuid.uuid4().hex[:8]}@example.com",
+        hashed_password="hashed",
+        role=UserRole.BASIC,
+        is_active=True,
+        is_superuser=False,
+        is_verified=True,
+    )
+    session.add(user)
+    await session.flush()
+
+    membership = OrganizationMembership(
+        user_id=user.id,
+        organization_id=org1.id,
+    )
+    session.add(membership)
+    await session.commit()
+    return user
+
+
+@pytest.fixture
+async def admin_in_org1(session: AsyncSession, org1: Organization) -> User:
+    """Create an admin user that belongs to org1."""
+    user = User(
+        id=uuid.uuid4(),
+        email=f"admin-org1-{uuid.uuid4().hex[:8]}@example.com",
+        hashed_password="hashed",
+        role=UserRole.ADMIN,
+        is_active=True,
+        is_superuser=False,
+        is_verified=True,
+    )
+    session.add(user)
+    await session.flush()
+
+    membership = OrganizationMembership(
+        user_id=user.id,
+        organization_id=org1.id,
+    )
+    session.add(membership)
+    await session.commit()
+    return user
+
+
+@pytest.fixture
+async def user_in_org2(session: AsyncSession, org2: Organization) -> User:
+    """Create a user that belongs to org2."""
+    user = User(
+        id=uuid.uuid4(),
+        email=f"user-org2-{uuid.uuid4().hex[:8]}@example.com",
+        hashed_password="hashed",
+        role=UserRole.BASIC,
+        is_active=True,
+        is_superuser=False,
+        is_verified=True,
+    )
+    session.add(user)
+    await session.flush()
+
+    membership = OrganizationMembership(
+        user_id=user.id,
+        organization_id=org2.id,
+    )
+    session.add(membership)
+    await session.commit()
+    return user
+
+
+def create_admin_role(organization_id: uuid.UUID, user_id: uuid.UUID) -> Role:
+    """Create an org admin role for testing (not a platform superuser)."""
+    return Role(
+        type="user",
+        user_id=user_id,
+        organization_id=organization_id,
+        service_id="tracecat-api",
+        is_platform_superuser=False,
+        scopes=ORG_ADMIN_SCOPES,
+    )
+
+
+def create_superuser_role(organization_id: uuid.UUID, user_id: uuid.UUID) -> Role:
+    """Create a platform superuser role for testing."""
+    return Role(
+        type="user",
+        user_id=user_id,
+        organization_id=organization_id,
+        service_id="tracecat-api",
+        is_platform_superuser=True,
+        scopes=ORG_ADMIN_SCOPES,
+    )
+
+
+@pytest.fixture
+async def org1_member_role(session: AsyncSession, org1: Organization) -> DBRole:
+    """Create an RBAC 'organization-member' role for org1."""
+    role = DBRole(
+        id=uuid.uuid4(),
+        name="Organization Member",
+        slug="organization-member",
+        description="Default member role",
+        organization_id=org1.id,
+    )
+    session.add(role)
+    await session.commit()
+    return role
+
+
+@pytest.fixture
+async def org1_admin_role(session: AsyncSession, org1: Organization) -> DBRole:
+    """Create an RBAC 'organization-admin' role for org1."""
+    role = DBRole(
+        id=uuid.uuid4(),
+        name="Organization Admin",
+        slug="organization-admin",
+        description="Admin role",
+        organization_id=org1.id,
+    )
+    session.add(role)
+    await session.commit()
+    return role
+
+
+@pytest.fixture
+async def org1_owner_role(session: AsyncSession, org1: Organization) -> DBRole:
+    """Create an RBAC 'organization-owner' role for org1."""
+    role = DBRole(
+        id=uuid.uuid4(),
+        name="Organization Owner",
+        slug="organization-owner",
+        description="Owner role",
+        organization_id=org1.id,
+    )
+    session.add(role)
+    await session.commit()
+    return role
+
+
+class TestOrganizationServiceListMembers:
+    """Tests for OrganizationService.list_members()."""
+
+    @pytest.mark.anyio
+    async def test_list_members_returns_only_org_members(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        user_in_org1: User,
+        admin_in_org1: User,
+        user_in_org2: User,
+    ):
+        """Test list_members only returns users in the specified organization."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        members = await service.list_members()
+
+        member_ids = {user.id for user in members}
+        assert user_in_org1.id in member_ids
+        assert admin_in_org1.id in member_ids
+        assert user_in_org2.id not in member_ids
+        assert len(members) == 2
+
+    @pytest.mark.anyio
+    async def test_list_members_empty_org(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org2: Organization,
+    ):
+        """Test list_members returns empty list for org with no additional members."""
+        # Query org2 which has no members
+        role = create_admin_role(org2.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        members = await service.list_members()
+
+        assert len(members) == 0
+
+
+class TestOrganizationServiceGetMember:
+    """Tests for OrganizationService.get_member()."""
+
+    @pytest.mark.anyio
+    async def test_get_member_in_same_org(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        user_in_org1: User,
+        admin_in_org1: User,
+    ):
+        """Test get_member returns user when they're in the same org."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        member = await service.get_member(user_in_org1.id)
+
+        assert member.id == user_in_org1.id
+        assert member.email == user_in_org1.email
+
+    @pytest.mark.anyio
+    async def test_get_member_in_different_org_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        user_in_org2: User,
+    ):
+        """Test get_member raises NoResultFound for user in different org."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(NoResultFound):
+            await service.get_member(user_in_org2.id)
+
+    @pytest.mark.anyio
+    async def test_get_member_nonexistent_user_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test get_member raises NoResultFound for nonexistent user."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(NoResultFound):
+            await service.get_member(uuid.uuid4())
+
+
+class TestOrganizationServiceDeleteMember:
+    """Tests for OrganizationService.delete_member()."""
+
+    @pytest.mark.anyio
+    async def test_delete_member_in_same_organization(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        user_in_org1: User,
+        admin_in_org1: User,
+    ):
+        """Test delete_member removes org membership but keeps the user."""
+        user_id = user_in_org1.id
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        await service.delete_member(user_id)
+
+        assert (
+            await session.scalar(select(User).where(type_cast(Any, User.id) == user_id))
+            is not None
+        )
+        assert (
+            await session.scalar(
+                select(OrganizationMembership).where(
+                    OrganizationMembership.user_id == user_id,
+                    OrganizationMembership.organization_id == org1.id,
+                )
+            )
+            is None
+        )
+
+    @pytest.mark.anyio
+    async def test_delete_member_is_org_scoped_and_revokes_sessions(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        user_in_org1: User,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Deleting a member removes org access without touching other orgs."""
+        org2_member_role = DBRole(
+            id=uuid.uuid4(),
+            name="Organization Member",
+            slug="organization-member",
+            description="Default member role",
+            organization_id=org2.id,
+        )
+        org2_membership = OrganizationMembership(
+            user_id=user_in_org1.id,
+            organization_id=org2.id,
+        )
+        workspace_org1 = Workspace(
+            id=uuid.uuid4(),
+            name=f"test-workspace-org1-{uuid.uuid4().hex[:8]}",
+            organization_id=org1.id,
+        )
+        workspace_org2 = Workspace(
+            id=uuid.uuid4(),
+            name=f"test-workspace-org2-{uuid.uuid4().hex[:8]}",
+            organization_id=org2.id,
+        )
+        group_org1 = Group(
+            id=uuid.uuid4(),
+            name=f"test-group-org1-{uuid.uuid4().hex[:8]}",
+            organization_id=org1.id,
+        )
+        group_org2 = Group(
+            id=uuid.uuid4(),
+            name=f"test-group-org2-{uuid.uuid4().hex[:8]}",
+            organization_id=org2.id,
+        )
+        session.add_all(
+            [
+                org2_member_role,
+                org2_membership,
+                workspace_org1,
+                workspace_org2,
+                group_org1,
+                group_org2,
+            ]
+        )
+        await session.flush()
+
+        token = AccessToken(
+            token=f"token-{uuid.uuid4().hex}",
+            user_id=user_in_org1.id,
+        )
+        org1_workspace_membership = Membership(
+            user_id=user_in_org1.id,
+            workspace_id=workspace_org1.id,
+        )
+        org2_workspace_membership = Membership(
+            user_id=user_in_org1.id,
+            workspace_id=workspace_org2.id,
+        )
+        org1_role_assignment = UserRoleAssignment(
+            organization_id=org1.id,
+            user_id=user_in_org1.id,
+            workspace_id=workspace_org1.id,
+            role_id=org1_member_role.id,
+            assigned_by=admin_in_org1.id,
+        )
+        org2_role_assignment = UserRoleAssignment(
+            organization_id=org2.id,
+            user_id=user_in_org1.id,
+            workspace_id=workspace_org2.id,
+            role_id=org2_member_role.id,
+            assigned_by=admin_in_org1.id,
+        )
+        org1_group_member = GroupMember(
+            user_id=user_in_org1.id,
+            group_id=group_org1.id,
+        )
+        org2_group_member = GroupMember(
+            user_id=user_in_org1.id,
+            group_id=group_org2.id,
+        )
+        session.add_all(
+            [
+                token,
+                org1_workspace_membership,
+                org2_workspace_membership,
+                org1_role_assignment,
+                org2_role_assignment,
+                org1_group_member,
+                org2_group_member,
+            ]
+        )
+        await session.commit()
+
+        token_id = token.id
+        user_id = user_in_org1.id
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        await service.delete_member(user_id)
+
+        assert (
+            await session.scalar(select(User).where(type_cast(Any, User.id) == user_id))
+            is not None
+        )
+        assert (
+            await session.scalar(
+                select(AccessToken).where(type_cast(Any, AccessToken.id) == token_id)
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(OrganizationMembership).where(
+                    OrganizationMembership.user_id == user_id,
+                    OrganizationMembership.organization_id == org1.id,
+                )
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(OrganizationMembership).where(
+                    OrganizationMembership.user_id == user_id,
+                    OrganizationMembership.organization_id == org2.id,
+                )
+            )
+            is not None
+        )
+        assert (
+            await session.scalar(
+                select(Membership).where(
+                    Membership.user_id == user_id,
+                    Membership.workspace_id == workspace_org1.id,
+                )
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(Membership).where(
+                    Membership.user_id == user_id,
+                    Membership.workspace_id == workspace_org2.id,
+                )
+            )
+            is not None
+        )
+        assert (
+            await session.scalar(
+                select(UserRoleAssignment).where(
+                    UserRoleAssignment.user_id == user_id,
+                    UserRoleAssignment.organization_id == org1.id,
+                )
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(UserRoleAssignment).where(
+                    UserRoleAssignment.user_id == user_id,
+                    UserRoleAssignment.organization_id == org2.id,
+                )
+            )
+            is not None
+        )
+        assert (
+            await session.scalar(
+                select(GroupMember).where(
+                    GroupMember.user_id == user_id,
+                    GroupMember.group_id == group_org1.id,
+                )
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(GroupMember).where(
+                    GroupMember.user_id == user_id,
+                    GroupMember.group_id == group_org2.id,
+                )
+            )
+            is not None
+        )
+
+    @pytest.mark.anyio
+    async def test_delete_member_in_different_organization_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        user_in_org2: User,
+    ):
+        """Test delete_member raises NoResultFound for user in different organization."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(NoResultFound):
+            await service.delete_member(user_in_org2.id)
+
+    @pytest.mark.anyio
+    async def test_delete_superuser_raises_authorization_error(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test delete_member raises TracecatAuthorizationError for superuser."""
+        # Create a superuser in org1
+        superuser = User(
+            id=uuid.uuid4(),
+            email=f"superuser-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=True,
+            is_verified=True,
+        )
+        session.add(superuser)
+        await session.flush()
+
+        membership = OrganizationMembership(
+            user_id=superuser.id,
+            organization_id=org1.id,
+        )
+        session.add(membership)
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(TracecatAuthorizationError, match="Cannot delete superuser"):
+            await service.delete_member(superuser.id)
+
+        # Verify superuser was NOT deleted
+        result = await session.execute(select(User).where(User.id == superuser.id))  # pyright: ignore[reportArgumentType]
+        assert result.scalar_one_or_none() is not None
+
+    @pytest.mark.anyio
+    async def test_delete_nonexistent_member_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test delete_member raises NoResultFound for nonexistent user."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(NoResultFound):
+            await service.delete_member(uuid.uuid4())
+
+
+class TestOrganizationServiceDeleteOrganization:
+    """Tests for OrgService.delete_organization()."""
+
+    @pytest.mark.anyio
+    async def test_owner_can_delete_organization_with_confirmation(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ) -> None:
+        token = AccessToken(
+            token=f"token-{uuid.uuid4().hex}",
+            user_id=admin_in_org1.id,
+        )
+        session.add(token)
+        await session.commit()
+        token_id = token.id
+        user_id = admin_in_org1.id
+
+        role = Role(
+            type="user",
+            user_id=admin_in_org1.id,
+            organization_id=org1.id,
+            scopes=ORG_OWNER_SCOPES,
+            service_id="tracecat-api",
+            is_platform_superuser=False,
+        )
+        service = OrgService(session, role=role)
+
+        await service.delete_organization(confirmation=org1.name)
+
+        org_result = await session.execute(
+            select(Organization).where(Organization.id == org1.id)
+        )
+        membership_result = await session.execute(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == org1.id
+            )
+        )
+        assert org_result.scalar_one_or_none() is None
+        assert membership_result.scalars().all() == []
+        assert (
+            await session.scalar(select(User).where(type_cast(Any, User.id) == user_id))
+            is not None
+        )
+        assert (
+            await session.scalar(
+                select(AccessToken).where(type_cast(Any, AccessToken.id) == token_id)
+            )
+            is None
+        )
+
+    @pytest.mark.anyio
+    async def test_owner_can_delete_organization_with_restrict_org_resources(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ) -> None:
+        refresh_token = MCPRefreshToken(
+            organization_id=org1.id,
+            token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+            family_id=uuid.uuid4(),
+            user_id=admin_in_org1.id,
+            client_id="test-client",
+            encrypted_metadata=b"{}",
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+        )
+        agent = WatchtowerAgent(
+            organization_id=org1.id,
+            fingerprint_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+            agent_type="test",
+            agent_source="test",
+        )
+        session.add_all([refresh_token, agent])
+        await session.flush()
+        agent_session = WatchtowerAgentSession(
+            organization_id=org1.id,
+            agent_id=agent.id,
+            session_state="connected",
+        )
+        session.add(agent_session)
+        await session.flush()
+        tool_call = WatchtowerAgentToolCall(
+            organization_id=org1.id,
+            agent_id=agent.id,
+            agent_session_id=agent_session.id,
+            tool_name="test_tool",
+            call_status="success",
+            args_redacted={},
+        )
+        session.add(tool_call)
+        await session.commit()
+
+        role = Role(
+            type="user",
+            user_id=admin_in_org1.id,
+            organization_id=org1.id,
+            scopes=ORG_OWNER_SCOPES,
+            service_id="tracecat-api",
+            is_platform_superuser=False,
+        )
+        service = OrgService(session, role=role)
+
+        await service.delete_organization(confirmation=org1.name)
+
+        assert (
+            await session.scalar(select(Organization).where(Organization.id == org1.id))
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(MCPRefreshToken).where(
+                    MCPRefreshToken.organization_id == org1.id
+                )
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(WatchtowerAgent).where(
+                    WatchtowerAgent.organization_id == org1.id
+                )
+            )
+            is None
+        )
+
+    @pytest.mark.anyio
+    async def test_owner_can_delete_organization_with_service_accounts(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ) -> None:
+        generated = generate_managed_api_key(prefix=ORG_API_KEY_PREFIX)
+        service_account = ServiceAccount(
+            organization_id=org1.id,
+            name="Org automation",
+            description="cleanup test",
+            owner_user_id=admin_in_org1.id,
+        )
+        session.add(service_account)
+        await session.flush()
+        session.add(
+            ServiceAccountApiKey(
+                service_account_id=service_account.id,
+                name="Primary",
+                key_id=generated.key_id,
+                hashed=generated.hashed,
+                salt=generated.salt_b64,
+                preview=generated.preview(),
+                created_by=admin_in_org1.id,
+            )
+        )
+        await session.commit()
+
+        role = Role(
+            type="user",
+            user_id=admin_in_org1.id,
+            organization_id=org1.id,
+            scopes=ORG_OWNER_SCOPES,
+            service_id="tracecat-api",
+            is_platform_superuser=False,
+        )
+        service = OrgService(session, role=role)
+
+        await service.delete_organization(confirmation=org1.name)
+
+        org_result = await session.execute(
+            select(Organization).where(Organization.id == org1.id)
+        )
+        service_account_result = await session.execute(
+            select(ServiceAccount).where(ServiceAccount.organization_id == org1.id)
+        )
+        assert org_result.scalar_one_or_none() is None
+        assert service_account_result.scalars().all() == []
+
+    @pytest.mark.anyio
+    async def test_delete_organization_requires_exact_confirmation(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ) -> None:
+        role = Role(
+            type="user",
+            user_id=admin_in_org1.id,
+            organization_id=org1.id,
+            scopes=ORG_OWNER_SCOPES,
+            service_id="tracecat-api",
+            is_platform_superuser=False,
+        )
+        service = OrgService(session, role=role)
+
+        with pytest.raises(
+            TracecatValidationError,
+            match="Confirmation text must exactly match the organization name.",
+        ):
+            await service.delete_organization(confirmation="wrong")
+
+        org_result = await session.execute(
+            select(Organization).where(Organization.id == org1.id)
+        )
+        assert org_result.scalar_one_or_none() is not None
+
+    @pytest.mark.anyio
+    async def test_admin_cannot_delete_organization(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ) -> None:
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(
+            TracecatAuthorizationError,
+            match="You don't have permission to perform this action.",
+        ):
+            await service.delete_organization(confirmation=org1.name)
+
+
+class TestOrganizationServiceSessions:
+    """Tests for OrganizationService session management."""
+
+    @pytest.mark.anyio
+    async def test_list_sessions_returns_only_org_sessions(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        user_in_org1: User,
+        admin_in_org1: User,
+        user_in_org2: User,
+    ):
+        """Test list_sessions only returns sessions for users in the org."""
+        # Create sessions for users in both orgs
+        token1 = AccessToken(
+            token=f"token-{uuid.uuid4().hex}",
+            user_id=user_in_org1.id,
+        )
+        token2 = AccessToken(
+            token=f"token-{uuid.uuid4().hex}",
+            user_id=admin_in_org1.id,
+        )
+        token3 = AccessToken(
+            token=f"token-{uuid.uuid4().hex}",
+            user_id=user_in_org2.id,
+        )
+        session.add_all([token1, token2, token3])
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        sessions = await service.list_sessions()
+
+        session_user_ids = {s.user_id for s in sessions}
+        assert user_in_org1.id in session_user_ids
+        assert admin_in_org1.id in session_user_ids
+        assert user_in_org2.id not in session_user_ids
+        assert len(sessions) == 2
+
+    @pytest.mark.anyio
+    async def test_delete_session_in_same_org(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        user_in_org1: User,
+        admin_in_org1: User,
+    ):
+        """Test delete_session works for session belonging to user in same org."""
+        token = AccessToken(
+            token=f"token-{uuid.uuid4().hex}",
+            user_id=user_in_org1.id,
+        )
+        session.add(token)
+        await session.commit()
+        token_id = token.id
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        await service.delete_session(token_id)
+
+        # Verify session was deleted
+        result = await session.execute(
+            select(AccessToken).where(AccessToken.id == token_id)
+        )
+        assert result.scalar_one_or_none() is None
+
+    @pytest.mark.anyio
+    async def test_delete_session_in_different_org_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        user_in_org2: User,
+    ):
+        """Test delete_session raises NoResultFound for session in different org."""
+        token = AccessToken(
+            token=f"token-{uuid.uuid4().hex}",
+            user_id=user_in_org2.id,
+        )
+        session.add(token)
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(NoResultFound):
+            await service.delete_session(token.id)
+
+
+class TestOrganizationServiceAddMember:
+    """Tests for OrgService.add_member()."""
+
+    @pytest.mark.anyio
+    async def test_add_member_creates_membership(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test add_member creates an OrganizationMembership record."""
+        # Create a new user not yet in the org
+        new_user = User(
+            id=uuid.uuid4(),
+            email=f"newuser-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.BASIC,
+            is_active=True,
+            is_superuser=False,
+            is_verified=True,
+        )
+        session.add(new_user)
+        await session.commit()
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        membership = await service.add_member(
+            user_id=new_user.id,
+            organization_id=org1.id,
+        )
+
+        assert membership.user_id == new_user.id
+        assert membership.organization_id == org1.id
+
+    @pytest.mark.anyio
+    async def test_add_member_with_admin_role(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test add_member can assign admin role."""
+        new_user = User(
+            id=uuid.uuid4(),
+            email=f"newadmin-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=False,
+            is_verified=True,
+        )
+        session.add(new_user)
+        await session.commit()
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        membership = await service.add_member(
+            user_id=new_user.id,
+            organization_id=org1.id,
+        )
+
+        assert membership.user_id == new_user.id
+        assert membership.organization_id == org1.id
+
+    @pytest.mark.anyio
+    async def test_add_member_with_owner_role(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test add_member can assign owner role."""
+        new_user = User(
+            id=uuid.uuid4(),
+            email=f"newowner-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=False,
+            is_verified=True,
+        )
+        session.add(new_user)
+        await session.commit()
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        membership = await service.add_member(
+            user_id=new_user.id,
+            organization_id=org1.id,
+        )
+
+        assert membership.user_id == new_user.id
+        assert membership.organization_id == org1.id
+
+    @pytest.mark.anyio
+    async def test_add_member_default_role_is_member(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test add_member defaults to MEMBER role when not specified."""
+        new_user = User(
+            id=uuid.uuid4(),
+            email=f"defaultrole-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.BASIC,
+            is_active=True,
+            is_superuser=False,
+            is_verified=True,
+        )
+        session.add(new_user)
+        await session.commit()
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        membership = await service.add_member(
+            user_id=new_user.id,
+            organization_id=org1.id,
+        )
+
+        assert membership.user_id == new_user.id
+        assert membership.organization_id == org1.id
+
+    @pytest.mark.anyio
+    async def test_add_member_user_appears_in_list_members(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test that added member appears in list_members."""
+        new_user = User(
+            id=uuid.uuid4(),
+            email=f"listcheck-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.BASIC,
+            is_active=True,
+            is_superuser=False,
+            is_verified=True,
+        )
+        session.add(new_user)
+        await session.commit()
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        # Add member
+        await service.add_member(
+            user_id=new_user.id,
+            organization_id=org1.id,
+        )
+
+        # Verify they appear in list_members
+        members = await service.list_members()
+        member_ids = {user.id for user in members}
+        assert new_user.id in member_ids
+
+
+class TestOrganizationServiceInvitations:
+    """Tests for OrgService invitation methods."""
+
+    @pytest.mark.anyio
+    async def test_create_invitation(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test create_invitation creates an invitation record."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email="newuser@example.com",
+            role_id=org1_member_role.id,
+        )
+
+        assert invitation.email == "newuser@example.com"
+        assert invitation.role_id == org1_member_role.id
+        assert invitation.organization_id == org1.id
+        assert invitation.invited_by == admin_in_org1.id
+        assert invitation.status == InvitationStatus.PENDING
+        assert invitation.token is not None
+        assert len(invitation.token) > 0
+
+    @pytest.mark.anyio
+    async def test_create_invitation_with_admin_role(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_admin_role: DBRole,
+    ):
+        """Test create_invitation can assign admin role."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email="newadmin@example.com",
+            role_id=org1_admin_role.id,
+        )
+
+        assert invitation.role_id == org1_admin_role.id
+
+    @pytest.mark.anyio
+    async def test_create_owner_invitation_requires_owner_or_superuser(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_owner_role: DBRole,
+    ):
+        """Test that org admins cannot create OWNER invitations."""
+        # Org admin (not superuser) should not be able to create OWNER invitations
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(
+            TracecatAuthorizationError,
+            match="Only organization owners can create owner invitations",
+        ):
+            await service.create_invitation(
+                email="newowner@example.com",
+                role_id=org1_owner_role.id,
+            )
+
+    @pytest.mark.anyio
+    async def test_superuser_can_create_owner_invitation(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_owner_role: DBRole,
+    ):
+        """Test that platform superusers can create OWNER invitations."""
+        role = create_superuser_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email="newowner@example.com",
+            role_id=org1_owner_role.id,
+        )
+
+        assert invitation.role_id == org1_owner_role.id
+        assert invitation.email == "newowner@example.com"
+
+    @pytest.mark.anyio
+    async def test_create_invitation_duplicate_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test create_invitation raises error for duplicate email in same org."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        await service.create_invitation(
+            email="duplicate@example.com", role_id=org1_member_role.id
+        )
+
+        with pytest.raises(
+            TracecatValidationError,
+            match="An invitation already exists for duplicate@example.com",
+        ):
+            await service.create_invitation(
+                email="duplicate@example.com", role_id=org1_member_role.id
+            )
+
+    @pytest.mark.anyio
+    async def test_create_invitation_replaces_expired_invitation(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test create_invitation replaces an expired invitation."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        # Create first invitation
+        invitation = await service.create_invitation(
+            email="expired@example.com", role_id=org1_member_role.id
+        )
+        old_id = invitation.id
+
+        # Manually expire it
+        invitation.expires_at = datetime.now(UTC) - timedelta(days=1)
+        await session.commit()
+
+        # Create new invitation for same email - should succeed
+        new_invitation = await service.create_invitation(
+            email="expired@example.com", role_id=org1_member_role.id
+        )
+
+        assert new_invitation.id != old_id
+        assert new_invitation.email == "expired@example.com"
+        assert new_invitation.expires_at > datetime.now(UTC)
+
+    @pytest.mark.anyio
+    async def test_create_invitation_existing_member_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test create_invitation raises error when email is already a member."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        # admin_in_org1 is already a member of org1, try to invite their email
+        with pytest.raises(
+            TracecatValidationError,
+            match="is already a member of this organization",
+        ):
+            await service.create_invitation(
+                email=admin_in_org1.email, role_id=org1_member_role.id
+            )
+
+    @pytest.mark.anyio
+    async def test_create_invitation_allows_existing_superuser_account_in_multi_tenant(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test superuser accounts can be invited as regular org members."""
+        monkeypatch.setattr(config, "TRACECAT__EE_MULTI_TENANT", True)
+        superuser = User(
+            id=uuid.uuid4(),
+            email=f"superuser-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=True,
+            is_verified=True,
+        )
+        session.add(superuser)
+        await session.commit()
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email=superuser.email,
+            role_id=org1_member_role.id,
+        )
+
+        invitation_id = await session.scalar(
+            select(OrganizationInvitation.id).where(
+                OrganizationInvitation.email == superuser.email
+            )
+        )
+        assert invitation_id == invitation.id
+
+    @pytest.mark.anyio
+    async def test_list_invitations_returns_org_invitations(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test list_invitations only returns invitations for the organization."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        # Create invitations for org1
+        inv1 = await service.create_invitation(
+            email="user1@example.com", role_id=org1_member_role.id
+        )
+        inv2 = await service.create_invitation(
+            email="user2@example.com", role_id=org1_member_role.id
+        )
+
+        # Create invitation for org2 directly (need a role for org2)
+        org2_role = DBRole(
+            id=uuid.uuid4(),
+            name="Organization Member",
+            slug="organization-member",
+            description="Default member role",
+            organization_id=org2.id,
+        )
+        session.add(org2_role)
+        await session.flush()
+        org2_invitation = OrganizationInvitation(
+            organization_id=org2.id,
+            email="org2user@example.com",
+            role_id=org2_role.id,
+            token=secrets.token_urlsafe(32),
+            expires_at=datetime.now(UTC) + timedelta(days=7),
+            status=InvitationStatus.PENDING,
+        )
+        session.add(org2_invitation)
+        await session.commit()
+
+        # List invitations for org1
+        invitations = await service.list_invitations()
+
+        invitation_ids = {inv.id for inv in invitations}
+        assert inv1.id in invitation_ids
+        assert inv2.id in invitation_ids
+        assert org2_invitation.id not in invitation_ids
+        assert len(invitations) == 2
+
+    @pytest.mark.anyio
+    async def test_list_invitations_filter_by_status(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test list_invitations can filter by status."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        # Create pending invitation
+        pending_inv = await service.create_invitation(
+            email="pending@example.com", role_id=org1_member_role.id
+        )
+
+        # Create and revoke another invitation
+        revoked_inv = await service.create_invitation(
+            email="revoked@example.com", role_id=org1_member_role.id
+        )
+        await service.revoke_invitation(revoked_inv.id)
+
+        # List only pending invitations
+        pending_invitations = await service.list_invitations(
+            status=InvitationStatus.PENDING
+        )
+        assert len(pending_invitations) == 1
+        assert pending_invitations[0].id == pending_inv.id
+
+        # List only revoked invitations
+        revoked_invitations = await service.list_invitations(
+            status=InvitationStatus.REVOKED
+        )
+        assert len(revoked_invitations) == 1
+        assert revoked_invitations[0].id == revoked_inv.id
+
+    @pytest.mark.anyio
+    async def test_get_invitation_by_token(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test get_invitation_by_token retrieves invitation."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email="test@example.com", role_id=org1_member_role.id
+        )
+
+        retrieved = await service.get_invitation_by_token(invitation.token)
+
+        assert retrieved.id == invitation.id
+        assert retrieved.email == invitation.email
+
+    @pytest.mark.anyio
+    async def test_get_invitation_by_token_returns_org_and_inviter_info(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test get_invitation_by_token returns org name and inviter info for acceptance page."""
+        # Set inviter's name for test
+        admin_in_org1.first_name = "John"
+        admin_in_org1.last_name = "Doe"
+        await session.commit()
+
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email="test@example.com", role_id=org1_member_role.id
+        )
+
+        # Get invitation by token
+        retrieved = await service.get_invitation_by_token(invitation.token)
+
+        # Verify organization info is available
+        assert retrieved.organization_id == org1.id
+
+        # Fetch org to verify name can be resolved
+        result = await session.execute(
+            select(Organization).where(Organization.id == retrieved.organization_id)
+        )
+        org = result.scalar_one()
+        assert org.name == "Test Organization 1"
+
+        # Verify inviter info is available
+        assert retrieved.invited_by == admin_in_org1.id
+        result = await session.execute(
+            select(User).where(User.id == retrieved.invited_by)  # pyright: ignore[reportArgumentType]
+        )
+        inviter = result.scalar_one()
+        assert inviter.first_name == "John"
+        assert inviter.last_name == "Doe"
+        assert inviter.email == admin_in_org1.email
+
+    @pytest.mark.anyio
+    async def test_get_invitation_by_token_not_found(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+    ):
+        """Test get_invitation_by_token raises error for invalid token."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(TracecatNotFoundError, match="Invitation not found"):
+            await service.get_invitation_by_token("invalid-token")
+
+    @pytest.mark.anyio
+    async def test_revoke_invitation(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test revoke_invitation marks invitation as revoked."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email="test@example.com", role_id=org1_member_role.id
+        )
+        assert invitation.status == InvitationStatus.PENDING
+
+        revoked = await service.revoke_invitation(invitation.id)
+
+        assert revoked.status == InvitationStatus.REVOKED
+
+    @pytest.mark.anyio
+    async def test_revoke_invitation_already_revoked_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+    ):
+        """Test revoke_invitation raises error for already revoked invitation."""
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        invitation = await service.create_invitation(
+            email="test@example.com", role_id=org1_member_role.id
+        )
+        await service.revoke_invitation(invitation.id)
+
+        with pytest.raises(
+            TracecatAuthorizationError, match="Cannot revoke invitation"
+        ):
+            await service.revoke_invitation(invitation.id)
+
+    @pytest.mark.anyio
+    async def test_revoke_invitation_from_different_org_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+    ):
+        """Test revoke_invitation raises error for invitation in different org."""
+        # Create invitation in org2 directly (need a role for org2)
+        org2_role = DBRole(
+            id=uuid.uuid4(),
+            name="Organization Member",
+            slug="organization-member",
+            description="Default member role",
+            organization_id=org2.id,
+        )
+        session.add(org2_role)
+        await session.flush()
+        org2_invitation = OrganizationInvitation(
+            organization_id=org2.id,
+            email="org2user@example.com",
+            role_id=org2_role.id,
+            token=secrets.token_urlsafe(32),
+            expires_at=datetime.now(UTC) + timedelta(days=7),
+            status=InvitationStatus.PENDING,
+        )
+        session.add(org2_invitation)
+        await session.commit()
+
+        # Try to revoke from org1
+        role = create_admin_role(org1.id, admin_in_org1.id)
+        service = OrgService(session, role=role)
+
+        with pytest.raises(NoResultFound):
+            await service.revoke_invitation(org2_invitation.id)
+
+    @pytest.mark.anyio
+    async def test_accept_invitation(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        user_in_org2: User,
+        org1_member_role: DBRole,
+    ):
+        """Test accept_invitation creates membership."""
+        # Create invitation as admin
+        admin_role = create_admin_role(org1.id, admin_in_org1.id)
+        admin_service = OrgService(session, role=admin_role)
+        invitation = await admin_service.create_invitation(
+            email=user_in_org2.email,
+            role_id=org1_member_role.id,
+        )
+
+        # Accept as user_in_org2
+        user_role = Role(
+            type="user",
+            user_id=user_in_org2.id,
+            organization_id=org2.id,
+            service_id="tracecat-api",
+            scopes=ORG_MEMBER_SCOPES,
+        )
+        user_service = OrgService(session, role=user_role)
+        membership = await user_service.accept_invitation(invitation.token)
+
+        assert membership.user_id == user_in_org2.id
+        assert membership.organization_id == org1.id
+
+        # Verify invitation is marked as accepted
+        await session.refresh(invitation)
+        assert invitation.status == InvitationStatus.ACCEPTED
+        assert invitation.accepted_at is not None
+
+    @pytest.mark.anyio
+    async def test_accept_invitation_allows_superuser_account_in_multi_tenant(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test multi-tenant superuser accounts accept org invitations as users."""
+        monkeypatch.setattr(config, "TRACECAT__EE_MULTI_TENANT", True)
+        standalone_superuser = User(
+            id=uuid.uuid4(),
+            email=f"standalone-superuser-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=True,
+            is_verified=True,
+        )
+        service_superuser = User(
+            id=uuid.uuid4(),
+            email=f"service-superuser-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=True,
+            is_verified=True,
+        )
+        session.add_all([standalone_superuser, service_superuser])
+        await session.commit()
+
+        admin_role = create_admin_role(org1.id, admin_in_org1.id)
+        admin_service = OrgService(session, role=admin_role)
+        standalone_invitation = await admin_service.create_invitation(
+            email=standalone_superuser.email,
+            role_id=org1_member_role.id,
+        )
+        service_invitation = await admin_service.create_invitation(
+            email=service_superuser.email,
+            role_id=org1_member_role.id,
+        )
+
+        standalone_membership = await accept_invitation_for_user(
+            session,
+            user_id=standalone_superuser.id,
+            token=standalone_invitation.token,
+        )
+        assert standalone_membership.user_id == standalone_superuser.id
+        assert standalone_membership.organization_id == org1.id
+
+        user_role = Role(
+            type="user",
+            user_id=service_superuser.id,
+            organization_id=org2.id,
+            service_id="tracecat-api",
+            scopes=ORG_MEMBER_SCOPES,
+        )
+        user_service = OrgService(session, role=user_role)
+        service_membership = await user_service.accept_invitation(
+            service_invitation.token
+        )
+        assert service_membership.user_id == service_superuser.id
+        assert service_membership.organization_id == org1.id
+
+    @pytest.mark.anyio
+    async def test_accept_invitation_allows_superuser_account_in_single_tenant(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        org1_member_role: DBRole,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Test single-tenant superuser accounts can accept org invitations."""
+        monkeypatch.setattr(config, "TRACECAT__EE_MULTI_TENANT", False)
+        standalone_superuser = User(
+            id=uuid.uuid4(),
+            email=f"standalone-superuser-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=True,
+            is_verified=True,
+        )
+        service_superuser = User(
+            id=uuid.uuid4(),
+            email=f"service-superuser-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.ADMIN,
+            is_active=True,
+            is_superuser=True,
+            is_verified=True,
+        )
+        session.add_all([standalone_superuser, service_superuser])
+        await session.commit()
+
+        admin_role = create_admin_role(org1.id, admin_in_org1.id)
+        admin_service = OrgService(session, role=admin_role)
+        standalone_invitation = await admin_service.create_invitation(
+            email=standalone_superuser.email,
+            role_id=org1_member_role.id,
+        )
+        service_invitation = await admin_service.create_invitation(
+            email=service_superuser.email,
+            role_id=org1_member_role.id,
+        )
+
+        standalone_membership = await accept_invitation_for_user(
+            session,
+            user_id=standalone_superuser.id,
+            token=standalone_invitation.token,
+        )
+        assert standalone_membership.user_id == standalone_superuser.id
+        assert standalone_membership.organization_id == org1.id
+
+        user_role = Role(
+            type="user",
+            user_id=service_superuser.id,
+            organization_id=org2.id,
+            service_id="tracecat-api",
+            scopes=ORG_MEMBER_SCOPES,
+        )
+        user_service = OrgService(session, role=user_role)
+        service_membership = await user_service.accept_invitation(
+            service_invitation.token
+        )
+        assert service_membership.user_id == service_superuser.id
+        assert service_membership.organization_id == org1.id
+
+    @pytest.mark.anyio
+    async def test_accept_invitation_already_accepted_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        user_in_org2: User,
+        org1_member_role: DBRole,
+    ):
+        """Test accept_invitation raises error for already accepted invitation."""
+        # Create and accept invitation
+        admin_role = create_admin_role(org1.id, admin_in_org1.id)
+        admin_service = OrgService(session, role=admin_role)
+        invitation = await admin_service.create_invitation(
+            email=user_in_org2.email,
+            role_id=org1_member_role.id,
+        )
+
+        user_role = Role(
+            type="user",
+            user_id=user_in_org2.id,
+            organization_id=org2.id,
+            service_id="tracecat-api",
+            scopes=ORG_MEMBER_SCOPES,
+        )
+        user_service = OrgService(session, role=user_role)
+        await user_service.accept_invitation(invitation.token)
+
+        # Try to accept again with the same user
+        with pytest.raises(TracecatAuthorizationError, match="already been accepted"):
+            await user_service.accept_invitation(invitation.token)
+
+    @pytest.mark.anyio
+    async def test_accept_invitation_email_mismatch_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        user_in_org2: User,
+        org1_member_role: DBRole,
+    ):
+        """Test accept_invitation raises error when user email doesn't match invitation."""
+        # Create invitation for user_in_org2
+        admin_role = create_admin_role(org1.id, admin_in_org1.id)
+        admin_service = OrgService(session, role=admin_role)
+        invitation = await admin_service.create_invitation(
+            email=user_in_org2.email,
+            role_id=org1_member_role.id,
+        )
+
+        # Create a different user with different email
+        different_user = User(
+            id=uuid.uuid4(),
+            email=f"different-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="hashed",
+            role=UserRole.BASIC,
+            is_active=True,
+            is_superuser=False,
+            is_verified=True,
+        )
+        session.add(different_user)
+        await session.commit()
+
+        # Try to accept with different user (email mismatch)
+        different_role = Role(
+            type="user",
+            user_id=different_user.id,
+            organization_id=org2.id,
+            service_id="tracecat-api",
+            scopes=ORG_MEMBER_SCOPES,
+        )
+        different_service = OrgService(session, role=different_role)
+
+        with pytest.raises(
+            TracecatAuthorizationError,
+            match="invitation was sent to a different email address",
+        ):
+            await different_service.accept_invitation(invitation.token)
+
+    @pytest.mark.anyio
+    async def test_accept_invitation_revoked_raises(
+        self,
+        session: AsyncSession,
+        org1: Organization,
+        org2: Organization,
+        admin_in_org1: User,
+        user_in_org2: User,
+        org1_member_role: DBRole,
+    ):
+        """Test accept_invitation raises error for revoked invitation."""
+        # Create and revoke invitation
+        admin_role = create_admin_role(org1.id, admin_in_org1.id)
+        admin_service = OrgService(session, role=admin_role)
+        invitation = await admin_service.create_invitation(
+            email=user_in_org2.email,
+            role_id=org1_member_role.id,
+        )
+        await admin_service.revoke_invitation(invitation.id)
+
+        # Try to accept
+        user_role = Role(
+            type="user",
+            user_id=user_in_org2.id,
+            organization_id=org2.id,
+            service_id="tracecat-api",
+            scopes=ORG_MEMBER_SCOPES,
+        )
+        user_service = OrgService(session, role=user_role)
+
+        with pytest.raises(TracecatAuthorizationError, match="has been revoked"):
+            await user_service.accept_invitation(invitation.token)

@@ -1,0 +1,201 @@
+"use client"
+
+import { DotsHorizontalIcon, ReloadIcon } from "@radix-ui/react-icons"
+import { HistoryIcon } from "lucide-react"
+import { useState } from "react"
+import type { OrgRegistryRepositoryRead } from "@/client"
+import { DataTable, DataTableColumnHeader } from "@/components/data-table"
+import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import { toast } from "@/components/ui/use-toast"
+import { useAdminOrgRegistry } from "@/hooks/use-admin"
+import { getApiErrorDetail } from "@/lib/errors"
+import { getRelativeTime } from "@/lib/event-history"
+
+interface AdminOrgRegistryTableProps {
+  orgId: string
+  onShowVersions?: (repository: OrgRegistryRepositoryRead) => void
+}
+
+export function AdminOrgRegistryTable({
+  orgId,
+  onShowVersions,
+}: AdminOrgRegistryTableProps) {
+  const [syncingId, setSyncingId] = useState<string | null>(null)
+  const { repositories, syncRepository, syncPending } =
+    useAdminOrgRegistry(orgId)
+
+  const handleSync = async (repositoryId: string, force = false) => {
+    setSyncingId(repositoryId)
+    try {
+      await syncRepository({ repositoryId, force })
+      toast({
+        title: "Sync complete",
+        description: "Repository sync successful.",
+      })
+    } catch (error) {
+      console.error("Failed to sync repository", error)
+      const detail =
+        getApiErrorDetail(error) ??
+        "Failed to sync repository. Please try again."
+      toast({
+        title: "Sync failed",
+        description: detail,
+        variant: "destructive",
+      })
+    } finally {
+      setSyncingId(null)
+    }
+  }
+
+  return (
+    <DataTable
+      data={repositories ?? []}
+      initialSortingState={[{ id: "origin", desc: false }]}
+      columns={[
+        {
+          accessorKey: "origin",
+          header: ({ column }) => (
+            <DataTableColumnHeader
+              className="text-xs"
+              column={column}
+              title="Repository"
+            />
+          ),
+          cell: ({ row }) => (
+            <div className="text-xs font-mono">
+              {row.getValue<OrgRegistryRepositoryRead["origin"]>("origin")}
+            </div>
+          ),
+          enableSorting: true,
+          enableHiding: false,
+        },
+        {
+          accessorKey: "commit_sha",
+          header: ({ column }) => (
+            <DataTableColumnHeader
+              className="text-xs"
+              column={column}
+              title="Current version"
+            />
+          ),
+          cell: ({ row }) => {
+            const commitSha =
+              row.getValue<OrgRegistryRepositoryRead["commit_sha"]>(
+                "commit_sha"
+              )
+            return (
+              <div className="text-xs">
+                {commitSha ? (
+                  <span className="font-mono">{commitSha.substring(0, 7)}</span>
+                ) : (
+                  <span className="text-muted-foreground">Not synced</span>
+                )}
+              </div>
+            )
+          },
+          enableSorting: false,
+          enableHiding: false,
+        },
+        {
+          accessorKey: "last_synced_at",
+          header: ({ column }) => (
+            <DataTableColumnHeader
+              className="text-xs"
+              column={column}
+              title="Last synced"
+            />
+          ),
+          cell: ({ row }) => {
+            const lastSynced =
+              row.getValue<OrgRegistryRepositoryRead["last_synced_at"]>(
+                "last_synced_at"
+              )
+            if (!lastSynced) {
+              return <div className="text-xs text-muted-foreground">Never</div>
+            }
+            const date = new Date(lastSynced)
+            const ago = getRelativeTime(date)
+            return (
+              <div className="text-xs text-muted-foreground">
+                <span>{date.toLocaleDateString()}</span>
+                <span className="ml-1">({ago})</span>
+              </div>
+            )
+          },
+          enableSorting: true,
+          enableHiding: false,
+        },
+        {
+          id: "versions",
+          header: () => <span className="text-xs">Versions</span>,
+          enableHiding: false,
+          cell: ({ row }) => {
+            const repo = row.original
+            return (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-1"
+                onClick={() => onShowVersions?.(repo)}
+              >
+                <HistoryIcon className="size-3" />
+                Versions
+              </Button>
+            )
+          },
+        },
+        {
+          id: "actions",
+          enableHiding: false,
+          cell: ({ row }) => {
+            const repo = row.original
+            const isSyncing = syncingId === repo.id && syncPending
+
+            return (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" className="size-8 p-0">
+                    <span className="sr-only">Open menu</span>
+                    {isSyncing ? (
+                      <ReloadIcon className="size-4 animate-spin" />
+                    ) : (
+                      <DotsHorizontalIcon className="size-4" />
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem
+                    onClick={() => navigator.clipboard.writeText(repo.id)}
+                  >
+                    Copy ID
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onClick={() => handleSync(repo.id, false)}
+                    disabled={isSyncing}
+                  >
+                    Sync repository
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => handleSync(repo.id, true)}
+                    disabled={isSyncing}
+                  >
+                    Force sync (delete existing)
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )
+          },
+        },
+      ]}
+      toolbarProps={{}}
+    />
+  )
+}

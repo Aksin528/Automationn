@@ -1,0 +1,76 @@
+name: Frontend Tests
+
+on:
+  pull_request:
+    paths:
+      - frontend/**
+      - .github/workflows/test-frontend.yml
+  push:
+    branches:
+      - main
+    paths:
+      - frontend/**
+      - .github/workflows/test-frontend.yml
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-quality-and-tests:
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Get pnpm store directory
+        working-directory: frontend
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-${{ runner.arch }}-pnpm-store-${{ hashFiles('frontend/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-pnpm-store-
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Biome linting and formatting
+        working-directory: frontend
+        run: pnpm check
+
+      - name: Run TypeScript type check
+        working-directory: frontend
+        run: pnpm run typecheck
+
+      - name: Run frontend tests
+        working-directory: frontend
+        run: pnpm test
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "✅ Frontend CI pipeline completed successfully!"
+          echo "📝 Steps completed:"
+          echo "  - Code linting and formatting (Biome)"
+          echo "  - TypeScript type checking"
+          echo "  - Jest test suite execution"
+          echo ""
+          echo "🎉 All frontend quality checks passed!"

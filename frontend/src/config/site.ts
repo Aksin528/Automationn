@@ -1,0 +1,25 @@
+import { env } from "@/env.mjs"
+import type { SiteConfig } from "@/types"
+
+export const siteConfig: SiteConfig = {
+  name: "Tracecat",
+  author: "Tracecat",
+  description:
+    "The open source AI automation platform for security teams and agents.",
+  keywords: ["Next.js", "React", "Tailwind CSS", "Radix UI", "shadcn/ui"],
+  url: {
+    base: env.NEXT_PUBLIC_APP_URL,
+    author: "Tracecat",
+  },
+  links: {
+    github: "https://github.com/TracecatHQ/tracecat",
+    discord: "https://discord.gg/n3GF4qxFU8",
+    docs: "https://docs.tracecat.com",
+    playbooks: "https://github.com/TracecatHQ/tracecat/tree/main/playbooks",
+  },
+  ogImage: `${env.NEXT_PUBLIC_APP_URL}/og.jpg`,
+}
+
+export const routeConfig = {
+  home: "/workspaces",
+}

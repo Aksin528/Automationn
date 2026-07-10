@@ -1,0 +1,37 @@
+type: action
+definition:
+  title: Answer
+  description: Answer a question with Exa search-grounded citations.
+  display_group: Exa
+  doc_url: https://exa.ai/docs/reference/answer
+  namespace: tools.exa
+  name: answer
+  secrets:
+    - name: exa
+      keys: ["EXA_API_KEY"]
+  expects:
+    query:
+      type: str
+      description: Natural-language question or instructions for the request.
+    text:
+      type: bool | None
+      description: Return full page text in citations when true.
+      default: null
+    outputSchema:
+      type: dict[str, Any] | None
+      description: JSON Schema Draft 7 object for structured answer output.
+      default: null
+  steps:
+    - ref: answer
+      action: core.http_request
+      args:
+        url: https://api.exa.ai/answer
+        method: POST
+        headers:
+          Content-Type: application/json
+          x-api-key: ${{ SECRETS.exa.EXA_API_KEY }}
+        payload:
+          query: ${{ inputs.query }}
+          text: ${{ inputs.text }}
+          outputSchema: ${{ inputs.outputSchema }}
+  returns: ${{ steps.answer.result.data }}

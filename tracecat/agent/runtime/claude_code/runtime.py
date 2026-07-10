@@ -1,0 +1,1518 @@
+"""Claude Agent Runtime for sandboxed execution.
+
+This module provides ClaudeAgentRuntime, a stateless runtime designed to run
+inside an NSJail sandbox without database access. All I/O happens via Unix sockets.
+
+Key design principles:
+- No database imports (no SQLAlchemy, no DB services)
+- No pydantic-ai imports
+- Minimal import footprint for fast cold start
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import tempfile
+import uuid
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+from typing import Any, Literal, Protocol, cast
+
+import orjson
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookMatcher,
+    SandboxSettings,
+    Transport,
+)
+from claude_agent_sdk.types import (
+    AgentDefinition,
+    HookContext,
+    HookInput,
+    McpHttpServerConfig,
+    McpServerConfig,
+    McpStdioServerConfig,
+    PreToolUseHookSpecificOutput,
+    ResultMessage,
+    StreamEvent,
+    SyncHookJSONOutput,
+    SystemMessage,
+    ToolResultBlock,
+    UserMessage,
+)
+
+from tracecat.agent.common.config import (
+    TRACECAT__AGENT_MCP_BRIDGE_PORT,
+    TRACECAT__DISABLE_NSJAIL,
+)
+from tracecat.agent.common.exceptions import AgentSandboxValidationError
+from tracecat.agent.common.output_format import build_sdk_output_format
+from tracecat.agent.common.protocol import RuntimeInitPayload
+from tracecat.agent.common.stream_types import (
+    StreamEventType,
+    ToolCallContent,
+    UnifiedStreamEvent,
+)
+from tracecat.agent.common.types import (
+    MCPServerConfig,
+    MCPStdioServerConfig,
+    MCPToolDefinition,
+)
+from tracecat.agent.llm_routing import get_litellm_route_model
+from tracecat.agent.mcp.metadata import (
+    PROXY_TOOL_CALL_ID_KEY,
+    PROXY_TOOL_METADATA_KEY,
+)
+from tracecat.agent.mcp.utils import (
+    action_name_to_mcp_tool_name,
+    normalize_mcp_tool_name,
+)
+from tracecat.agent.runtime.claude_code.adapter import ClaudeSDKAdapter
+from tracecat.agent.runtime.claude_code.session_lines import (
+    APPROVAL_CONTINUATION_PROMPT,
+    is_approval_continuation_prompt_line,
+    is_meta_session_line,
+    is_synthetic_session_line,
+)
+from tracecat.logger import logger
+
+CLAUDE_PROJECT_DIR_MAX_LENGTH = 200
+CLAUDE_PROJECT_DIR_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9]")
+LOG_PREVIEW_CHARS = 8000
+
+
+def _claude_project_dir_name(cwd: Path) -> str:
+    """Return the project directory name Claude uses for a runtime cwd.
+
+    This mirrors claude-agent-sdk's private ``_sanitize_path`` helper for short
+    paths. Long paths are rejected because Claude CLI and SDK hash suffixes can
+    diverge, which would make session persistence non-deterministic.
+    """
+    sanitized = CLAUDE_PROJECT_DIR_SANITIZE_RE.sub("-", str(cwd))
+    if len(sanitized) > CLAUDE_PROJECT_DIR_MAX_LENGTH:
+        raise AgentSandboxValidationError(
+            "Claude runtime cwd is too long for deterministic session persistence: "
+            f"sanitized path length {len(sanitized)} exceeds "
+            f"{CLAUDE_PROJECT_DIR_MAX_LENGTH}. Shorten TMPDIR or the runtime cwd."
+        )
+    return sanitized
+
+
+def _ensure_supported_claude_project_dir_name(cwd: Path) -> None:
+    """Ensure Claude can persist sessions under the runtime cwd."""
+    _claude_project_dir_name(cwd)
+
+
+def _preview_text(text: str, *, limit: int = LOG_PREVIEW_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated]"
+
+
+class RuntimeEventWriter(Protocol):
+    """Protocol for runtime event delivery."""
+
+    async def send_stream_event(self, event: UnifiedStreamEvent) -> None:
+        """Send a unified stream event."""
+
+    async def send_session_line(
+        self, sdk_session_id: str, line: str, *, internal: bool = False
+    ) -> None:
+        """Send a raw Claude session line."""
+
+    async def send_result(
+        self,
+        usage: dict[str, Any] | None = None,
+        num_turns: int | None = None,
+        duration_ms: int | None = None,
+        output: Any = None,
+    ) -> None:
+        """Send the final Claude result."""
+
+    async def send_error(self, error: str) -> None:
+        """Send a terminal runtime error."""
+
+    async def send_done(self) -> None:
+        """Signal that the runtime turn is complete."""
+
+    async def send_log(self, level: str, message: str, **extra: object) -> None:
+        """Send a structured runtime log event."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedResumeAndMCP:
+    resume_session_id: str | None
+    fork_session: bool
+    mcp_servers: dict[str, McpServerConfig]
+
+
+def _configure_claude_sdk_process_env() -> None:
+    """Prime process-level SDK env before ClaudeSDKClient.connect().
+
+    The SDK checks this flag from ``os.environ`` during connect, before it merges
+    ``ClaudeAgentOptions.env`` into the child process environment.
+    """
+    if "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK" not in os.environ:
+        os.environ["CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"] = "1"
+
+
+# Tools that are always disallowed regardless of sandbox mode
+# These are interactive/planning tools that don't make sense for automation
+CLAUDE_CODE_STATEFUL_TOOLS = [
+    # Scheduled prompts and worktree lifecycle are host/session stateful.
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "EnterWorktree",
+    "ExitWorktree",
+]
+
+DISALLOWED_TOOLS = [
+    *CLAUDE_CODE_STATEFUL_TOOLS,
+    # Notebook tools
+    "NotebookRead",
+    "NotebookEdit",
+    # Planning/interaction tools - agent is non-interactive
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "AskUserQuestion",
+    "TodoRead",
+    "TodoWrite",
+    "Agent",
+    "Task",
+    "TaskOutput",
+    "SlashCommand",
+]
+
+AGENT_TOOL_NAMES = frozenset({"Agent", "Task"})
+CHILD_AGENT_DISALLOWED_TOOLS = [
+    "Agent",
+    "Task",
+    "TaskOutput",
+    *CLAUDE_CODE_STATEFUL_TOOLS,
+]
+
+# Tools that require internet access (these bypass sandbox network isolation
+# because they're executed server-side by Anthropic, not in the sandbox)
+INTERNET_TOOLS = [
+    "WebSearch",
+    "WebFetch",
+]
+
+COMMAND_LINE_TOOLS_PROMPT = (
+    "<CommandLineTools>\n"
+    "- `duckdb`: The runtime shell includes the DuckDB CLI. Use it for local "
+    "SQL and tabular data inspection over files such as CSV, JSON, Parquet, "
+    "and DuckDB database files. The CLI is configured with the `json`, "
+    "`httpfs`, `inet`, and `fts` extensions for JSON, HTTP/S3, IP address, "
+    "and full-text search workflows. This is a local "
+    "command-line capability, not a Tracecat action or MCP tool.\n"
+    "</CommandLineTools>"
+)
+
+# Registry MCP server naming.
+# We canonicalize persisted session history to the hyphen form at the
+# resume boundary so runtime configuration only exposes one logical server.
+REGISTRY_MCP_SERVER_NAME = "tracecat-registry"
+REGISTRY_MCP_TOOL_PREFIX = f"mcp__{REGISTRY_MCP_SERVER_NAME}__"
+REGISTRY_MCP_DOT_PREFIX = f"mcp.{REGISTRY_MCP_SERVER_NAME}."
+LEGACY_REGISTRY_MCP_TOOL_PREFIX = "mcp__tracecat_registry__"
+LEGACY_REGISTRY_MCP_DOT_PREFIX = "mcp.tracecat_registry."
+SUBAGENT_REGISTRY_MCP_SERVER_PREFIX = "tracecat-registry-"
+TRUSTED_MCP_BRIDGE_URL = f"http://127.0.0.1:{TRACECAT__AGENT_MCP_BRIDGE_PORT}/mcp"
+
+# Increase the SDK's stdout/stderr capture buffer above its default 1 MiB so
+# larger tool responses do not truncate during agent execution.
+CLAUDE_SDK_MAX_BUFFER_SIZE_BYTES = 5 * 1024 * 1024
+CUSTOM_MODEL_PROVIDER_AUTO_COMPACT_WINDOW = "128000"
+
+# Cap on how many times the CLI may re-invoke the model to satisfy a Stop hook
+# (e.g. structured-output schema validation). Without a cap the CLI can death-loop
+# when the model keeps emitting output that fails validation.
+MAX_STOP_HOOK_RETRIES = 3
+
+
+class ClaudeAgentRuntime:
+    """Stateless, sandboxed Claude SDK runtime.
+
+    This runtime is designed to run inside an NSJail sandbox without database access.
+    All I/O happens via Unix sockets:
+    - Control socket: Receives init payload, streams events back to orchestrator
+    - MCP socket: Tool execution via trusted MCP server
+
+    The orchestrator (outside the sandbox) handles:
+    - Session persistence (SDK session files)
+    - Message persistence (chat history)
+    - Approval flow coordination
+    """
+
+    def __init__(
+        self,
+        event_writer: RuntimeEventWriter,
+        *,
+        transport_factory: Callable[[ClaudeAgentOptions], Transport],
+        session_home_dir: Path | None = None,
+        cwd: Path | None = None,
+        cwd_setup_path: Path | None = None,
+        system_prompt_fragments: Sequence[str] = (),
+    ):
+        self._event_writer = event_writer
+        self._session_id: uuid.UUID | None = None
+        # Public for testing - these represent runtime configuration
+        self.registry_tools: dict[str, MCPToolDefinition] | None = None
+        self.tool_approvals: dict[str, bool] | None = None
+        self._runtime_internet_access_enabled: bool = False
+        self._explicit_subagent_aliases: set[str] = set()
+        self._registry_mcp_server_names: set[str] = {REGISTRY_MCP_SERVER_NAME}
+        self._agents_enabled: bool = False
+        self._pending_approval_tool_ids: set[str] = set()
+        self.client: ClaudeSDKClient | None = None
+        self._was_interrupted: bool = False
+        # For incremental JSONL line tracking
+        self._sdk_session_id: str | None = None
+        self._last_seen_byte_offset: int = 0
+        self._session_flush_lock = asyncio.Lock()
+        self._session_flush_event = asyncio.Event()
+        # Adapter for converting Claude SDK events - must be reused to track state
+        self._stream_adapter = ClaudeSDKAdapter()
+        # Working directory for session file path resolution
+        # Must match the cwd passed to ClaudeAgentOptions for session resume
+        self._cwd: Path | None = cwd
+        self._cwd_setup_path = cwd_setup_path
+        self._session_home_dir = session_home_dir
+        self._transport_factory = transport_factory
+        self._system_prompt_fragments = tuple(system_prompt_fragments)
+        # Tracks Stop hook retries within this run to break structured-output loops
+        self._stop_hook_retries: int = 0
+
+    @staticmethod
+    def _is_manual_compaction_prompt(prompt: str) -> bool:
+        """Return True when the current prompt triggers manual compaction."""
+        stripped = prompt.strip()
+        return stripped == "/compact" or stripped.startswith("/compact ")
+
+    @staticmethod
+    def _build_compaction_status_event(
+        *,
+        phase: Literal["started", "completed"],
+        pre_tokens: int | None = None,
+    ) -> UnifiedStreamEvent:
+        """Create a transient stream event for compaction UI feedback."""
+        metadata: dict[str, Any] = {}
+        if pre_tokens is not None:
+            metadata["pre_tokens"] = pre_tokens
+        return UnifiedStreamEvent.compaction_event(
+            phase=phase,
+            metadata=metadata or None,
+        )
+
+    def _should_inject_tool_metadata(self, tool_name: str, action_name: str) -> bool:
+        """Return True when a tool executes through the registry proxy path."""
+        for server_name in self._registry_mcp_server_names:
+            if tool_name.startswith((f"mcp__{server_name}__", f"mcp.{server_name}.")):
+                return not action_name.startswith(("mcp.", "internal."))
+        return tool_name.startswith(
+            (LEGACY_REGISTRY_MCP_TOOL_PREFIX, LEGACY_REGISTRY_MCP_DOT_PREFIX)
+        ) and not action_name.startswith(("mcp.", "internal."))
+
+    @staticmethod
+    def _subagent_registry_server_name(alias: str) -> str:
+        return f"{SUBAGENT_REGISTRY_MCP_SERVER_PREFIX}{alias}"
+
+    @staticmethod
+    def _trusted_mcp_server_config(auth_token: str) -> McpHttpServerConfig:
+        return {
+            "type": "http",
+            "url": TRUSTED_MCP_BRIDGE_URL,
+            "headers": {
+                "Authorization": f"Bearer {auth_token}",
+                "Accept-Encoding": "identity",
+            },
+        }
+
+    @staticmethod
+    def _mcp_tool_name_for_action(server_name: str, action_name: str) -> str:
+        if action_name.startswith("mcp__"):
+            concrete_name = action_name
+        else:
+            concrete_name = action_name_to_mcp_tool_name(action_name)
+        return f"mcp__{server_name}__{concrete_name}"
+
+    @staticmethod
+    def _mcp_tool_wildcard_for_server(server_name: str) -> str:
+        return f"mcp__{server_name}__*"
+
+    @classmethod
+    def _mcp_tool_names_for_actions(
+        cls,
+        server_name: str,
+        actions: dict[str, MCPToolDefinition] | None,
+    ) -> list[str]:
+        if not actions:
+            return []
+        return sorted(
+            cls._mcp_tool_name_for_action(server_name, action_name)
+            for action_name in actions
+        )
+
+    @classmethod
+    def _allowed_tools_for_mcp_scope(
+        cls,
+        *,
+        registry_server_name: str,
+        actions: dict[str, MCPToolDefinition] | None,
+        stdio_server_names: list[str],
+    ) -> list[str]:
+        return sorted(
+            {
+                *cls._mcp_tool_names_for_actions(registry_server_name, actions),
+                *(
+                    cls._mcp_tool_wildcard_for_server(server_name)
+                    for server_name in stdio_server_names
+                ),
+            }
+        )
+
+    @classmethod
+    def _stdio_mcp_servers(
+        cls,
+        *,
+        source_configs: list[MCPServerConfig] | None,
+        name_prefix: str | None = None,
+        existing_names: set[str] | None = None,
+    ) -> dict[str, McpStdioServerConfig]:
+        servers: dict[str, McpStdioServerConfig] = {}
+        used_names = set(existing_names or ())
+        if not source_configs:
+            return servers
+
+        for config in source_configs:
+            if config.get("type", "http") != "stdio":
+                continue
+            stdio_config = cast(MCPStdioServerConfig, config)
+            base_name = stdio_config["name"]
+            if name_prefix:
+                base_name = f"{name_prefix}-{base_name}"
+
+            server_name = base_name
+            suffix = 2
+            while server_name in used_names:
+                server_name = f"{base_name}-{suffix}"
+                suffix += 1
+
+            used_names.add(server_name)
+            server_config: dict[str, Any] = {
+                "type": "stdio",
+                "command": stdio_config["command"],
+            }
+            if args := stdio_config.get("args"):
+                server_config["args"] = args
+            if env := stdio_config.get("env"):
+                server_config["env"] = env
+            if (timeout := stdio_config.get("timeout")) is not None:
+                server_config["timeout"] = timeout
+            servers[server_name] = cast(McpStdioServerConfig, server_config)
+
+        return servers
+
+    @staticmethod
+    def _is_subagent_scope(input_data: HookInput) -> bool:
+        return bool(input_data.get("agent_id"))
+
+    def _hook_agent_type(self, input_data: HookInput) -> str | None:
+        if self._is_subagent_scope(input_data):
+            agent_type = input_data.get("agent_type")
+            if isinstance(agent_type, str) and agent_type:
+                return agent_type
+        return None
+
+    def _explicit_subagent_alias_for_tool(
+        self,
+        input_data: HookInput,
+        tool_name: str,
+    ) -> str | None:
+        agent_type = self._hook_agent_type(input_data)
+        if agent_type in self._explicit_subagent_aliases:
+            return agent_type
+
+        for alias in self._explicit_subagent_aliases:
+            server_name = self._subagent_registry_server_name(alias)
+            if tool_name.startswith((f"mcp__{server_name}__", f"mcp.{server_name}.")):
+                return alias
+        return None
+
+    @staticmethod
+    def _agent_tool_target(tool_input: dict[str, Any]) -> str | None:
+        for key in ("subagent_type", "agent_type", "type", "name"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _validate_agent_tool_call(
+        self,
+        input_data: HookInput,
+        tool_name: str,
+        tool_input: dict[str, Any],
+    ) -> str | None:
+        """Return denial reason for invalid Agent/Task tool use, else None."""
+        if tool_name not in AGENT_TOOL_NAMES:
+            return None
+        if not self._agents_enabled:
+            return "Subagents are disabled for this agent configuration."
+        if self._is_subagent_scope(input_data):
+            return "Subagents cannot invoke other subagents."
+
+        target = self._agent_tool_target(tool_input)
+        if (
+            target
+            and target != "general-purpose"
+            and target not in self._explicit_subagent_aliases
+        ):
+            allowed = ["general-purpose", *sorted(self._explicit_subagent_aliases)]
+            return (
+                f"Subagent '{target}' is not available. "
+                f"Allowed subagents: {', '.join(allowed)}."
+            )
+        return None
+
+    @staticmethod
+    def _with_tool_call_metadata(
+        tool_input: dict[str, Any],
+        tool_use_id: str,
+    ) -> dict[str, Any]:
+        """Attach Tracecat-internal tool metadata to proxy tool input."""
+        return {
+            **tool_input,
+            PROXY_TOOL_METADATA_KEY: {
+                PROXY_TOOL_CALL_ID_KEY: tool_use_id,
+            },
+        }
+
+    def _get_session_file_path(self, sdk_session_id: str) -> Path:
+        """Derive the session file path from SDK session ID.
+
+        The Claude SDK stores sessions at:
+        ~/.claude/projects/{encoded-cwd}/{session_id}.jsonl
+
+        Raises:
+            AgentSandboxValidationError: If sdk_session_id contains path traversal.
+        """
+        # Validate session ID to prevent path traversal
+        # Only allow alphanumeric, hyphens, and underscores
+        if not sdk_session_id or not all(
+            c.isalnum() or c in "-_" for c in sdk_session_id
+        ):
+            raise AgentSandboxValidationError(
+                f"Invalid sdk_session_id: must be alphanumeric with hyphens/underscores only, got {sdk_session_id!r}"
+            )
+
+        if self._cwd is None:
+            raise RuntimeError("Runtime working directory is not configured")
+        encoded_cwd = _claude_project_dir_name(self._cwd)
+        claude_home_dir = self._session_home_dir or Path.home()
+        claude_dir = claude_home_dir / ".claude" / "projects" / encoded_cwd
+        return claude_dir / f"{sdk_session_id}.jsonl"
+
+    async def _write_session_file(
+        self,
+        sdk_session_id: str,
+        sdk_session_data: str,
+    ) -> Path:
+        """Write session data to local filesystem for SDK resume."""
+        session_file_path = self._get_session_file_path(sdk_session_id)
+        sdk_session_data = self._session_data_for_disk(sdk_session_data)
+
+        def _write() -> None:
+            session_file_path.parent.mkdir(parents=True, exist_ok=True)
+            session_file_path.write_text(sdk_session_data, encoding="utf-8")
+
+        await asyncio.to_thread(_write)
+        logger.debug("Wrote session file", path=str(session_file_path))
+        return session_file_path
+
+    async def _prepare_resume_and_mcp(
+        self,
+        payload: RuntimeInitPayload,
+        *,
+        write_session_file: bool = True,
+    ) -> _PreparedResumeAndMCP:
+        """Prepare resume state and root registry MCP server config."""
+        resume_session_id: str | None = None
+        fork_session = False
+        mcp_servers: dict[str, McpServerConfig] = {}
+        session_file_task: asyncio.Task[Path] | None = None
+
+        if payload.sdk_session_id and payload.sdk_session_data:
+            resume_session_id = payload.sdk_session_id
+            fork_session = payload.is_fork
+            if not fork_session:
+                session_data = self._session_data_for_disk(payload.sdk_session_data)
+                self._last_seen_byte_offset = len(session_data.encode("utf-8"))
+                self._sdk_session_id = resume_session_id
+
+        async with asyncio.TaskGroup() as tg:
+            if (
+                write_session_file
+                and payload.sdk_session_id
+                and payload.sdk_session_data
+            ):
+                session_file_task = tg.create_task(
+                    self._write_session_file(
+                        payload.sdk_session_id, payload.sdk_session_data
+                    )
+                )
+
+        if session_file_task is not None:
+            _ = session_file_task.result()
+
+        if self.registry_tools:
+            mcp_servers[REGISTRY_MCP_SERVER_NAME] = self._trusted_mcp_server_config(
+                payload.mcp_auth_token
+            )
+
+        return _PreparedResumeAndMCP(
+            resume_session_id=resume_session_id,
+            fork_session=fork_session,
+            mcp_servers=mcp_servers,
+        )
+
+    def _canonicalize_sdk_session_data(self, sdk_session_data: str) -> str:
+        """Canonicalize legacy registry MCP aliases in JSONL session history."""
+        return sdk_session_data.replace(
+            LEGACY_REGISTRY_MCP_TOOL_PREFIX, REGISTRY_MCP_TOOL_PREFIX
+        ).replace(LEGACY_REGISTRY_MCP_DOT_PREFIX, REGISTRY_MCP_DOT_PREFIX)
+
+    def _session_data_for_disk(self, sdk_session_data: str) -> str:
+        """Return canonical SDK JSONL exactly as written to the local session file."""
+        sdk_session_data = self._canonicalize_sdk_session_data(sdk_session_data)
+        # Ensure JSONL readers do not treat the final record as truncated.
+        if sdk_session_data and not sdk_session_data.endswith("\n"):
+            return f"{sdk_session_data}\n"
+        return sdk_session_data
+
+    @staticmethod
+    def _is_internal_compaction_prompt(text: str) -> bool:
+        """Return True for structured Claude SDK compaction artifacts."""
+        compact_markers = (
+            "<local-command-caveat>",
+            "<command-name>/compact</command-name>",
+            "<local-command-stdout>Compacted ",
+        )
+        return any(marker in text for marker in compact_markers)
+
+    @staticmethod
+    async def _meta_text_input_stream(text: str) -> AsyncIterator[dict[str, Any]]:
+        """Yield a hidden Claude SDK stream-json user message."""
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": text},
+            "parent_tool_use_id": None,
+            "session_id": "default",
+            "isMeta": True,
+        }
+
+    def _is_internal_session_line(self, line_data: dict[str, Any]) -> bool:
+        """Determine if a session line is internal (not shown in UI timeline).
+
+        Internal lines include:
+        - queue-operation, compaction, summary, system messages
+        - compaction continuation prompts/summarizer sidechain messages
+        - Interrupt signals (tool_result with "doesn't want to take this action")
+        - Interrupt markers ("[Request interrupted by user")
+        - Synthetic messages (model="<synthetic>")
+        - Raw tool result/error text injections from approval flow
+        - SDK compaction summary and metadata messages (isCompactSummary, isMeta)
+
+        Visible lines are:
+        - User messages (actual user input)
+        - Assistant messages (model responses with text/thinking/tool_use)
+
+        Args:
+            line_data: Parsed JSONL line content.
+
+        Returns:
+            True if this line should be marked as internal.
+        """
+        # SDK compaction artifacts marked with structural flags
+        # isCompactSummary messages are persisted as kind='compaction' for badge rendering
+        # isMeta messages (like caveats) are internal
+        if is_meta_session_line(line_data) or line_data.get("isCompactSummary"):
+            return True
+
+        msg_type = line_data.get("type", "")
+
+        # Only user and assistant messages can be visible
+        if msg_type not in ("user", "assistant"):
+            return True
+
+        agent_id = line_data.get("agentId")
+        if isinstance(agent_id, str) and agent_id.startswith("acompact-"):
+            return True
+
+        message = line_data.get("message", {})
+
+        # Synthetic messages are internal (placeholders during approval flow)
+        if is_synthetic_session_line(line_data):
+            return True
+
+        # "(no content)" placeholder assistant message from the SDK's
+        # structured output stop hook flow.
+        if msg_type == "assistant":
+            msg_content_check = message.get("content", [])
+            if isinstance(msg_content_check, list) and len(msg_content_check) == 1:
+                only_part = msg_content_check[0]
+                if (
+                    isinstance(only_part, dict)
+                    and only_part.get("type") == "text"
+                    and only_part.get("text") == "(no content)"
+                ):
+                    return True
+
+        # Check message content for internal patterns
+        msg_content = message.get("content", [])
+
+        # String content - check for raw tool result/error injection
+        if isinstance(msg_content, str):
+            if msg_content.startswith("Tool '") and (
+                "Result:" in msg_content or "Error:" in msg_content
+            ):
+                return True
+            if self._is_internal_compaction_prompt(msg_content):
+                return True
+            # Stop hook feedback injected by Claude SDK for structured output
+            if "Stop hook feedback:" in msg_content:
+                return True
+
+        # List content - check for interrupt patterns
+        if isinstance(msg_content, list):
+            for part in msg_content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    # Interrupt tool_result with error
+                    if (
+                        part_type == "tool_result"
+                        and part.get("is_error")
+                        and "doesn't want to take this action"
+                        in str(part.get("content", ""))
+                    ):
+                        return True
+                    # Interrupt text marker or stop hook feedback
+                    if part_type == "text":
+                        text = part.get("text", "")
+                        if "[Request interrupted by user" in text:
+                            return True
+                        if self._is_internal_compaction_prompt(text):
+                            return True
+                        if "Stop hook feedback:" in text:
+                            return True
+
+        return False
+
+    async def _capture_sdk_session_id(
+        self,
+        sdk_session_id: str | None,
+        *,
+        resume_session_id: str | None,
+        fork_session: bool,
+    ) -> None:
+        """Capture the SDK session ID from any SDK message that carries it."""
+        if not sdk_session_id:
+            return
+        if self._sdk_session_id == sdk_session_id:
+            return
+
+        previous = self._sdk_session_id
+        self._sdk_session_id = sdk_session_id
+
+        if previous is None and resume_session_id and fork_session:
+            session_file = self._get_session_file_path(sdk_session_id)
+            try:
+                stat = session_file.stat()
+            except FileNotFoundError:
+                pass
+            else:
+                self._last_seen_byte_offset = stat.st_size
+
+        logger.debug(
+            "Captured SDK session ID",
+            sdk_session_id=self._sdk_session_id,
+            previous_sdk_session_id=previous,
+        )
+
+    async def _flush_session_lines_when_signaled(
+        self,
+        *,
+        is_approval_continuation: bool,
+    ) -> None:
+        """Flush SDK JSONL lines when stream progress marks the session dirty."""
+        while True:
+            await self._session_flush_event.wait()
+            self._session_flush_event.clear()
+            try:
+                await self._emit_new_session_lines(
+                    is_approval_continuation=is_approval_continuation
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Failed to flush session lines", error=str(e))
+
+    async def _emit_new_session_lines(
+        self,
+        *,
+        is_approval_continuation: bool = False,
+    ) -> None:
+        """Read and emit new JSONL lines from the SDK session file.
+
+        This tails the session file written by Claude SDK and emits complete new
+        lines from the last byte offset to the orchestrator for persistence.
+        The lines contain the full JSONL envelope (uuid, timestamp, parentUuid, etc.)
+        needed for proper resume.
+
+        If a line is incomplete or fails to parse, we stop processing at that byte
+        offset. The incomplete line will be retried on the next call once the SDK
+        finishes writing it.
+
+        Race condition handling: If called before _sdk_session_id is set (i.e., before
+        the first StreamEvent), this is a no-op. The loopback handler uses UUID-based
+        deduplication to handle any duplicates that might occur from out-of-order events.
+        """
+        async with self._session_flush_lock:
+            if not self._sdk_session_id:
+                return
+
+            sdk_session_id = self._sdk_session_id
+            session_file = self._get_session_file_path(sdk_session_id)
+            start_offset = self._last_seen_byte_offset
+
+            def _read_tail() -> bytes | None:
+                try:
+                    with session_file.open("rb") as file:
+                        file.seek(start_offset)
+                        return file.read()
+                except FileNotFoundError:
+                    return None
+
+            tail = await asyncio.to_thread(_read_tail)
+            if not tail:
+                return
+
+            line_offset = start_offset
+            for raw_line in tail.splitlines(keepends=True):
+                if not raw_line.endswith(b"\n"):
+                    break
+
+                next_offset = line_offset + len(raw_line)
+                line_bytes = raw_line.rstrip(b"\r\n")
+                if not line_bytes.strip():
+                    self._last_seen_byte_offset = next_offset
+                    line_offset = next_offset
+                    continue
+
+                # Parse to determine visibility, but send raw line for SDK resume
+                try:
+                    line = line_bytes.decode("utf-8")
+                    line_data = orjson.loads(line)
+                except (UnicodeDecodeError, orjson.JSONDecodeError):
+                    # Stop at the first decode failure - this line may be incomplete
+                    # because the SDK is still writing it. We'll retry on the next pass.
+                    logger.debug(
+                        "Stopping at incomplete session line, will retry",
+                        byte_offset=line_offset,
+                    )
+                    break
+
+                internal = self._is_internal_session_line(line_data) or (
+                    is_approval_continuation
+                    and is_approval_continuation_prompt_line(line_data)
+                )
+
+                await self._event_writer.send_session_line(
+                    sdk_session_id, line, internal=internal
+                )
+
+                # Only advance the offset after successfully processing the line.
+                self._last_seen_byte_offset = next_offset
+                line_offset = next_offset
+
+    async def _handle_approval_request(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        tool_use_id: str,
+    ) -> None:
+        """Handle an approval request by streaming and interrupting.
+
+        Streams APPROVAL_REQUEST event via socket and interrupts the client.
+        The orchestrator handles persistence and coordination.
+        """
+        self._pending_approval_tool_ids.add(tool_use_id)
+
+        approval_event = UnifiedStreamEvent.approval_request_event(
+            [
+                ToolCallContent(
+                    id=tool_use_id,
+                    name=tool_name,
+                    input=tool_input,
+                )
+            ]
+        )
+        await self._event_writer.send_stream_event(approval_event)
+
+        logger.info("Approval request streamed, interrupting", tool_name=tool_name)
+
+        if self.client is not None:
+            self._was_interrupted = True
+            await self.client.interrupt()
+
+    async def _pre_tool_use_hook(
+        self,
+        input_data: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,  # noqa: ARG002
+    ) -> SyncHookJSONOutput:
+        """PreToolUse hook invoked by Claude SDK before each tool use.
+
+        The proxy MCP server only exposes pre-filtered allowed actions.
+        Tools are either:
+        - Auto-approved (tool_approvals[action] is False or not set)
+        - Require approval (tool_approvals[action] is True) -> trigger approval request
+
+        User MCP servers are auto-approved.
+        """
+
+        tool_name: str = input_data.get("tool_name", "")
+        tool_input: dict[str, Any] = input_data.get("tool_input", {})
+
+        action_name = normalize_mcp_tool_name(tool_name)
+        if denial_reason := self._validate_agent_tool_call(
+            input_data,
+            tool_name,
+            tool_input,
+        ):
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": denial_reason,
+                }
+            }
+
+        if tool_name in INTERNET_TOOLS and not self._runtime_internet_access_enabled:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Tool '{tool_name}' is disabled because internet access is "
+                        "disabled for the root agent."
+                    ),
+                }
+            }
+
+        # Preset-backed subagents cannot require manual approvals in v1.
+        # Dynamic/general-purpose subagents still inherit root approvals.
+        requires_approval = (
+            self._explicit_subagent_alias_for_tool(input_data, tool_name) is None
+            and self.tool_approvals is not None
+            and self.tool_approvals.get(action_name) is True
+        )
+
+        if requires_approval:
+            # Requires approval - stream request and interrupt
+            if not tool_use_id:
+                raise ValueError("Missing tool use ID")
+
+            await self._handle_approval_request(
+                action_name,
+                tool_input,
+                tool_use_id,
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"Tool '{action_name}' requires approval. Request sent for review.",
+                }
+            }
+
+        hook_output: PreToolUseHookSpecificOutput = {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+        }
+        if self._should_inject_tool_metadata(tool_name, action_name):
+            if tool_use_id:
+                hook_output["updatedInput"] = self._with_tool_call_metadata(
+                    tool_input,
+                    tool_use_id,
+                )
+            else:
+                logger.warning(
+                    "Missing tool use ID for registry tool execution",
+                    action_name=action_name,
+                )
+
+        return {
+            "hookSpecificOutput": hook_output,
+        }
+
+    async def _stop_hook(
+        self,
+        input_data: HookInput,
+        tool_use_id: str | None,
+        context: HookContext,
+    ) -> SyncHookJSONOutput:
+        """Stop hook: cap structured-output retry loops.
+
+        The CLI runs this on every natural stop. When ``stop_hook_active`` is True
+        the CLI is already inside a retry loop (e.g. structured-output schema
+        validation failed and it wants the model to try again). We let the first
+        ``MAX_STOP_HOOK_RETRIES`` retries through, then terminate the turn so a
+        broken schema or stuck model can't death-loop.
+        """
+        if input_data["hook_event_name"] != "Stop":
+            raise ValueError(
+                f"Expected Stop hook event, got {input_data['hook_event_name']!r}"
+            )
+        if not input_data.get("stop_hook_active"):
+            return {}
+
+        self._stop_hook_retries += 1
+        if self._stop_hook_retries <= MAX_STOP_HOOK_RETRIES:
+            return {}
+
+        reason = (
+            f"Stop hook retry cap reached ({MAX_STOP_HOOK_RETRIES}); ending turn "
+            "to prevent a structured-output death loop."
+        )
+        await self._event_writer.send_log(
+            "warning",
+            "Stop hook retry cap reached, terminating turn",
+            retries=self._stop_hook_retries,
+            cap=MAX_STOP_HOOK_RETRIES,
+        )
+        return {"continue_": False, "stopReason": reason}
+
+    def _build_system_prompt(
+        self, instructions: str | None, output_type: str | dict[str, Any] | None = None
+    ) -> str:
+        """Build the system prompt for the agent."""
+        base = (
+            "If asked about your identity, you are a Tracecat automation assistant."
+            f"\n\n{COMMAND_LINE_TOOLS_PROMPT}"
+        )
+
+        # Only include structured output instruction if output_type is configured (not None)
+        if output_type is not None:
+            base += (
+                "\n\nYou MUST produce structured output as the very last thing in EVERY turn"
+                " — including follow-up turns. Do not add any commentary, explanation, or text"
+                " after the structured output. This applies to every response, not just the first one."
+            )
+
+        prompt_parts = [base]
+        if instructions:
+            prompt_parts.append(instructions)
+        prompt_parts.extend(self._system_prompt_fragments)
+        return "\n\n".join(prompt_parts)
+
+    def _build_agent_definitions(
+        self,
+        *,
+        payload: RuntimeInitPayload,
+    ) -> dict[str, AgentDefinition] | None:
+        if not payload.subagents:
+            return None
+
+        definitions: dict[str, AgentDefinition] = {}
+        for subagent in payload.subagents:
+            registry_server_name = self._subagent_registry_server_name(subagent.alias)
+            mcp_server_configs: list[str | dict[str, Any]] = []
+            if subagent.allowed_actions:
+                mcp_server_configs.append(
+                    {
+                        registry_server_name: self._trusted_mcp_server_config(
+                            subagent.mcp_auth_token
+                        )
+                    }
+                )
+            stdio_mcp_servers = self._stdio_mcp_servers(
+                source_configs=subagent.config.mcp_servers,
+                name_prefix=f"subagent-{subagent.alias}",
+                existing_names={registry_server_name},
+            )
+            mcp_server_configs.extend(
+                {server_name: server_config}
+                for server_name, server_config in stdio_mcp_servers.items()
+            )
+
+            disallowed_tools = list(CHILD_AGENT_DISALLOWED_TOOLS)
+            if not payload.config.enable_internet_access:
+                disallowed_tools.extend(INTERNET_TOOLS)
+
+            allowed_tools = self._allowed_tools_for_mcp_scope(
+                registry_server_name=registry_server_name,
+                actions=subagent.allowed_actions,
+                stdio_server_names=list(stdio_mcp_servers),
+            )
+            definitions[subagent.alias] = AgentDefinition(
+                description=subagent.description,
+                prompt=subagent.prompt,
+                model=(
+                    subagent.model_route
+                    or get_litellm_route_model(
+                        model_provider=subagent.config.model_provider,
+                        model_name=subagent.config.model_name,
+                        passthrough=subagent.config.passthrough,
+                    )
+                ),
+                tools=allowed_tools,
+                mcpServers=mcp_server_configs or None,
+                disallowedTools=disallowed_tools,
+                maxTurns=subagent.max_turns,
+            )
+
+        return definitions
+
+    def _configure_runtime_state(self, payload: RuntimeInitPayload) -> None:
+        """Cache per-turn policy needed by SDK hooks."""
+        self._session_id = payload.session_id
+        self._sdk_session_id = None
+        self._last_seen_byte_offset = 0
+        self._session_flush_event.clear()
+        self.registry_tools = payload.allowed_actions
+        self.tool_approvals = payload.config.tool_approvals
+        self._agents_enabled = payload.config.agents.enabled
+        self._explicit_subagent_aliases = {
+            subagent.alias for subagent in payload.subagents
+        }
+        self._registry_mcp_server_names = {
+            REGISTRY_MCP_SERVER_NAME,
+            *(
+                self._subagent_registry_server_name(subagent.alias)
+                for subagent in payload.subagents
+                if subagent.allowed_actions
+            ),
+        }
+        self._runtime_internet_access_enabled = payload.config.enable_internet_access
+
+    def _ensure_working_directory(self, session_id: uuid.UUID) -> None:
+        """Create the stable Claude cwd used for session resume."""
+        if self._cwd is None:
+            self._cwd = Path(tempfile.gettempdir()) / f"tracecat-agent-{session_id}"
+        _ensure_supported_claude_project_dir_name(self._cwd)
+        cwd_setup_path = self._cwd_setup_path or self._cwd
+        cwd_setup_path.mkdir(parents=True, exist_ok=True)
+
+    def _root_disallowed_tools(self) -> list[str]:
+        """Return root Claude tools blocked for this turn."""
+        disallowed_tools = [
+            tool
+            for tool in DISALLOWED_TOOLS
+            if not (self._agents_enabled and tool in AGENT_TOOL_NAMES)
+        ]
+        # Internet access is a runtime-wide sandbox/network capability for the
+        # turn, so the root setting also governs explicit subagents.
+        if not self._runtime_internet_access_enabled:
+            disallowed_tools.extend(INTERNET_TOOLS)
+        return disallowed_tools
+
+    def _root_allowed_tools(
+        self,
+        *,
+        actions: dict[str, MCPToolDefinition] | None,
+        stdio_server_names: list[str],
+    ) -> list[str]:
+        """Return root Claude tools explicitly allowed for this turn."""
+        allowed_tools = self._allowed_tools_for_mcp_scope(
+            registry_server_name=REGISTRY_MCP_SERVER_NAME,
+            actions=actions,
+            stdio_server_names=stdio_server_names,
+        )
+        if self._agents_enabled:
+            allowed_tools.extend(sorted(AGENT_TOOL_NAMES))
+        return allowed_tools
+
+    @staticmethod
+    def _sandbox_settings() -> SandboxSettings:
+        """Build Claude SDK sandbox settings for direct mode."""
+        sandbox_settings = SandboxSettings(enabled=TRACECAT__DISABLE_NSJAIL)
+        if TRACECAT__DISABLE_NSJAIL:
+            sandbox_settings["enableWeakerNestedSandbox"] = True
+            sandbox_settings["allowUnsandboxedCommands"] = False
+        return sandbox_settings
+
+    @staticmethod
+    def _sdk_env(payload: RuntimeInitPayload) -> dict[str, str]:
+        """Return child-process environment overrides for the Claude SDK."""
+        env = {"ANTHROPIC_AUTH_TOKEN": payload.llm_gateway_auth_token}
+        if payload.config.model_provider == "custom-model-provider":
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = (
+                CUSTOM_MODEL_PROVIDER_AUTO_COMPACT_WINDOW
+            )
+        if payload.config.passthrough or any(
+            subagent.config.passthrough for subagent in payload.subagents
+        ):
+            env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+        return env
+
+    def _build_options(
+        self,
+        *,
+        payload: RuntimeInitPayload,
+        resume_session_id: str | None,
+        fork_session: bool,
+        mcp_servers: dict[str, McpServerConfig],
+        stdio_mcp_servers: dict[str, McpStdioServerConfig],
+        agent_definitions: dict[str, AgentDefinition] | None,
+        stderr: Callable[[str], None],
+    ) -> ClaudeAgentOptions:
+        """Build Claude SDK options from runtime policy and payload config."""
+        system_prompt = self._build_system_prompt(
+            payload.config.instructions,
+            payload.config.output_type,
+        )
+        logger.info(
+            "Claude runtime system prompt prepared",
+            session_id=str(payload.session_id),
+            system_prompt_length=len(system_prompt),
+            system_prompt_fragment_count=len(self._system_prompt_fragments),
+        )
+        return ClaudeAgentOptions(
+            include_partial_messages=True,
+            resume=resume_session_id,
+            fork_session=fork_session,
+            thinking=(
+                {"type": "enabled", "budget_tokens": 1024}
+                if payload.config.enable_thinking
+                else {"type": "disabled"}
+            ),
+            setting_sources=["user"],
+            env=self._sdk_env(payload),
+            model=get_litellm_route_model(
+                model_provider=payload.config.model_provider,
+                model_name=payload.config.model_name,
+                passthrough=payload.config.passthrough,
+            ),
+            system_prompt=system_prompt,
+            mcp_servers=mcp_servers,
+            allowed_tools=self._root_allowed_tools(
+                actions=payload.allowed_actions,
+                stdio_server_names=list(stdio_mcp_servers),
+            ),
+            disallowed_tools=self._root_disallowed_tools(),
+            agents=agent_definitions,
+            stderr=stderr,
+            sandbox=self._sandbox_settings(),
+            hooks={
+                "PreToolUse": [HookMatcher(hooks=[self._pre_tool_use_hook])],
+                "Stop": [HookMatcher(hooks=[self._stop_hook])],
+            },
+            cwd=self._cwd,
+            max_buffer_size=CLAUDE_SDK_MAX_BUFFER_SIZE_BYTES,
+            output_format=build_sdk_output_format(payload.config.output_type),
+        )
+
+    async def _handle_system_message(self, message: SystemMessage) -> None:
+        """Handle SDK system events that need side effects in Tracecat."""
+        await self._emit_new_session_lines()
+
+        # init: emitted once at session start; surfaces MCP server connection
+        # results so we can flag failures.
+        if message.subtype == "init":
+            mcp_servers = message.data.get("mcp_servers")
+            if isinstance(mcp_servers, list):
+                for server in mcp_servers:
+                    if isinstance(server, dict) and server.get("status") == "failed":
+                        await self._event_writer.send_log(
+                            "error",
+                            "MCP server failed to connect",
+                            server_name=server.get("name", "<unknown>"),
+                        )
+
+        # compact_boundary: emitted after auto-compaction, carrying the
+        # pre-compaction token count for UI feedback.
+        elif message.subtype == "compact_boundary":
+            pre_tokens: int | None = None
+            compact_metadata = message.data.get("compact_metadata")
+            if isinstance(compact_metadata, dict):
+                pre_tokens_value = compact_metadata.get("pre_tokens")
+                if isinstance(pre_tokens_value, int):
+                    pre_tokens = pre_tokens_value
+
+            await self._event_writer.send_stream_event(
+                self._build_compaction_status_event(
+                    phase="completed",
+                    pre_tokens=pre_tokens,
+                )
+            )
+            self._session_flush_event.set()
+
+    async def _emit_user_tool_results(self, message: UserMessage) -> None:
+        """Stream non-approval tool results from SDK user messages."""
+        if not isinstance(message.content, list):
+            return
+
+        for block in message.content:
+            if not isinstance(block, ToolResultBlock):
+                continue
+            if block.tool_use_id in self._pending_approval_tool_ids:
+                continue
+            await self._event_writer.send_stream_event(
+                UnifiedStreamEvent(
+                    type=StreamEventType.TOOL_RESULT,
+                    tool_call_id=block.tool_use_id,
+                    tool_output=block.content,
+                    is_error=block.is_error or False,
+                )
+            )
+            self._session_flush_event.set()
+
+    async def run(self, payload: RuntimeInitPayload) -> None:
+        """Run an agent with the given initialization payload.
+
+        This is the main entry point for sandboxed execution.
+        Called after receiving init payload from orchestrator via socket.
+
+        On resume after approval, session history already contains the
+        approved or denied tool_result. The runtime sends a hidden meta tick so
+        Claude Code consumes the completed history.
+        """
+        run_started_at = perf_counter()
+
+        def log_benchmark_phase(phase: str, **extra: object) -> None:
+            logger.info(
+                "Agent benchmark phase",
+                phase=phase,
+                elapsed_ms=round((perf_counter() - run_started_at) * 1000, 2),
+                session_id=payload.session_id,
+                component="runtime",
+                **extra,
+            )
+
+        self._configure_runtime_state(payload)
+        log_benchmark_phase("runtime_start")
+        await self._event_writer.send_log(
+            "info",
+            "Runtime initialized",
+        )
+
+        session_flush_task: asyncio.Task[None] | None = None
+
+        # Stable per-session working directory for the Claude Code CLI.
+        # IMPORTANT: Must be deterministic per session_id. The CLI indexes
+        # sessions by project directory (cwd), so if cwd changes between
+        # turns (e.g., random mkdtemp), --resume can't find the session.
+        # Both nsjail and direct mode use the same scheme for parity.
+        self._ensure_working_directory(payload.session_id)
+
+        # Write session file locally if resuming or forking
+        try:
+            prepared_resume = await self._prepare_resume_and_mcp(
+                payload,
+                write_session_file=True,
+            )
+            resume_session_id = prepared_resume.resume_session_id
+            fork_session = prepared_resume.fork_session
+            mcp_servers = prepared_resume.mcp_servers
+            log_benchmark_phase(
+                "runtime_resume_ready",
+                resumed=resume_session_id is not None,
+                fork_session=fork_session,
+            )
+
+            stderr_queue: asyncio.Queue[str] = asyncio.Queue()
+            stdio_mcp_servers = self._stdio_mcp_servers(
+                source_configs=payload.config.mcp_servers,
+                existing_names=set(mcp_servers),
+            )
+            mcp_servers.update(stdio_mcp_servers)
+            agent_definitions = self._build_agent_definitions(payload=payload)
+
+            def handle_claude_stderr(line: str) -> None:
+                """Forward Claude CLI stderr to loopback via queue."""
+                stderr_queue.put_nowait(line)
+
+            await self._event_writer.send_log(
+                "debug",
+                "MCP servers configured",
+                extra={
+                    "server_count": len(mcp_servers),
+                    "servers": list(mcp_servers.keys()),
+                },
+            )
+
+            options = self._build_options(
+                payload=payload,
+                resume_session_id=resume_session_id,
+                fork_session=fork_session,
+                mcp_servers=mcp_servers,
+                stdio_mcp_servers=stdio_mcp_servers,
+                agent_definitions=agent_definitions,
+                stderr=handle_claude_stderr,
+            )
+
+            async def drain_stderr() -> None:
+                """Background task to drain stderr queue to loopback."""
+                while True:
+                    line = await stderr_queue.get()
+                    await self._event_writer.send_log("warning", f"[stderr] {line}")
+
+            logger.debug(
+                "Creating ClaudeSDKClient",
+                mcp_servers=list(mcp_servers.keys()),
+            )
+            _configure_claude_sdk_process_env()
+            if payload.is_approval_continuation:
+                query_input = self._meta_text_input_stream(APPROVAL_CONTINUATION_PROMPT)
+                query_log_extra = {
+                    "prompt_length": len(APPROVAL_CONTINUATION_PROMPT),
+                    "is_meta": True,
+                }
+                logger.info(
+                    "Claude runtime user prompt prepared",
+                    session_id=str(payload.session_id),
+                    is_continuation=True,
+                    is_meta=True,
+                    prompt_length=len(APPROVAL_CONTINUATION_PROMPT),
+                    prompt_preview=_preview_text(APPROVAL_CONTINUATION_PROMPT),
+                )
+            else:
+                query_input = payload.user_prompt
+                query_log_extra = {"prompt_length": len(query_input)}
+                logger.info(
+                    "Claude runtime user prompt prepared",
+                    session_id=str(payload.session_id),
+                    is_continuation=False,
+                    is_meta=False,
+                    prompt_length=len(query_input),
+                )
+
+            transport = self._transport_factory(options)
+            client = ClaudeSDKClient(options=options, transport=transport)
+            logger.debug("Client created, entering context")
+            async with client:
+                self.client = client
+                log_benchmark_phase("runtime_client_connected")
+                stderr_task = asyncio.create_task(drain_stderr())
+                session_flush_task = asyncio.create_task(
+                    self._flush_session_lines_when_signaled(
+                        is_approval_continuation=payload.is_approval_continuation
+                    )
+                )
+                try:
+                    await self._event_writer.send_log(
+                        "info",
+                        "Sending query to Claude SDK",
+                        is_continuation=payload.is_approval_continuation,
+                        **query_log_extra,
+                    )
+                    if isinstance(
+                        query_input, str
+                    ) and self._is_manual_compaction_prompt(query_input):
+                        await self._event_writer.send_stream_event(
+                            self._build_compaction_status_event(phase="started")
+                        )
+                    await client.query(query_input)
+                    log_benchmark_phase("runtime_query_sent")
+
+                    await self._event_writer.send_log(
+                        "debug", "Query sent, receiving response"
+                    )
+
+                    first_stream_event_logged = False
+                    async for message in client.receive_response():
+                        logger.debug(
+                            "Received message", message_type=type(message).__name__
+                        )
+                        raw_sdk_session_id = getattr(message, "session_id", None)
+                        sdk_session_id = (
+                            raw_sdk_session_id
+                            if isinstance(raw_sdk_session_id, str)
+                            else None
+                        )
+                        await self._capture_sdk_session_id(
+                            sdk_session_id,
+                            resume_session_id=resume_session_id,
+                            fork_session=fork_session,
+                        )
+                        if isinstance(message, StreamEvent):
+                            if not first_stream_event_logged:
+                                first_stream_event_logged = True
+                                log_benchmark_phase("runtime_first_stream_event")
+
+                            # Partial streaming delta - forward to UI
+                            unified = self._stream_adapter.to_unified_event(message)
+                            await self._event_writer.send_stream_event(unified)
+                            self._session_flush_event.set()
+
+                        elif isinstance(message, ResultMessage):
+                            await self._event_writer.send_log(
+                                "info",
+                                "Agent turn completed",
+                                num_turns=message.num_turns,
+                                duration_ms=message.duration_ms,
+                                usage=message.usage,
+                            )
+                            log_benchmark_phase(
+                                "runtime_result_received",
+                                duration_ms=message.duration_ms,
+                                num_turns=message.num_turns,
+                            )
+                            result_output = (
+                                message.structured_output
+                                if message.structured_output is not None
+                                else message.result
+                            )
+                            await self._event_writer.send_result(
+                                usage=message.usage,
+                                num_turns=message.num_turns,
+                                duration_ms=message.duration_ms,
+                                output=result_output,
+                            )
+
+                        elif isinstance(message, SystemMessage):
+                            await self._handle_system_message(message)
+
+                        else:
+                            # AssistantMessage, UserMessage, etc.
+                            await self._emit_new_session_lines()
+
+                            if isinstance(message, UserMessage):
+                                await self._emit_user_tool_results(message)
+                finally:
+                    stderr_task.cancel()
+                    try:
+                        await stderr_task
+                    except asyncio.CancelledError:
+                        pass
+
+            # CLI has exited — session file is fully flushed.
+            await self._emit_new_session_lines(
+                is_approval_continuation=payload.is_approval_continuation
+            )
+            log_benchmark_phase("runtime_complete")
+
+        except Exception as e:
+            await self._event_writer.send_log(
+                "error",
+                "Runtime error",
+                error_type=type(e).__name__,
+                error_message=str(e),
+            )
+            await self._event_writer.send_error(str(e))
+            raise
+        finally:
+            if session_flush_task is not None:
+                session_flush_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await session_flush_task
+            self.client = None
+            await self._event_writer.send_done()

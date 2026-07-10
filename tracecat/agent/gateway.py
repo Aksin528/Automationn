@@ -451,8 +451,6 @@ class TracecatCallbackHandler(CustomLogger):
         # Strip after model_settings merge so they can't be re-added
         if provider == "bedrock":
             _strip_bedrock_unsupported_params(data)
-        elif provider == "custom-model-provider":
-            _translate_thinking_for_custom_provider(data)
 
         logger.info(
             "Injected credentials for LiteLLM call",
@@ -544,20 +542,6 @@ def _strip_bedrock_unsupported_params(data: dict) -> None:
     """Strip params that Bedrock doesn't reliably support."""
     data.pop("thinking", None)
     data.pop("reasoning_effort", None)
-
-
-def _translate_thinking_for_custom_provider(data: dict) -> None:
-    """Translate Anthropic-style `thinking` into Ollama's native `think` boolean.
-
-    Custom model providers (e.g. Ollama) are routed through the Claude Agent SDK,
-    which always sends `thinking: {"type": "enabled" | "disabled"}`. Ollama does
-    not understand that shape and silently ignores it, so thinking stays on
-    regardless of the `enable_thinking` preset setting. Ollama instead expects a
-    top-level boolean `think` field.
-    """
-    thinking = data.pop("thinking", None)
-    if isinstance(thinking, dict):
-        data["think"] = thinking.get("type") == "enabled"
 
 
 def _inject_provider_credentials(

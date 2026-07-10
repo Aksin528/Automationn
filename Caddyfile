@@ -1,0 +1,52 @@
+{$BASE_DOMAIN} {
+	bind {$ADDRESS} # Binds to all available network interfaces if not specified
+
+	# MinIO S3 API proxy for presigned URLs
+	handle_path /s3/* {
+		reverse_proxy http://minio:9000 {
+			header_up Host {host}
+			header_up -Server
+		}
+	}
+
+	handle_path /api* {
+		reverse_proxy http://api:8000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	# MCP server (FastMCP serves at /mcp by default, so preserve the path)
+	handle /mcp* {
+		reverse_proxy http://mcp:8099 {
+			flush_interval -1
+		}
+	}
+
+	# MCP OAuth and discovery routes (served at root level by FastMCP)
+	handle /.well-known/oauth-authorization-server {
+		reverse_proxy http://mcp:8099
+	}
+	handle /.well-known/oauth-protected-resource* {
+		reverse_proxy http://mcp:8099
+	}
+	handle /authorize* {
+		reverse_proxy http://mcp:8099
+	}
+	handle /token {
+		reverse_proxy http://mcp:8099
+	}
+	handle /register {
+		reverse_proxy http://mcp:8099
+	}
+	handle /consent* {
+		reverse_proxy http://mcp:8099
+	}
+	handle /auth/callback* {
+		reverse_proxy http://mcp:8099
+	}
+
+	reverse_proxy http://ui:3000
+}

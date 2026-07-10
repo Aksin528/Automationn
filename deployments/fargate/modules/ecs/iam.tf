@@ -1,0 +1,690 @@
+# Get current caller identity and region
+data "aws_caller_identity" "current" {}
+
+# Common assume role policy document
+data "aws_iam_policy_document" "assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    effect  = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values = [
+        "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*"
+      ]
+    }
+  }
+}
+
+# ECS Poll policy
+resource "aws_iam_policy" "ecs_poll" {
+  name        = "${var.iam_name_prefix}ECSPollPolicy"
+  description = "Policy for ECS Poll action"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["ecs:Poll"]
+        Resource = [
+          "arn:aws:ecs:*:${data.aws_caller_identity.current.account_id}:task-set/cluster/*"
+        ]
+      }
+    ]
+  })
+}
+
+
+# Redis IAM access policy
+resource "aws_iam_policy" "redis_iam_access" {
+  name        = "${var.iam_name_prefix}RedisIAMAccessPolicy"
+  description = "Policy for ElastiCache Redis metadata access (no IAM auth)"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "elasticache:DescribeReplicationGroups"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# S3 access policy for Tracecat blob storage buckets
+resource "aws_iam_policy" "s3_blob_access" {
+  name        = "${var.iam_name_prefix}S3BlobStoragePolicy"
+  description = "Policy for S3 blob storage access (attachments, registry, skills, workflow, agent)"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowBlobObjectOperations"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:PutObjectTagging",
+          "s3:GetObjectTagging",
+          "s3:HeadObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.attachments.arn}/*",
+          "${aws_s3_bucket.registry.arn}/*",
+          "${aws_s3_bucket.skills.arn}/*",
+          "${aws_s3_bucket.workflow.arn}/*",
+          "${aws_s3_bucket.agent.arn}/*",
+        ]
+      },
+      {
+        Sid    = "AllowBlobBucketOperations"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+          "s3:HeadBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.attachments.arn,
+          aws_s3_bucket.registry.arn,
+          aws_s3_bucket.skills.arn,
+          aws_s3_bucket.workflow.arn,
+          aws_s3_bucket.agent.arn,
+        ]
+      },
+      {
+        Sid    = "AllowWorkflowBucketLifecycleConfiguration"
+        Effect = "Allow"
+        Action = [
+          "s3:GetLifecycleConfiguration",
+          "s3:PutLifecycleConfiguration",
+          "s3:DeleteLifecycleConfiguration"
+        ]
+        Resource = [
+          aws_s3_bucket.workflow.arn
+        ]
+      }
+    ]
+  })
+}
+
+# Secrets access policy
+resource "aws_iam_policy" "secrets_access" {
+  name        = "${var.iam_name_prefix}SecretsAccessPolicy"
+  description = "Policy for accessing Tracecat secrets"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
+        Resource = compact([
+          var.tracecat_db_encryption_key_arn,
+          var.tracecat_service_key_arn,
+          var.tracecat_signing_secret_arn,
+          var.oauth_client_id_arn,
+          var.oauth_client_secret_arn,
+          var.oidc_client_id_arn,
+          var.oidc_client_secret_arn,
+          var.saml_idp_metadata_url_arn,
+          var.temporal_api_key_arn,
+          aws_secretsmanager_secret.redis_url.arn,
+        ])
+      }
+    ]
+  })
+
+  depends_on = [aws_db_instance.core_database]
+}
+
+# API and MCP secrets — USER_AUTH_SECRET is needed by the API service
+# (password reset, email verification, OAuth state signing) and the MCP
+# service (internal OIDC client-secret derivation).  It must NOT be
+# accessible from worker or executor services to limit blast radius.
+resource "aws_iam_policy" "api_only_secrets_access" {
+  name        = "${var.iam_name_prefix}APIOnlySecretsAccessPolicy"
+  description = "Policy for accessing API-only secrets (USER_AUTH_SECRET)"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [var.user_auth_secret_arn]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "temporal_payload_encryption_keyring_access" {
+  count       = var.temporal_payload_encryption_keyring_arn != null ? 1 : 0
+  name        = "${var.iam_name_prefix}TemporalPayloadEncryptionKeyringAccessPolicy"
+  description = "Policy for accessing the Temporal payload encryption keyring"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [var.temporal_payload_encryption_keyring_arn]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "ui_secrets_access" {
+  name        = "${var.iam_name_prefix}UISecretsAccessPolicy"
+  description = "Policy for accessing Tracecat UI secrets"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
+        Resource = compact([
+          var.tracecat_service_key_arn,
+        ])
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "temporal_secrets_access" {
+  count       = var.disable_temporal_autosetup ? 0 : 1
+  name        = "${var.iam_name_prefix}TemporalSecretsAccessPolicy"
+  description = "Policy for accessing Temporal secrets"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
+        Resource = [
+          aws_db_instance.temporal_database[0].master_user_secret[0].secret_arn
+        ]
+      }
+    ]
+  })
+
+  depends_on = [aws_db_instance.temporal_database]
+}
+
+# API execution role
+resource "aws_iam_role" "api_execution" {
+  name               = "${var.iam_name_prefix}APIExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "api_execution_ecs_poll" {
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.api_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "api_execution_secrets" {
+  policy_arn = aws_iam_policy.secrets_access.arn
+  role       = aws_iam_role.api_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "api_execution_api_only_secrets" {
+  policy_arn = aws_iam_policy.api_only_secrets_access.arn
+  role       = aws_iam_role.api_execution.name
+}
+
+# Worker execution role
+resource "aws_iam_role" "worker_execution" {
+  name               = "${var.iam_name_prefix}WorkerExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "worker_execution_ecs_poll" {
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.worker_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "worker_execution_secrets" {
+  policy_arn = aws_iam_policy.secrets_access.arn
+  role       = aws_iam_role.worker_execution.name
+}
+
+# API and Worker task role
+resource "aws_iam_role" "api_worker_task" {
+  name               = "${var.iam_name_prefix}APIWorkerTaskRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy" "api_worker_task_db_access" {
+  name = "${var.iam_name_prefix}APIWorkerDBAccessPolicy"
+  role = aws_iam_role.api_worker_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "rds-db:connect",
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          "${aws_db_instance.core_database.arn}/postgres",
+          aws_db_instance.core_database.master_user_secret[0].secret_arn,
+        ]
+      }
+    ]
+  })
+}
+
+# Attach S3 policy to API/Worker task role
+resource "aws_iam_role_policy_attachment" "api_worker_task_s3" {
+  policy_arn = aws_iam_policy.s3_blob_access.arn
+  role       = aws_iam_role.api_worker_task.name
+}
+
+# Attach Redis IAM policy to API/Worker task role
+resource "aws_iam_role_policy_attachment" "api_worker_task_redis" {
+  policy_arn = aws_iam_policy.redis_iam_access.arn
+  role       = aws_iam_role.api_worker_task.name
+}
+
+resource "aws_iam_role_policy_attachment" "api_worker_task_temporal_payload_encryption_keyring" {
+  count      = var.temporal_payload_encryption_keyring_arn != null ? 1 : 0
+  policy_arn = aws_iam_policy.temporal_payload_encryption_keyring_access[0].arn
+  role       = aws_iam_role.api_worker_task.name
+}
+
+resource "aws_iam_role" "executor_task" {
+  name               = "${var.iam_name_prefix}ExecutorTaskRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy" "executor_task_db_access" {
+  name = "${var.iam_name_prefix}ExecutorDBAccessPolicy"
+  role = aws_iam_role.executor_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "rds-db:connect",
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          "${aws_db_instance.core_database.arn}/postgres",
+          aws_db_instance.core_database.master_user_secret[0].secret_arn,
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "executor_task_assume_role" {
+  name = "${var.iam_name_prefix}ExecutorAssumeRolePolicy"
+  role = aws_iam_role.executor_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sts:AssumeRole"
+        ]
+        Resource = [
+          "arn:aws:iam::*:role/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "executor_task_s3" {
+  policy_arn = aws_iam_policy.s3_blob_access.arn
+  role       = aws_iam_role.executor_task.name
+}
+
+resource "aws_iam_role_policy_attachment" "executor_task_redis" {
+  policy_arn = aws_iam_policy.redis_iam_access.arn
+  role       = aws_iam_role.executor_task.name
+}
+
+resource "aws_iam_role_policy_attachment" "executor_task_temporal_payload_encryption_keyring" {
+  count      = var.temporal_payload_encryption_keyring_arn != null ? 1 : 0
+  policy_arn = aws_iam_policy.temporal_payload_encryption_keyring_access[0].arn
+  role       = aws_iam_role.executor_task.name
+}
+
+# UI execution role
+resource "aws_iam_role" "ui_execution" {
+  name               = "${var.iam_name_prefix}UIExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "ui_execution_ecs_poll" {
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.ui_execution.name
+}
+
+# Add this new attachment for secrets access
+resource "aws_iam_role_policy_attachment" "ui_execution_secrets" {
+  policy_arn = aws_iam_policy.ui_secrets_access.arn
+  role       = aws_iam_role.ui_execution.name
+}
+
+# Temporal execution role
+resource "aws_iam_role" "temporal_execution" {
+  count              = var.disable_temporal_autosetup ? 0 : 1
+  name               = "${var.iam_name_prefix}TemporalExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "temporal_execution_ecs_poll" {
+  count      = var.disable_temporal_autosetup ? 0 : 1
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.temporal_execution[0].name
+}
+
+resource "aws_iam_role_policy_attachment" "temporal_execution_secrets" {
+  count      = var.disable_temporal_autosetup ? 0 : 1
+  policy_arn = aws_iam_policy.temporal_secrets_access[0].arn
+  role       = aws_iam_role.temporal_execution[0].name
+}
+
+# Temporal task role
+resource "aws_iam_role" "temporal_task" {
+  count              = var.disable_temporal_autosetup ? 0 : 1
+  name               = "${var.iam_name_prefix}TemporalTaskRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy" "temporal_task_db_access" {
+  count = var.disable_temporal_autosetup ? 0 : 1
+  name  = "${var.iam_name_prefix}TemporalDBAccessPolicy"
+  role  = aws_iam_role.temporal_task[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "rds-db:connect"
+        ]
+        Resource = [
+          "${aws_db_instance.temporal_database[0].arn}/postgres"
+        ]
+      }
+    ]
+  })
+}
+
+# MCP execution role
+resource "aws_iam_role" "mcp_execution" {
+  count              = var.enable_mcp ? 1 : 0
+  name               = "${var.iam_name_prefix}MCPExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "mcp_execution_ecs_poll" {
+  count      = var.enable_mcp ? 1 : 0
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.mcp_execution[0].name
+}
+
+resource "aws_iam_role_policy_attachment" "mcp_execution_secrets" {
+  count      = var.enable_mcp ? 1 : 0
+  policy_arn = aws_iam_policy.secrets_access.arn
+  role       = aws_iam_role.mcp_execution[0].name
+}
+
+resource "aws_iam_role_policy_attachment" "mcp_execution_api_only_secrets" {
+  count      = var.enable_mcp ? 1 : 0
+  policy_arn = aws_iam_policy.api_only_secrets_access.arn
+  role       = aws_iam_role.mcp_execution[0].name
+}
+
+resource "aws_iam_role_policy_attachment" "mcp_execution_cloudwatch_logs" {
+  count      = var.enable_mcp ? 1 : 0
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.mcp_execution[0].name
+}
+
+# MCP task role
+resource "aws_iam_role" "mcp_task" {
+  count              = var.enable_mcp ? 1 : 0
+  name               = "${var.iam_name_prefix}MCPTaskRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy" "mcp_task_db_access" {
+  count = var.enable_mcp ? 1 : 0
+  name  = "${var.iam_name_prefix}MCPDBAccessPolicy"
+  role  = aws_iam_role.mcp_task[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "rds-db:connect",
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          "${aws_db_instance.core_database.arn}/postgres",
+          aws_db_instance.core_database.master_user_secret[0].secret_arn,
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "mcp_task_temporal_payload_encryption_keyring" {
+  count      = var.enable_mcp && var.temporal_payload_encryption_keyring_arn != null ? 1 : 0
+  policy_arn = aws_iam_policy.temporal_payload_encryption_keyring_access[0].arn
+  role       = aws_iam_role.mcp_task[0].name
+}
+
+# LiteLLM execution role
+resource "aws_iam_role" "litellm_execution" {
+  name               = "${var.iam_name_prefix}LitellmExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "litellm_execution_ecs_poll" {
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.litellm_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "litellm_execution_secrets" {
+  policy_arn = aws_iam_policy.secrets_access.arn
+  role       = aws_iam_role.litellm_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "litellm_execution_cloudwatch_logs" {
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.litellm_execution.name
+}
+
+# LiteLLM task role
+resource "aws_iam_role" "litellm_task" {
+  name               = "${var.iam_name_prefix}LitellmTaskRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy" "litellm_task_db_access" {
+  name = "${var.iam_name_prefix}LitellmDBAccessPolicy"
+  role = aws_iam_role.litellm_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "rds-db:connect",
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          "${aws_db_instance.core_database.arn}/postgres",
+          aws_db_instance.core_database.master_user_secret[0].secret_arn,
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "litellm_task_assume_role" {
+  name = "${var.iam_name_prefix}LitellmAssumeRolePolicy"
+  role = aws_iam_role.litellm_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sts:AssumeRole"
+        ]
+        Resource = [
+          aws_iam_role.executor_task.arn
+        ]
+      }
+    ]
+  })
+}
+
+# Caddy execution role
+resource "aws_iam_role" "caddy_execution" {
+  name               = "${var.iam_name_prefix}CaddyExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "caddy_execution_ecs_poll" {
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.caddy_execution.name
+}
+
+# Add CloudWatch Logs policy
+resource "aws_iam_policy" "cloudwatch_logs" {
+  name        = "${var.iam_name_prefix}CloudWatchLogsPolicy"
+  description = "Policy for writing to CloudWatch Logs"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.tracecat_log_group.arn}:*"
+      }
+    ]
+  })
+}
+
+# Attach CloudWatch Logs policy to execution roles
+
+resource "aws_iam_role_policy_attachment" "api_execution_cloudwatch_logs" {
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.api_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "worker_execution_cloudwatch_logs" {
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.worker_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "ui_execution_cloudwatch_logs" {
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.ui_execution.name
+}
+
+resource "aws_iam_role_policy_attachment" "temporal_execution_cloudwatch_logs" {
+  count      = var.disable_temporal_autosetup ? 0 : 1
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.temporal_execution[0].name
+}
+
+resource "aws_iam_role_policy_attachment" "caddy_execution_cloudwatch_logs" {
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.caddy_execution.name
+}
+
+# (Optional) Temporal UI execution role
+resource "aws_iam_policy" "temporal_ui_secrets_access" {
+  count       = var.disable_temporal_ui ? 0 : 1
+  name        = "${var.iam_name_prefix}TemporalUISecretsAccessPolicy"
+  description = "Policy for accessing Temporal UI secrets"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
+        Resource = compact([
+          var.temporal_auth_client_id_arn,
+          var.temporal_auth_client_secret_arn
+        ])
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "temporal_ui_execution" {
+  count              = var.disable_temporal_ui ? 0 : 1
+  name               = "${var.iam_name_prefix}TemporalUIExecutionRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "temporal_ui_execution_ecs_poll" {
+  count      = var.disable_temporal_ui ? 0 : 1
+  policy_arn = aws_iam_policy.ecs_poll.arn
+  role       = aws_iam_role.temporal_ui_execution[0].name
+}
+
+resource "aws_iam_role_policy_attachment" "temporal_ui_execution_cloudwatch_logs" {
+  count      = var.disable_temporal_ui ? 0 : 1
+  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  role       = aws_iam_role.temporal_ui_execution[0].name
+}
+
+resource "aws_iam_role_policy_attachment" "temporal_ui_execution_secrets" {
+  count      = var.disable_temporal_ui ? 0 : 1
+  policy_arn = aws_iam_policy.temporal_ui_secrets_access[0].arn
+  role       = aws_iam_role.temporal_ui_execution[0].name
+}
+
+# Temporal UI task role (minimal permissions)
+resource "aws_iam_role" "temporal_ui_task" {
+  count              = var.disable_temporal_ui ? 0 : 1
+  name               = "${var.iam_name_prefix}TemporalUITaskRole"
+  assume_role_policy = data.aws_iam_policy_document.assume_role.json
+}

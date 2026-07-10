@@ -1,0 +1,99 @@
+"use client"
+
+import type { LucideIcon } from "lucide-react"
+import { BookText, Settings, ShieldCheckIcon } from "lucide-react"
+import Link from "next/link"
+import { useSettingsModal } from "@/components/settings/settings-modal-context"
+import { Separator } from "@/components/ui/separator"
+import {
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+} from "@/components/ui/sidebar"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+import { siteConfig } from "@/config/site"
+import { useAuth } from "@/hooks/use-auth"
+import { useOrganization } from "@/hooks/use-organization"
+
+type SidebarUserNavManageItem = {
+  title: string
+  href: string
+  icon: LucideIcon
+  isActive?: boolean
+}
+
+export function SidebarUserNav({
+  manageItems,
+  showManageLabel = true,
+}: {
+  manageItems?: SidebarUserNavManageItem[]
+  showManageLabel?: boolean
+}) {
+  const { user } = useAuth()
+  const { setOpen } = useSettingsModal()
+  const { organization, isLoading } = useOrganization()
+
+  return (
+    <SidebarMenu>
+      <Separator className="my-1" />
+      {showManageLabel ? (
+        <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
+          Manage
+        </div>
+      ) : null}
+
+      <SidebarMenuItem>
+        <SidebarMenuButton onClick={() => setOpen(true)} tooltip="Settings">
+          <Settings className="size-4" />
+          <span>Settings</span>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+
+      {manageItems?.map((item) => (
+        <SidebarMenuItem key={item.href}>
+          <SidebarMenuButton asChild isActive={item.isActive}>
+            <Link href={item.href}>
+              <item.icon className="size-4" />
+              <span>{item.title}</span>
+            </Link>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
+      ))}
+
+      {user?.isSuperuser && (
+        <SidebarMenuItem>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <SidebarMenuButton asChild>
+                <Link href="/admin">
+                  <ShieldCheckIcon className="size-4" />
+                  <span>Admin</span>
+                </Link>
+              </SidebarMenuButton>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {isLoading ? "..." : (organization?.name ?? "Organization")}
+            </TooltipContent>
+          </Tooltip>
+        </SidebarMenuItem>
+      )}
+
+      <SidebarMenuItem>
+        <SidebarMenuButton asChild tooltip="Docs">
+          <Link
+            href={siteConfig.links.docs}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <BookText className="size-4" />
+            <span>Docs</span>
+          </Link>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+    </SidebarMenu>
+  )
+}

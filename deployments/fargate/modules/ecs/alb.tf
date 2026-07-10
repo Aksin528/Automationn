@@ -1,0 +1,588 @@
+# Application Load Balancer
+# Note: ALB is AWS-managed and does not expose Envoy tuning knobs; keep-alive
+# behaviour for Service Connect SSE traffic must be handled in the downstream
+# proxies (Caddy and the managed Envoy sidecars).
+resource "aws_alb" "this" {
+  name               = "${var.name_prefix}-alb"
+  internal           = var.is_internal
+  load_balancer_type = "application"
+  subnets            = var.public_subnet_ids
+  security_groups    = [aws_security_group.alb.id]
+
+  tags = {
+    Name = "${var.name_prefix}-alb"
+  }
+}
+
+# Target Group for Caddy
+resource "aws_alb_target_group" "caddy" {
+  name        = "${var.name_prefix}-caddy-tg"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = var.vpc_id
+  target_type = "ip"
+
+  health_check {
+    healthy_threshold   = "3"
+    interval            = "30"
+    protocol            = "HTTP"
+    matcher             = "200"
+    timeout             = "3"
+    path                = "/"
+    unhealthy_threshold = "2"
+  }
+}
+
+# HTTPS Listener
+resource "aws_alb_listener" "https" {
+  load_balancer_arn = aws_alb.this.id
+  port              = "443"
+  protocol          = "HTTPS"
+
+  ssl_policy      = var.alb_ssl_policy
+  certificate_arn = var.acm_certificate_arn
+
+  default_action {
+    target_group_arn = aws_alb_target_group.caddy.id
+    type             = "forward"
+  }
+}
+
+# HTTP to HTTPS Redirect
+resource "aws_alb_listener" "http" {
+  load_balancer_arn = aws_alb.this.id
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+# Add a WAF in front of the ALB
+resource "aws_wafv2_web_acl" "this" {
+  count = var.enable_waf ? 1 : 0
+
+  name        = "${var.name_prefix}-waf-acl"
+  description = "Default WAF configuration for Tracecat ALB"
+  scope       = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  # AWS Managed Rules - Common Rule Set
+  rule {
+    name     = "AWS-AWSManagedRulesCommonRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+
+        rule_action_override {
+          name = "SizeRestrictions_BODY"
+          action_to_use {
+            count {}
+          }
+        }
+
+        rule_action_override {
+          name = "SizeRestrictions_QUERYSTRING"
+          action_to_use {
+            count {}
+          }
+        }
+
+        # Override rules that commonly cause false positives with file uploads
+        rule_action_override {
+          name = "CrossSiteScripting_BODY"
+          action_to_use {
+            count {}
+          }
+        }
+
+        rule_action_override {
+          name = "GenericLFI_BODY"
+          action_to_use {
+            count {}
+          }
+        }
+
+        rule_action_override {
+          name = "GenericRFI_BODY"
+          action_to_use {
+            count {}
+          }
+        }
+
+        rule_action_override {
+          name = "GenericRFI_QUERYARGUMENTS"
+          action_to_use {
+            count {}
+          }
+        }
+
+        rule_action_override {
+          name = "EC2MetaDataSSRF_BODY"
+          action_to_use {
+            count {}
+          }
+        }
+
+        rule_action_override {
+          name = "EC2MetaDataSSRF_QUERYARGUMENTS"
+          action_to_use {
+            count {}
+          }
+        }
+
+        rule_action_override {
+          name = "NoUserAgent_HEADER"
+          action_to_use {
+            count {}
+          }
+        }
+
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesCommonRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # AWS Managed Rules - Known Bad Inputs Rule Set
+  rule {
+    name     = "AWS-AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesKnownBadInputsRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # AWS Managed Rules - SQL Database Rule Set
+  rule {
+    name     = "AWS-AWSManagedRulesSQLiRuleSet"
+    priority = 3
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesSQLiRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesSQLiRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # AWS Managed Rules - Linux Operating System Rule Set
+  rule {
+    name     = "AWS-AWSManagedRulesLinuxRuleSet"
+    priority = 4
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesLinuxRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWSManagedRulesLinuxRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Custom rule to block missing User-Agent except for MCP public endpoints.
+  # Some MCP clients bootstrap OAuth without a User-Agent header. Keep the
+  # managed rule active everywhere else.
+  rule {
+    name     = "BlockMissingUserAgentExceptMcpPublic"
+    priority = 5
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          label_match_statement {
+            scope = "LABEL"
+            key   = "awswaf:managed:aws:core-rule-set:NoUserAgent_Header"
+          }
+        }
+        statement {
+          not_statement {
+            statement {
+              regex_pattern_set_reference_statement {
+                arn = aws_wafv2_regex_pattern_set.mcp_public_endpoints[0].arn
+                field_to_match {
+                  uri_path {}
+                }
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "BlockMissingUserAgentExceptMcpPublic"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Custom rule to block XSS threats except for attachment uploads
+  rule {
+    name     = "BlockXSSExceptAttachments"
+    priority = 6
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          label_match_statement {
+            scope = "LABEL"
+            key   = "awswaf:managed:aws:core-rule-set:CrossSiteScripting_Body"
+          }
+        }
+        statement {
+          not_statement {
+            statement {
+              regex_pattern_set_reference_statement {
+                arn = aws_wafv2_regex_pattern_set.attachments_endpoint[0].arn
+                field_to_match {
+                  uri_path {}
+                }
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "BlockXSSExceptAttachments"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Custom rule to block LFI threats except for attachment uploads
+  rule {
+    name     = "BlockLFIExceptAttachments"
+    priority = 7
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          label_match_statement {
+            scope = "LABEL"
+            key   = "awswaf:managed:aws:core-rule-set:GenericLFI_Body"
+          }
+        }
+        statement {
+          not_statement {
+            statement {
+              regex_pattern_set_reference_statement {
+                arn = aws_wafv2_regex_pattern_set.attachments_endpoint[0].arn
+                field_to_match {
+                  uri_path {}
+                }
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "BlockLFIExceptAttachments"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "BlockSSRFExceptMcpOAuth"
+    priority = 9
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          or_statement {
+            statement {
+              label_match_statement {
+                scope = "LABEL"
+                key   = "awswaf:managed:aws:core-rule-set:EC2MetaDataSSRF_Body"
+              }
+            }
+
+            statement {
+              label_match_statement {
+                scope = "LABEL"
+                key   = "awswaf:managed:aws:core-rule-set:EC2MetaDataSSRF_QueryArguments"
+              }
+            }
+          }
+        }
+
+        statement {
+          not_statement {
+            statement {
+              regex_pattern_set_reference_statement {
+                arn = aws_wafv2_regex_pattern_set.mcp_oauth_endpoints[0].arn
+
+                field_to_match {
+                  uri_path {}
+                }
+
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "BlockSSRFExceptMcpOAuth"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Custom rule to block IPv4 URL inclusion except for MCP OAuth endpoints.
+  # Local MCP clients can legitimately register loopback redirect URIs such as
+  # 127.0.0.1 in DCR bodies and authorization query strings.
+  rule {
+    name     = "BlockRFIExceptMcpOAuth"
+    priority = 8
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          or_statement {
+            statement {
+              label_match_statement {
+                scope = "LABEL"
+                key   = "awswaf:managed:aws:core-rule-set:GenericRFI_Body"
+              }
+            }
+
+            statement {
+              label_match_statement {
+                scope = "LABEL"
+                key   = "awswaf:managed:aws:core-rule-set:GenericRFI_QueryArguments"
+              }
+            }
+          }
+        }
+
+        statement {
+          not_statement {
+            statement {
+              regex_pattern_set_reference_statement {
+                arn = aws_wafv2_regex_pattern_set.mcp_oauth_endpoints[0].arn
+
+                field_to_match {
+                  uri_path {}
+                }
+
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "BlockRFIExceptMcpOAuth"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Custom rule to block oversized query strings except for attachment uploads
+  rule {
+    name     = "BlockQueryStringSizeExceptAttachments"
+    priority = 10
+
+    action {
+      block {}
+    }
+
+    statement {
+      and_statement {
+        statement {
+          label_match_statement {
+            scope = "LABEL"
+            key   = "awswaf:managed:aws:core-rule-set:SizeRestrictions_QueryString"
+          }
+        }
+        statement {
+          not_statement {
+            statement {
+              regex_pattern_set_reference_statement {
+                arn = aws_wafv2_regex_pattern_set.attachments_endpoint[0].arn
+                field_to_match {
+                  uri_path {}
+                }
+                text_transformation {
+                  priority = 0
+                  type     = "NONE"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "BlockQueryStringSizeExceptAttachments"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${var.name_prefix}-waf-metric"
+    sampled_requests_enabled   = true
+  }
+}
+
+# Regex pattern set for attachments endpoint
+resource "aws_wafv2_regex_pattern_set" "attachments_endpoint" {
+  count = var.enable_waf ? 1 : 0
+
+  name        = local.waf_attachments_endpoint_pattern_name
+  description = "Pattern to match attachments API endpoint"
+  scope       = "REGIONAL"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  regular_expression {
+    regex_string = "^/api/cases/[a-fA-F0-9-]+/attachments(\\?.*)?$"
+  }
+}
+
+resource "aws_wafv2_regex_pattern_set" "mcp_oauth_endpoints" {
+  count = var.enable_waf ? 1 : 0
+
+  name        = local.waf_mcp_oauth_endpoints_pattern_name
+  description = "Matches MCP OAuth endpoints that carry loopback redirect URIs"
+  scope       = "REGIONAL"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  regular_expression {
+    regex_string = "^/(mcp/)?(register|authorize|consent|token|auth/callback)$"
+  }
+}
+
+# Regex pattern set for MCP public endpoints that must remain reachable even
+# when clients omit a User-Agent header during connection bootstrapping.
+resource "aws_wafv2_regex_pattern_set" "mcp_public_endpoints" {
+  count = var.enable_waf ? 1 : 0
+
+  name        = local.waf_mcp_public_endpoint_pattern_name
+  description = "Matches MCP discovery, transport, and OAuth endpoints"
+  scope       = "REGIONAL"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  regular_expression {
+    regex_string = "^/(mcp|\\.well-known/oauth-(protected-resource|authorization-server)(/mcp)?|(mcp/)?(register|authorize|consent|token|auth/callback))/?$"
+  }
+}
+
+resource "aws_wafv2_web_acl_association" "this" {
+  count = var.enable_waf ? 1 : 0
+
+  resource_arn = aws_alb.this.arn
+  web_acl_arn  = aws_wafv2_web_acl.this[0].arn
+}

@@ -1,0 +1,1284 @@
+from __future__ import annotations
+
+import re
+import uuid
+from datetime import datetime
+from typing import Any, cast
+
+import sqlalchemy as sa
+import yaml
+from fastapi import HTTPException, status
+from pydantic import ValidationError
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import selectinload
+from temporalio import activity
+from temporalio.exceptions import ApplicationError
+
+from tracecat.audit.logger import audit_log
+from tracecat.authz.controls import require_scope
+from tracecat.contexts import ctx_logical_time
+from tracecat.db.models import (
+    Action,
+    CaseTrigger,
+    Schedule,
+    Webhook,
+    Workflow,
+    WorkflowDefinition,
+    WorkflowTag,
+    WorkflowTagLink,
+)
+from tracecat.dsl.action import materialize_context
+from tracecat.dsl.common import (
+    DSLEntrypoint,
+    DSLInput,
+    build_action_statements_from_actions,
+    edge_components_from_dep,
+)
+from tracecat.dsl.schemas import DSLConfig, ExecutionContext, RunContext
+from tracecat.dsl.view import RFGraph
+from tracecat.exceptions import TracecatValidationError
+from tracecat.expressions.eval import eval_templated_object
+from tracecat.identifiers import WorkflowID
+from tracecat.identifiers.workflow import (
+    LEGACY_WF_ID_PATTERN,
+    WF_ID_SHORT_PATTERN,
+    WorkflowUUID,
+)
+from tracecat.pagination import (
+    BaseCursorPaginator,
+    CursorPaginatedResponse,
+    CursorPaginationParams,
+)
+from tracecat.registry.lock.service import RegistryLockService
+from tracecat.service import BaseWorkspaceService
+from tracecat.validation.schemas import (
+    DSLValidationResult,
+    ValidationDetail,
+    ValidationResult,
+)
+from tracecat.validation.service import validate_dsl
+from tracecat.workflow.actions.schemas import ActionControlFlow, ActionEdge
+from tracecat.workflow.case_triggers.service import CaseTriggersService
+from tracecat.workflow.executions.enums import ExecutionType
+from tracecat.workflow.graph.service import WorkflowGraphService
+from tracecat.workflow.management.definitions import WorkflowDefinitionsService
+from tracecat.workflow.management.layout import (
+    WorkflowActionLayoutInput,
+    auto_generate_layout,
+)
+from tracecat.workflow.management.schemas import (
+    ExternalWorkflowDefinition,
+    GetErrorHandlerWorkflowIDActivityInputs,
+    GraphOperation,
+    GraphOperationType,
+    ResolveWorkflowAliasActivityInputs,
+    WorkflowCreate,
+    WorkflowDSLCreateResponse,
+    WorkflowUpdate,
+)
+from tracecat.workflow.management.types import (
+    WorkflowDefinitionMinimal,
+    WorkflowTriggerSummaryMinimal,
+    build_workflow_trigger_summary,
+)
+from tracecat.workflow.schedules import bridge
+from tracecat.workflow.schedules.service import WorkflowSchedulesService
+
+
+class WorkflowsManagementService(BaseWorkspaceService):
+    """Manages CRUD operations for Workflows."""
+
+    service_name = "workflows"
+
+    @staticmethod
+    def _workflow_fields_from_dsl(dsl: DSLInput) -> dict[str, Any]:
+        """Project runtime-relevant workflow fields from a DSLInput."""
+        return {
+            "title": dsl.title,
+            "description": dsl.description,
+            "expects": dsl.entrypoint.model_dump(mode="json").get("expects"),
+            "returns": dsl.returns,
+            "config": dsl.config.model_dump(),
+            "error_handler": dsl.error_handler,
+        }
+
+    @staticmethod
+    def _build_schedule_summary_subqueries() -> tuple[sa.Subquery, sa.Subquery]:
+        """Build schedule summary subqueries for list endpoints."""
+        schedule_count_subq = (
+            select(
+                Schedule.workflow_id.label("workflow_id"),
+                sa.func.count(Schedule.id).label("online_schedule_count"),
+            )
+            .where(Schedule.status == "online")
+            .group_by(Schedule.workflow_id)
+            .subquery()
+        )
+
+        ranked_schedule_subq = select(
+            Schedule.workflow_id.label("workflow_id"),
+            Schedule.cron.label("schedule_cron"),
+            Schedule.every.label("schedule_every"),
+            sa.func.row_number()
+            .over(
+                partition_by=Schedule.workflow_id,
+                order_by=(
+                    sa.case((Schedule.status == "online", 0), else_=1).asc(),
+                    Schedule.updated_at.desc(),
+                    Schedule.id.desc(),
+                ),
+            )
+            .label("row_num"),
+        ).subquery()
+
+        schedule_preview_subq = (
+            select(
+                ranked_schedule_subq.c.workflow_id,
+                ranked_schedule_subq.c.schedule_cron,
+                ranked_schedule_subq.c.schedule_every,
+            )
+            .where(ranked_schedule_subq.c.row_num == 1)
+            .subquery()
+        )
+
+        return schedule_count_subq, schedule_preview_subq
+
+    @staticmethod
+    def _build_webhook_summary_subquery() -> sa.Subquery:
+        """Build webhook summary subquery for list endpoints."""
+        return (
+            select(
+                Webhook.workflow_id.label("workflow_id"),
+                sa.func.bool_or(Webhook.status == "online").label("webhook_active"),
+            )
+            .group_by(Webhook.workflow_id)
+            .subquery()
+        )
+
+    async def list_all_workflows(
+        self, *, tags: list[str] | None = None, reverse: bool = False
+    ) -> list[
+        tuple[
+            Workflow,
+            WorkflowDefinitionMinimal | None,
+            WorkflowTriggerSummaryMinimal | None,
+        ]
+    ]:
+        """List workflows with their latest definitions and trigger summaries.
+
+        Args:
+            tags: Optional list of tag names to filter workflows by
+
+        Returns:
+            List of tuples containing workflow, latest definition metadata,
+            and trigger summary metadata.
+        """
+        # Subquery to get the latest definition for each workflow
+        latest_defn_subq = (
+            select(
+                WorkflowDefinition.workflow_id,
+                sa.func.max(WorkflowDefinition.version).label("latest_version"),
+            )
+            .group_by(sa.cast(WorkflowDefinition.workflow_id, sa.UUID))
+            .subquery()
+        )
+
+        schedule_count_subq, schedule_preview_subq = (
+            self._build_schedule_summary_subqueries()
+        )
+        webhook_summary_subq = self._build_webhook_summary_subquery()
+
+        # Main query selecting workflow with trigger summary and latest definition
+        stmt = (
+            select(
+                Workflow,
+                WorkflowDefinition.id,
+                WorkflowDefinition.version,
+                WorkflowDefinition.created_at,
+                webhook_summary_subq.c.webhook_active,
+                CaseTrigger.event_types.label("case_trigger_event_types"),
+                schedule_count_subq.c.online_schedule_count,
+                schedule_preview_subq.c.schedule_cron,
+                schedule_preview_subq.c.schedule_every,
+            )
+            .where(Workflow.workspace_id == self.workspace_id)
+            .outerjoin(
+                latest_defn_subq,
+                sa.cast(Workflow.id, sa.UUID) == latest_defn_subq.c.workflow_id,
+            )
+            .outerjoin(
+                WorkflowDefinition,
+                and_(
+                    WorkflowDefinition.workflow_id == Workflow.id,
+                    WorkflowDefinition.version == latest_defn_subq.c.latest_version,
+                ),
+            )
+            .outerjoin(
+                CaseTrigger,
+                and_(
+                    sa.cast(Workflow.id, sa.UUID) == CaseTrigger.workflow_id,
+                    CaseTrigger.status == "online",
+                ),
+            )
+            .outerjoin(
+                webhook_summary_subq,
+                sa.cast(Workflow.id, sa.UUID) == webhook_summary_subq.c.workflow_id,
+            )
+            .outerjoin(
+                schedule_count_subq,
+                sa.cast(Workflow.id, sa.UUID) == schedule_count_subq.c.workflow_id,
+            )
+            .outerjoin(
+                schedule_preview_subq,
+                sa.cast(Workflow.id, sa.UUID) == schedule_preview_subq.c.workflow_id,
+            )
+        )
+
+        if reverse:
+            stmt = stmt.order_by(
+                Workflow.created_at.asc(),
+                Workflow.id.asc(),
+            )
+        else:
+            stmt = stmt.order_by(
+                Workflow.created_at.desc(),
+                Workflow.id.desc(),
+            )
+
+        if tags:
+            tag_set = set(tags)
+            # Join through the WorkflowTagLink table to WorkflowTag table
+            stmt = (
+                stmt.join(
+                    WorkflowTagLink,
+                    sa.cast(Workflow.id, sa.UUID) == WorkflowTagLink.workflow_id,
+                )
+                .join(
+                    WorkflowTag,
+                    and_(
+                        WorkflowTag.id == WorkflowTagLink.tag_id,
+                        WorkflowTag.name.in_(tag_set),
+                    ),
+                )
+                # Ensure we get distinct workflows when multiple tags match
+                .distinct()
+            )
+
+        # Add eager loading for tags since they're accessed in the router
+        stmt = stmt.options(selectinload(Workflow.tags))
+
+        results = await self.session.execute(stmt)
+        res = []
+        for (
+            workflow,
+            defn_id,
+            defn_version,
+            defn_created,
+            webhook_active,
+            case_trigger_event_types,
+            online_schedule_count,
+            schedule_cron,
+            schedule_every,
+        ) in results.all():
+            if all((defn_id, defn_version, defn_created)):
+                latest_defn = WorkflowDefinitionMinimal(
+                    id=defn_id,
+                    version=defn_version,
+                    created_at=defn_created,
+                )
+            else:
+                latest_defn = None
+            trigger_summary = build_workflow_trigger_summary(
+                online_schedule_count=online_schedule_count,
+                schedule_cron=schedule_cron,
+                schedule_every=schedule_every,
+                webhook_active=webhook_active,
+                case_trigger_event_types=case_trigger_event_types,
+            )
+            res.append((workflow, latest_defn, trigger_summary))
+        return res
+
+    async def list_workflows(
+        self,
+        params: CursorPaginationParams,
+        *,
+        tags: list[str] | None = None,
+        status: str | None = None,
+        search: str | None = None,
+    ) -> CursorPaginatedResponse[
+        tuple[
+            Workflow,
+            WorkflowDefinitionMinimal | None,
+            WorkflowTriggerSummaryMinimal | None,
+        ]
+    ]:
+        """List workflows with cursor-based pagination.
+
+        Args:
+            params: Cursor pagination parameters
+            tags: Optional list of tag names to filter workflows by
+
+        Returns:
+            CursorPaginatedResponse containing workflow rows with latest definition
+            and trigger summary metadata.
+        """
+
+        # Subquery to get the latest definition for each workflow
+        latest_defn_subq = (
+            select(
+                WorkflowDefinition.workflow_id,
+                sa.func.max(WorkflowDefinition.version).label("latest_version"),
+            )
+            .group_by(sa.cast(WorkflowDefinition.workflow_id, sa.UUID))
+            .subquery()
+        )
+
+        schedule_count_subq, schedule_preview_subq = (
+            self._build_schedule_summary_subqueries()
+        )
+        webhook_summary_subq = self._build_webhook_summary_subquery()
+
+        # Main query selecting workflow with trigger summary and latest definition
+        stmt = (
+            select(
+                Workflow,
+                WorkflowDefinition.id,
+                WorkflowDefinition.version,
+                WorkflowDefinition.created_at.label("defn_created_at"),
+                webhook_summary_subq.c.webhook_active,
+                CaseTrigger.event_types.label("case_trigger_event_types"),
+                schedule_count_subq.c.online_schedule_count,
+                schedule_preview_subq.c.schedule_cron,
+                schedule_preview_subq.c.schedule_every,
+            )
+            .where(Workflow.workspace_id == self.workspace_id)
+            .outerjoin(
+                latest_defn_subq,
+                sa.cast(Workflow.id, sa.UUID) == latest_defn_subq.c.workflow_id,
+            )
+            .outerjoin(
+                WorkflowDefinition,
+                and_(
+                    WorkflowDefinition.workflow_id == Workflow.id,
+                    WorkflowDefinition.version == latest_defn_subq.c.latest_version,
+                ),
+            )
+            .outerjoin(
+                CaseTrigger,
+                and_(
+                    sa.cast(Workflow.id, sa.UUID) == CaseTrigger.workflow_id,
+                    CaseTrigger.status == "online",
+                ),
+            )
+            .outerjoin(
+                webhook_summary_subq,
+                sa.cast(Workflow.id, sa.UUID) == webhook_summary_subq.c.workflow_id,
+            )
+            .outerjoin(
+                schedule_count_subq,
+                sa.cast(Workflow.id, sa.UUID) == schedule_count_subq.c.workflow_id,
+            )
+            .outerjoin(
+                schedule_preview_subq,
+                sa.cast(Workflow.id, sa.UUID) == schedule_preview_subq.c.workflow_id,
+            )
+        )
+
+        if status is not None:
+            stmt = stmt.where(Workflow.status == status)
+        if search:
+            search_pattern = f"%{search}%"
+            stmt = stmt.where(
+                or_(
+                    Workflow.title.ilike(search_pattern),
+                    Workflow.description.ilike(search_pattern),
+                )
+            )
+
+        # Apply tag filtering if specified
+        if tags:
+            tag_set = set(tags)
+            stmt = (
+                stmt.join(
+                    WorkflowTagLink,
+                    sa.cast(Workflow.id, sa.UUID) == WorkflowTagLink.workflow_id,
+                )
+                .join(
+                    WorkflowTag,
+                    and_(
+                        WorkflowTag.id == WorkflowTagLink.tag_id,
+                        WorkflowTag.name.in_(tag_set),
+                    ),
+                )
+                .distinct()
+            )
+
+        # Use cursor paginator for workflows
+        paginator = BaseCursorPaginator(self.session)
+
+        # Since we're selecting multiple columns, we need to handle pagination differently
+        # Apply cursor filter manually for complex queries
+        if params.cursor:
+            cursor_data = paginator.decode_cursor(params.cursor)
+            cursor_id = uuid.UUID(cursor_data.id)
+
+            # Extract the sort value (created_at timestamp) from cursor
+            cursor_sort_value = cursor_data.sort_value
+            cursor_has_sort_value = (
+                cursor_data.sort_column == "created_at"
+                and cursor_sort_value is not None
+            )
+
+            if cursor_has_sort_value:
+                # Workflows are sorted by created_at DESC (see line 260)
+                # Descending order logic:
+                if params.reverse:
+                    # Going backward: get records after cursor in sort order
+                    stmt = stmt.where(
+                        sa.or_(
+                            Workflow.created_at > cursor_sort_value,
+                            sa.and_(
+                                Workflow.created_at == cursor_sort_value,
+                                Workflow.id > cursor_id,
+                            ),
+                        )
+                    )
+                else:
+                    # Going forward: get records before cursor in sort order
+                    stmt = stmt.where(
+                        sa.or_(
+                            Workflow.created_at < cursor_sort_value,
+                            sa.and_(
+                                Workflow.created_at == cursor_sort_value,
+                                Workflow.id < cursor_id,
+                            ),
+                        )
+                    )
+            else:
+                # Fallback for old-format cursors or cursors without sort value
+                # Use ID-only filtering to maintain backward compatibility
+                if params.reverse:
+                    stmt = stmt.where(Workflow.id > cursor_id)
+                else:
+                    stmt = stmt.where(Workflow.id < cursor_id)
+
+        # Apply ordering
+        if params.reverse:
+            stmt = stmt.order_by(Workflow.created_at.asc(), Workflow.id.asc())
+        else:
+            stmt = stmt.order_by(Workflow.created_at.desc(), Workflow.id.desc())
+
+        # Fetch limit + 1 to determine if there are more items
+        stmt = stmt.limit(params.limit + 1)
+
+        # Add eager loading for tags since they're accessed in the router
+        stmt = stmt.options(selectinload(Workflow.tags))
+
+        results = await self.session.execute(stmt)
+        raw_items = list(results.all())
+
+        # Check if there are more items
+        has_more = len(raw_items) > params.limit
+        if has_more:
+            raw_items = raw_items[: params.limit]
+
+        # Process results into the expected format
+        items = []
+        for (
+            workflow,
+            defn_id,
+            defn_version,
+            defn_created,
+            webhook_active,
+            case_trigger_event_types,
+            online_schedule_count,
+            schedule_cron,
+            schedule_every,
+        ) in raw_items:
+            if all((defn_id, defn_version, defn_created)):
+                latest_defn = WorkflowDefinitionMinimal(
+                    id=defn_id,
+                    version=defn_version,
+                    created_at=defn_created,
+                )
+            else:
+                latest_defn = None
+            trigger_summary = build_workflow_trigger_summary(
+                online_schedule_count=online_schedule_count,
+                schedule_cron=schedule_cron,
+                schedule_every=schedule_every,
+                webhook_active=webhook_active,
+                case_trigger_event_types=case_trigger_event_types,
+            )
+            items.append((workflow, latest_defn, trigger_summary))
+
+        # Generate cursors
+        next_cursor = None
+        prev_cursor = None
+
+        if items:
+            if has_more:
+                last_workflow = items[-1][0]  # Get the workflow from the tuple
+                next_cursor = paginator.encode_cursor(
+                    last_workflow.id,
+                    sort_column="created_at",
+                    sort_value=last_workflow.created_at,
+                )
+
+            if params.cursor:
+                first_workflow = items[0][0]  # Get the workflow from the tuple
+                prev_cursor = paginator.encode_cursor(
+                    first_workflow.id,
+                    sort_column="created_at",
+                    sort_value=first_workflow.created_at,
+                )
+
+        # If we were doing reverse pagination, swap the cursors and reverse items
+        if params.reverse:
+            items = list(reversed(items))
+            next_cursor, prev_cursor = prev_cursor, next_cursor
+
+        return CursorPaginatedResponse(
+            items=items,
+            next_cursor=next_cursor,
+            prev_cursor=prev_cursor,
+            has_more=has_more,
+            has_previous=params.cursor is not None,
+        )
+
+    async def get_workflow(
+        self, workflow_id: WorkflowID, *, for_update: bool = False
+    ) -> Workflow | None:
+        workflow_uuid = WorkflowUUID.new(workflow_id)
+        statement = (
+            select(Workflow)
+            .where(
+                Workflow.workspace_id == self.workspace_id,
+                Workflow.id == workflow_uuid,
+            )
+            .options(
+                selectinload(Workflow.actions),
+                selectinload(Workflow.webhook).options(selectinload(Webhook.api_key)),
+                selectinload(Workflow.case_trigger),
+                selectinload(Workflow.schedules),
+            )
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await self.session.execute(statement)
+        workflow = result.scalar_one_or_none()
+        if workflow:
+            commit = not for_update
+            await self._ensure_workflow_system_resources(workflow, commit=commit)
+            await self._reconcile_graph_object_with_actions(workflow, commit=commit)
+        return workflow
+
+    async def _ensure_workflow_system_resources(
+        self, workflow: Workflow, *, commit: bool = True
+    ) -> bool:
+        """Create missing default webhook/case trigger rows for legacy workflows."""
+
+        changed = False
+
+        if workflow.webhook is None:
+            webhook = Webhook(workspace_id=self.workspace_id)
+            webhook.workflow = workflow
+            workflow.webhook = webhook
+            self.session.add(webhook)
+            changed = True
+
+        if workflow.case_trigger is None:
+            await CaseTriggersService(
+                session=self.session, role=self.role
+            )._ensure_case_trigger_exists(WorkflowUUID.new(workflow.id), commit=False)
+            changed = True
+
+        if changed:
+            if commit:
+                await self.session.commit()
+            else:
+                await self.session.flush()
+            await self.session.refresh(workflow, ["webhook", "case_trigger"])
+
+        return changed
+
+    async def _reconcile_graph_object_with_actions(
+        self, workflow: Workflow, *, commit: bool = True
+    ) -> bool:
+        """Remove stale upstream edge references from actions.
+
+        The graph layout is stored in action.upstream_edges and workflow trigger
+        coordinates. When actions are deleted out-of-band (e.g. manual DB edits),
+        their IDs may remain in upstream_edges of other actions. This method
+        normalizes the edge lists by removing references to non-existent actions
+        and invalid trigger IDs.
+
+        Returns:
+            bool: True if any changes were persisted, False otherwise.
+        """
+
+        await self.session.refresh(workflow, ["actions"])
+
+        if not workflow.actions:
+            return False
+
+        valid_action_ids = {str(action.id) for action in workflow.actions}
+        trigger_id = f"trigger-{workflow.id}"
+        changed = False
+
+        for action in workflow.actions:
+            edges = action.upstream_edges or []
+            filtered_edges: list[dict[str, Any]] = []
+
+            for edge in edges:
+                source_id = str(edge.get("source_id", ""))
+                source_type = edge.get("source_type", "udf")
+
+                if source_type == "trigger":
+                    if source_id != trigger_id:
+                        changed = True
+                        continue
+                elif source_type == "udf":
+                    if source_id not in valid_action_ids:
+                        changed = True
+                        continue
+                else:
+                    changed = True
+                    continue
+
+                filtered_edges.append(edge)
+
+            if filtered_edges != edges:
+                action.upstream_edges = filtered_edges
+                self.session.add(action)
+
+        if changed:
+            if commit:
+                await self.session.commit()
+            else:
+                await self.session.flush()
+            await self.session.refresh(workflow, ["actions"])
+
+        return changed
+
+    async def resolve_workflow_alias(
+        self, alias: str, *, use_committed: bool = True
+    ) -> WorkflowID | None:
+        """Resolve a workflow alias to a workflow ID.
+
+        Args:
+            alias: The workflow alias to resolve.
+            use_committed: If True, resolve from committed WorkflowDefinition aliases.
+                           If False, resolve from draft Workflow aliases (for draft executions).
+        """
+        if use_committed:
+            # For published executions: resolve from the current committed definition.
+            statement = (
+                select(WorkflowDefinition.workflow_id)
+                .join(
+                    Workflow,
+                    and_(
+                        Workflow.id == WorkflowDefinition.workflow_id,
+                        Workflow.version == WorkflowDefinition.version,
+                    ),
+                )
+                .where(
+                    WorkflowDefinition.workspace_id == self.workspace_id,
+                    WorkflowDefinition.alias == alias,
+                )
+                .order_by(
+                    WorkflowDefinition.created_at.desc(),
+                    WorkflowDefinition.workflow_id.desc(),
+                )
+                .limit(1)
+            )
+            result = await self.session.execute(statement)
+            if res := result.scalar_one_or_none():
+                return WorkflowUUID.new(res)
+
+            # Legacy fallback for workflows without a current version pointer.
+            statement = (
+                select(WorkflowDefinition.workflow_id)
+                .join(Workflow, Workflow.id == WorkflowDefinition.workflow_id)
+                .where(
+                    WorkflowDefinition.workspace_id == self.workspace_id,
+                    Workflow.workspace_id == self.workspace_id,
+                    Workflow.version.is_(None),
+                    WorkflowDefinition.alias == alias,
+                )
+                .order_by(WorkflowDefinition.version.desc())
+                .limit(1)
+            )
+        else:
+            # For draft executions: resolve from draft Workflow table
+            statement = select(Workflow.id).where(
+                Workflow.workspace_id == self.workspace_id,
+                Workflow.alias == alias,
+            )
+        result = await self.session.execute(statement)
+        res = result.scalar_one_or_none()
+        return WorkflowUUID.new(res) if res else None
+
+    @require_scope("workflow:update")
+    async def update_workflow(
+        self, workflow_id: WorkflowID, params: WorkflowUpdate
+    ) -> Workflow:
+        workflow_uuid = WorkflowUUID.new(workflow_id)
+        statement = select(Workflow).where(
+            Workflow.workspace_id == self.workspace_id,
+            Workflow.id == workflow_uuid,
+        )
+        result = await self.session.execute(statement)
+        workflow = result.scalar_one()
+        set_fields = params.model_dump(exclude_unset=True)
+        if "object" in set_fields:
+            graph = RFGraph.model_validate(set_fields["object"])
+            normalized_graph = graph.normalize_action_ids()
+            set_fields["object"] = normalized_graph.model_dump(
+                by_alias=True, mode="json"
+            )
+
+        for key, value in set_fields.items():
+            # Safe because params has been validated
+            setattr(workflow, key, value)
+        self.session.add(workflow)
+        await self.session.commit()
+        await self.session.refresh(workflow)
+        return workflow
+
+    @require_scope("workflow:delete")
+    @audit_log(resource_type="workflow", action="delete")
+    async def delete_workflow(self, workflow_id: WorkflowID) -> None:
+        """Delete a workflow and clean up associated resources.
+
+        This method ensures that Temporal schedules are properly deleted
+        before the database cascade deletion occurs.
+        """
+        workflow_uuid = WorkflowUUID.new(workflow_id)
+        statement = select(Workflow).where(
+            Workflow.workspace_id == self.workspace_id,
+            Workflow.id == workflow_uuid,
+        )
+        result = await self.session.execute(statement)
+        workflow = result.scalar_one()
+
+        # Clean up Temporal schedules before cascade deletion
+        # This prevents orphaned schedules in Temporal
+        schedule_service = WorkflowSchedulesService(self.session, role=self.role)
+        schedules = await schedule_service.list_schedules(workflow_uuid)
+
+        for schedule in schedules:
+            try:
+                await bridge.delete_schedule(schedule.id)
+                self.logger.info(
+                    "Deleted Temporal schedule during workflow cleanup",
+                    schedule_id=schedule.id,
+                    workflow_id=workflow_uuid,
+                )
+            except Exception as e:
+                # Log but don't fail the entire workflow deletion
+                self.logger.warning(
+                    "Failed to delete Temporal schedule during workflow cleanup",
+                    schedule_id=schedule.id,
+                    workflow_id=workflow_uuid,
+                    error=str(e),
+                )
+
+        # Now delete the workflow (cascade will handle database schedule cleanup)
+        await self.session.delete(workflow)
+        await self.session.commit()
+
+    @require_scope("workflow:create")
+    @audit_log(resource_type="workflow", action="create")
+    async def create_workflow(self, params: WorkflowCreate) -> Workflow:
+        """Create a new workflow."""
+        now = datetime.now().strftime("%b %d, %Y, %H:%M:%S")
+        title = params.title or now
+        description = params.description or f"New workflow created {now}"
+
+        # registry_lock will be resolved when workflow is committed with actions
+        workflow = Workflow(
+            title=title,
+            description=description,
+            workspace_id=self.workspace_id,
+        )
+        # When we create a workflow, we automatically create a webhook
+        # Add the Workflow to the session first to generate an ID
+        self.session.add(workflow)
+        await self.session.flush()  # Flush to generate workflow.id
+        await self.session.refresh(workflow)
+
+        # Create and associate Webhook with the Workflow
+        webhook = Webhook(
+            workspace_id=self.workspace_id,
+            # workflow_id=workflow.id,
+        )
+        webhook.workflow = workflow
+        self.session.add(webhook)
+        workflow.webhook = webhook
+
+        case_trigger = CaseTrigger(
+            workspace_id=self.workspace_id,
+            workflow_id=workflow.id,
+            status="offline",
+            event_types=[],
+            tag_filters=[],
+        )
+        case_trigger.workflow = workflow
+        self.session.add(case_trigger)
+        workflow.case_trigger = case_trigger
+
+        await self.session.commit()
+        await self.session.refresh(workflow)
+        return workflow
+
+    @require_scope("workflow:create")
+    async def create_workflow_from_dsl(
+        self, dsl_data: dict[str, Any], *, skip_secret_validation: bool = False
+    ) -> WorkflowDSLCreateResponse:
+        """Create a new workflow from a Tracecat DSL data object."""
+
+        construction_errors: list[DSLValidationResult] = []
+        dsl: DSLInput | None = None
+        try:
+            # Convert the workflow into a WorkflowDefinition
+            # XXX: When we commit from the workflow, we have action IDs
+            dsl = DSLInput.model_validate(dsl_data)
+            self.logger.info("Creating workflow from database")
+        except TracecatValidationError as e:
+            self.logger.info("Custom validation error", error=e)
+            construction_errors.append(
+                DSLValidationResult(status="error", msg=str(e), detail=e.detail)
+            )
+        except ValidationError as e:
+            self.logger.info("Pydantic validation error", error=e)
+            construction_errors.append(
+                DSLValidationResult(
+                    status="error",
+                    msg=str(e),
+                    detail=ValidationDetail.list_from_pydantic(e),
+                )
+            )
+        if construction_errors:
+            return WorkflowDSLCreateResponse(
+                errors=[ValidationResult.new(e) for e in construction_errors]
+            )
+
+        if dsl is None:
+            raise ValueError("dsl should be defined if no construction errors")
+        if not skip_secret_validation:
+            if val_errors := await validate_dsl(
+                session=self.session, dsl=dsl, role=self.role
+            ):
+                self.logger.info("Validation errors", errors=val_errors)
+                return WorkflowDSLCreateResponse(errors=list(val_errors))
+
+        self.logger.debug("Creating workflow from DSL", dsl=dsl)
+        try:
+            workflow = await self.create_db_workflow_from_dsl(dsl)
+            return WorkflowDSLCreateResponse(workflow=workflow)
+        except Exception as e:
+            # Rollback the transaction on error
+            self.logger.error(f"Error creating workflow: {e}")
+            await self.session.rollback()
+            raise e
+
+    async def build_dsl_from_workflow(self, workflow: Workflow) -> DSLInput:
+        """Build a DSLInput from a Workflow."""
+
+        # XXX: Invoking workflow.actions instantiates the actions relationship
+        actions = workflow.actions
+        # If it still falsy, raise a user facing error
+        if not actions:
+            raise TracecatValidationError(
+                "Workflow has no actions. Please add an action to the workflow before saving."
+            )
+        action_statements = build_action_statements_from_actions(actions)
+        return DSLInput(
+            title=workflow.title,
+            description=workflow.description,
+            entrypoint=DSLEntrypoint(expects=workflow.expects),
+            actions=action_statements,
+            config=DSLConfig(**workflow.config),
+            returns=workflow.returns,
+            error_handler=workflow.error_handler,
+        )
+
+    @require_scope("workflow:update")
+    async def restore_workflow_definition(
+        self, workflow: Workflow, definition: WorkflowDefinition
+    ) -> Workflow:
+        """Restore a workflow definition as the current mutable draft."""
+        if definition.workflow_id != workflow.id:
+            raise TracecatValidationError(
+                "Workflow definition does not belong to the selected workflow"
+            )
+
+        # Re-read the row under FOR UPDATE so concurrent graph mutations
+        # cannot race the action rewrite below. The expected `graph_version`
+        # is whatever the caller observed; if the DB has moved on, abort.
+        expected_graph_version = workflow.graph_version
+        locked = await self.session.execute(
+            select(Workflow.graph_version)
+            .where(
+                Workflow.workspace_id == self.workspace_id,
+                Workflow.id == workflow.id,
+            )
+            .with_for_update()
+        )
+        current_graph_version = locked.scalar_one_or_none()
+        if current_graph_version is None:
+            raise TracecatValidationError("Workflow no longer exists")
+        if current_graph_version != expected_graph_version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "This workflow has been edited since you opened it. Refresh to see the latest version before restoring.",
+                    "current_version": current_graph_version,
+                },
+            )
+
+        dsl = DSLInput.model_validate(definition.content)
+        for field, value in self._workflow_fields_from_dsl(dsl).items():
+            setattr(workflow, field, value)
+        workflow.alias = definition.alias
+        workflow.version = definition.version
+        workflow.registry_lock = definition.registry_lock
+        workflow.graph_version += 1
+
+        await self.session.execute(
+            sa.delete(Action).where(
+                Action.workspace_id == self.workspace_id,
+                Action.workflow_id == workflow.id,
+            )
+        )
+        await self.create_actions_from_dsl(dsl, workflow.id)
+        await self.session.flush()
+        await self.session.refresh(workflow, ["actions"])
+
+        layout = auto_generate_layout(
+            [
+                WorkflowActionLayoutInput(
+                    ref=action.ref, depends_on=list(action.depends_on)
+                )
+                for action in dsl.actions
+            ]
+        )
+        ref_to_action_id = {action.ref: str(action.id) for action in workflow.actions}
+        positions = [
+            {
+                "action_id": ref_to_action_id[item["ref"]],
+                "x": item["x"],
+                "y": item["y"],
+            }
+            for item in layout["actions"]
+            if item["ref"] in ref_to_action_id
+        ]
+        graph_service = WorkflowGraphService(self.session, role=self.role)
+        await graph_service.apply_operations(
+            workflow_id=WorkflowUUID.new(workflow.id),
+            base_version=workflow.graph_version,
+            operations=[
+                GraphOperation(
+                    type=GraphOperationType.MOVE_NODES,
+                    payload={"positions": positions},
+                ),
+                GraphOperation(
+                    type=GraphOperationType.UPDATE_TRIGGER_POSITION,
+                    payload={
+                        "x": layout["trigger"]["x"],
+                        "y": layout["trigger"]["y"],
+                    },
+                ),
+            ],
+        )
+        await self.session.refresh(workflow)
+        await self.session.refresh(workflow, ["actions", "webhook", "schedules"])
+        return workflow
+
+    @require_scope("workflow:create")
+    async def create_workflow_from_external_definition(
+        self,
+        import_data: dict[str, Any],
+        *,
+        use_workflow_id: bool = False,
+        trigger_position: tuple[float, float] | None = None,
+        viewport: tuple[float, float, float] | None = None,
+        action_positions: dict[str, tuple[float, float]] | None = None,
+    ) -> Workflow:
+        """Import an external workflow definition into the current workspace.
+
+        Optionally validate the workflow definition before importing. (Default: False)
+        """
+
+        external_defn = ExternalWorkflowDefinition.model_validate(import_data)
+        # NOTE: We do not support adding invalid workflows
+
+        dsl = external_defn.definition
+        imported_trigger_position, imported_viewport, imported_action_positions = (
+            external_defn.extract_layout_positions()
+        )
+        trigger_position = (
+            trigger_position
+            if trigger_position is not None
+            else imported_trigger_position
+        )
+        viewport = viewport if viewport is not None else imported_viewport
+        action_positions = (
+            action_positions
+            if action_positions is not None
+            else imported_action_positions
+        )
+        self.logger.trace("Constructed DSL from external definition", dsl=dsl)
+        # We need to be able to control:
+        # 1. The workspace the workflow is imported into
+        # 2. The owner of the workflow
+        # 3. The ID of the workflow
+
+        workflow = await self.create_db_workflow_from_dsl(
+            dsl,
+            workflow_id=external_defn.workflow_id if use_workflow_id else None,
+            created_at=external_defn.created_at,
+            updated_at=external_defn.updated_at,
+            trigger_position=trigger_position,
+            viewport=viewport,
+            action_positions=action_positions,
+        )
+        if external_defn.case_trigger is not None and (
+            external_defn.case_trigger.is_configured()
+        ):
+            case_trigger_service = CaseTriggersService(self.session, role=self.role)
+            await case_trigger_service.upsert_case_trigger(
+                WorkflowUUID.new(workflow.id),
+                external_defn.case_trigger,
+                create_missing_tags=True,
+                commit=False,
+            )
+            await self.session.commit()
+        return workflow
+
+    @require_scope("workflow:create")
+    async def create_db_workflow_from_dsl(
+        self,
+        dsl: DSLInput,
+        *,
+        workflow_id: WorkflowID | None = None,
+        workflow_alias: str | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+        trigger_position: tuple[float, float] | None = None,
+        viewport: tuple[float, float, float] | None = None,
+        action_positions: dict[str, tuple[float, float]] | None = None,
+        commit: bool = True,
+    ) -> Workflow:
+        """Create a new workflow and associated actions in the database from a DSLInput."""
+        self.logger.info("Creating workflow from DSL", dsl=dsl)
+
+        # Resolve registry_lock with action bindings from the DSL
+        action_names = {action.action for action in dsl.actions}
+        lock_service = RegistryLockService(self.session, self.role)
+        resolved_lock = await lock_service.resolve_lock_with_bindings(action_names)
+        registry_lock = resolved_lock.model_dump()
+
+        workflow_kwargs = {
+            "workspace_id": self.workspace_id,
+            "registry_lock": registry_lock,
+            **self._workflow_fields_from_dsl(dsl),
+        }
+        if workflow_id:
+            workflow_kwargs["id"] = workflow_id
+        if created_at:
+            workflow_kwargs["created_at"] = created_at
+        if updated_at:
+            workflow_kwargs["updated_at"] = updated_at
+        if workflow_alias:
+            workflow_kwargs["alias"] = workflow_alias
+        if trigger_position is not None:
+            workflow_kwargs["trigger_position_x"] = trigger_position[0]
+            workflow_kwargs["trigger_position_y"] = trigger_position[1]
+        if viewport is not None:
+            workflow_kwargs["viewport_x"] = viewport[0]
+            workflow_kwargs["viewport_y"] = viewport[1]
+            workflow_kwargs["viewport_zoom"] = viewport[2]
+        workflow = Workflow(**workflow_kwargs)
+
+        # Add the Workflow to the session first and flush to ensure ID is persisted
+        self.session.add(workflow)
+        await self.session.flush()
+        self.logger.debug("Workflow created", workflow_id=workflow.id)
+
+        # Create and associate Webhook with the Workflow
+        webhook = Webhook(
+            workspace_id=self.workspace_id,
+            workflow_id=workflow.id,
+        )
+        self.session.add(webhook)
+        workflow.webhook = webhook
+
+        case_trigger = CaseTrigger(
+            workspace_id=self.workspace_id,
+            workflow_id=workflow.id,
+            status="offline",
+            event_types=[],
+            tag_filters=[],
+        )
+        self.session.add(case_trigger)
+        workflow.case_trigger = case_trigger
+
+        # Create actions from DSL (actions have workflow_id set, relationship managed by FK)
+        await self.create_actions_from_dsl(dsl, workflow.id, action_positions)
+
+        # Commit the transaction
+        if commit:
+            await self.session.commit()
+            await self.session.refresh(workflow)
+        return workflow
+
+    async def create_actions_from_dsl(
+        self,
+        dsl: DSLInput,
+        workflow_id: uuid.UUID,
+        action_positions: dict[str, tuple[float, float]] | None = None,
+    ) -> list[Action]:
+        """Create Action entities from DSL and add to session.
+
+        Builds upstream_edges from depends_on relationships.
+        For root actions (no depends_on), creates trigger->action edge.
+        """
+        # Create all actions and build ref->action mapping
+        actions: list[Action] = []
+        ref_to_action: dict[str, Action] = {}
+        for act_stmt in dsl.actions:
+            control_flow = ActionControlFlow(
+                run_if=act_stmt.run_if,
+                for_each=act_stmt.for_each,
+                retry_policy=act_stmt.retry_policy,
+                start_delay=act_stmt.start_delay,
+                wait_until=act_stmt.wait_until,
+                join_strategy=act_stmt.join_strategy,
+                mask_output=act_stmt.mask_output,
+            )
+            pos = (action_positions or {}).get(act_stmt.ref)
+            new_action = Action(
+                id=uuid.uuid4(),
+                workspace_id=self.workspace_id,
+                workflow_id=workflow_id,
+                type=act_stmt.action,
+                inputs=yaml.dump(act_stmt.args),
+                title=act_stmt.title,
+                description=act_stmt.description,
+                control_flow=control_flow.model_dump(),
+                position_x=pos[0] if pos else 0.0,
+                position_y=pos[1] if pos else 0.0,
+            )
+            actions.append(new_action)
+            ref_to_action[act_stmt.ref] = new_action
+
+        # Build upstream_edges (separate loop handles forward references in depends_on)
+        trigger_id = f"trigger-{workflow_id}"
+        for act_stmt in dsl.actions:
+            action = ref_to_action[act_stmt.ref]
+            upstream_edges: list[ActionEdge] = []
+
+            if act_stmt.depends_on:
+                for dep_ref in act_stmt.depends_on:
+                    src_ref, edge_type = edge_components_from_dep(dep_ref)
+                    if dep_action := ref_to_action.get(src_ref):
+                        upstream_edges.append(
+                            ActionEdge(
+                                source_id=str(dep_action.id),
+                                source_type="udf",
+                                source_handle=edge_type.value,
+                            )
+                        )
+            else:
+                upstream_edges.append(
+                    ActionEdge(
+                        source_id=trigger_id,
+                        source_type="trigger",
+                    )
+                )
+            action.upstream_edges = cast(list[dict[str, Any]], upstream_edges)
+
+        for action in actions:
+            self.session.add(action)
+        await self.session.flush()
+        return actions
+
+    @staticmethod
+    @activity.defn
+    async def resolve_workflow_alias_activity(
+        ctx: RunContext,
+        operand: ExecutionContext,
+        input: ResolveWorkflowAliasActivityInputs,
+    ) -> WorkflowID | None:
+        # Resolve expr
+        # Materialize any StoredObjects in operand before evaluation
+        materialized = await materialize_context(operand)
+        token = ctx_logical_time.set(ctx.logical_time)
+        try:
+            evaluated_alias = eval_templated_object(
+                input.workflow_alias, operand=materialized
+            )
+        finally:
+            ctx_logical_time.reset(token)
+        if not isinstance(evaluated_alias, str):
+            raise TypeError(
+                f"Workflow alias expression must evaluate to a string. Got {type(evaluated_alias).__name__}"
+            )
+        async with WorkflowsManagementService.with_session(input.role) as service:
+            return await service.resolve_workflow_alias(
+                evaluated_alias, use_committed=input.use_committed
+            )
+
+    @staticmethod
+    @activity.defn
+    async def get_error_handler_workflow_id(
+        input: GetErrorHandlerWorkflowIDActivityInputs,
+    ) -> WorkflowID | None:
+        args = input.args
+        id_or_alias = None
+        if args.dsl:
+            # 1. If a DSL was provided, we must use its error handler
+            if not args.dsl.error_handler:
+                activity.logger.info("DSL has no error handler")
+                return None
+            id_or_alias = args.dsl.error_handler
+        else:
+            # 2. Otherwise, get error handler from the committed definition
+            # This ensures schedules use the committed error handler
+            async with WorkflowDefinitionsService.with_session(
+                role=args.role
+            ) as defn_service:
+                defn = await defn_service.get_definition_by_workflow_id(args.wf_id)
+            if not defn:
+                activity.logger.info("No committed definition found")
+                return None
+            dsl = defn.content
+            if not dsl or not dsl.get("error_handler"):
+                activity.logger.info("Committed definition has no error handler")
+                return None
+            id_or_alias = dsl["error_handler"]
+
+        # 3. Convert the error handler to an ID
+        if re.match(LEGACY_WF_ID_PATTERN, id_or_alias):
+            # TODO: Legacy workflow ID for backwards compatibility. Slowly deprecate.
+            handler_wf_id = WorkflowUUID.from_legacy(id_or_alias)
+        elif re.match(WF_ID_SHORT_PATTERN, id_or_alias):
+            # Short workflow ID
+            handler_wf_id = WorkflowUUID.new(id_or_alias)
+        else:
+            use_committed = args.execution_type == ExecutionType.PUBLISHED
+            async with WorkflowsManagementService.with_session(
+                role=args.role
+            ) as service:
+                handler_wf_id = await service.resolve_workflow_alias(
+                    id_or_alias, use_committed=use_committed
+                )
+            if not handler_wf_id:
+                raise ApplicationError(
+                    f"Couldn't find matching workflow for alias {id_or_alias!r}",
+                    non_retryable=True,
+                    type="WorkflowAliasResolutionError",
+                )
+        return handler_wf_id
