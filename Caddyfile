@@ -1,4 +1,9 @@
+{
+	skip_install_trust
+}
+
 {$BASE_DOMAIN} {
+	tls internal
 	bind {$ADDRESS} # Binds to all available network interfaces if not specified
 
 	# MinIO S3 API proxy for presigned URLs

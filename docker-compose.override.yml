@@ -1,4 +1,8 @@
 services:
+  caddy:
+    ports:
+      - "443:443"
+
   ui:
     build:
       context: ./frontend
