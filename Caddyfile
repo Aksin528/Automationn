@@ -2,8 +2,8 @@
 	skip_install_trust
 }
 
-{$BASE_DOMAIN} {
-	tls internal
+:443 {
+	tls /etc/caddy/certs/server.crt /etc/caddy/certs/server.key
 	bind {$ADDRESS} # Binds to all available network interfaces if not specified
 
 	# MinIO S3 API proxy for presigned URLs

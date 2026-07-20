@@ -296,7 +296,7 @@ function TablesActions() {
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7 bg-white">
+          <Button variant="outline" size="sm" className="h-7">
             <Plus className="mr-1 h-3.5 w-3.5" />
             New table
             <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -351,7 +351,7 @@ function IntegrationsActions() {
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7 bg-white">
+          <Button variant="outline" size="sm" className="h-7">
             <Plus className="mr-1 h-3.5 w-3.5" />
             Add integration
             <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -498,7 +498,7 @@ function AgentsActions() {
         <>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="h-7 bg-white">
+              <Button variant="outline" size="sm" className="h-7">
                 <Plus className="mr-1 h-3.5 w-3.5" />
                 Create new
                 <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -578,7 +578,7 @@ function AddAgentTag({
       <Button
         variant="outline"
         size="sm"
-        className="h-7 bg-white"
+        className="h-7"
         onClick={() => onOpenChange(true)}
       >
         <Plus className="mr-1 h-3.5 w-3.5" />
@@ -656,7 +656,7 @@ function CasesActions() {
           <Button
             variant="outline"
             size="sm"
-            className="h-7 bg-white"
+            className="h-7"
             onClick={() => setDialogOpen(true)}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
@@ -1563,7 +1563,7 @@ function CredentialsActions() {
       <Button
         variant="outline"
         size="sm"
-        className="h-7 bg-white"
+        className="h-7"
         onClick={() => setDialogOpen(true)}
       >
         <Plus className="mr-1 h-3.5 w-3.5" />
@@ -1591,7 +1591,7 @@ function ServiceAccountsActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7 bg-white"
+      className="h-7"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createServiceAccount", Date.now().toString())
@@ -1620,7 +1620,7 @@ function McpServersActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7 bg-white"
+      className="h-7"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createMcpServer", Date.now().toString())
@@ -1649,7 +1649,7 @@ function McpAccessActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7 bg-white"
+      className="h-7"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createMcpToken", Date.now().toString())
@@ -1668,7 +1668,7 @@ function VariablesActions() {
   return (
     <NewVariableDialog>
       <NewVariableDialogTrigger asChild>
-        <Button variant="outline" size="sm" className="h-7 bg-white">
+        <Button variant="outline" size="sm" className="h-7">
           <Plus className="mr-1 h-3.5 w-3.5" />
           Add variable
         </Button>

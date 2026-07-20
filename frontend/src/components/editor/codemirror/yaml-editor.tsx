@@ -22,6 +22,7 @@ import {
 import { tags } from "@lezer/highlight"
 import CodeMirror from "@uiw/react-codemirror"
 import { AlertTriangle, Check } from "lucide-react"
+import { useTheme } from "next-themes"
 import React, { useCallback, useMemo, useRef, useState } from "react"
 import { type Control, type FieldValues, useController } from "react-hook-form"
 import YAML from "yaml"
@@ -67,6 +68,7 @@ export const YamlStyledEditor = React.forwardRef<
   })
   const workspaceId = useWorkspaceId()
   const { workflow } = useWorkflow()
+  const { resolvedTheme } = useTheme()
   const [hasErrors, setHasErrors] = useState(false)
   const [saveState, setSaveState] = useState<SaveState>(SaveState.IDLE)
   const [validationErrors, setValidationErrors] = useState<string[]>([])
@@ -334,7 +336,7 @@ export const YamlStyledEditor = React.forwardRef<
           height="auto"
           extensions={allExtensions}
           onChange={handleChange}
-          theme="light"
+          theme={resolvedTheme === "dark" ? "dark" : "light"}
           basicSetup={{
             foldGutter: true,
             dropCursor: true,
@@ -766,6 +768,7 @@ export function YamlViewOnlyEditor({
   className?: string
 }) {
   const workspaceId = useWorkspaceId()
+  const { resolvedTheme } = useTheme()
 
   const textValue = React.useMemo(() => {
     if (value == null) return ""
@@ -817,7 +820,7 @@ export function YamlViewOnlyEditor({
           value={textValue}
           height="auto"
           extensions={extensions}
-          theme="light"
+          theme={resolvedTheme === "dark" ? "dark" : "light"}
           editable={false}
           basicSetup={{
             foldGutter: true,

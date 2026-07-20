@@ -1,5 +1,5 @@
-"""SOC MCP Actions Server — destructive/state-changing Cortex XDR response
-actions (isolate, quarantine, blocklist, etc.) for AI agents.
+"""SOC MCP Actions Server — destructive/state-changing Cortex XDR and
+Trellix DLP response actions for AI agents.
 
 Kept as a separate MCP server (separate FastMCP instance, separate port) from
 server.py's read-only tools so it can be registered as its own Tracecat MCP
@@ -9,13 +9,15 @@ module docstring for the full rationale.
 
 from fastmcp import FastMCP
 from tools.cortex_actions import register_cortex_action_tools
+from tools.trellix_actions import register_trellix_action_tools
 
 mcp = FastMCP(
     name="soc-mcp-actions",
-    instructions="SOC response-action MCP server. Executes real, state-changing containment actions (isolate, quarantine, blocklist) on Cortex XDR. Only call these after explicit human approval.",
+    instructions="SOC response-action MCP server. Executes real, state-changing actions (Cortex XDR containment, Trellix DLP incident status/severity/comment updates) on live systems. Only call these after explicit human approval.",
 )
 
 register_cortex_action_tools(mcp)
+register_trellix_action_tools(mcp)
 
 if __name__ == "__main__":
     import os

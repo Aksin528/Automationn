@@ -349,7 +349,7 @@ export default React.memo(function TriggerNode({
                   </button>
                 </HoverCardTrigger>
                 <HoverCardContent
-                  className="w-[300px] bg-white p-3 font-mono text-xs tracking-tight text-foreground"
+                  className="w-[300px] p-3 font-mono text-xs tracking-tight"
                   side="top"
                   align="start"
                   sideOffset={10}

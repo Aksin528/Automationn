@@ -7,10 +7,12 @@ import {
   LockIcon,
   LogOut,
   Settings2,
+  SunMoon,
   UserIcon,
   WorkflowIcon,
 } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
+import { AppearanceSettings } from "@/components/settings/appearance-settings"
 import { ProfileSettings } from "@/components/settings/profile-settings"
 import {
   type SettingsSection,
@@ -195,6 +197,13 @@ function SettingsModalContent() {
                 activeSection={displayedSection}
                 onSelect={setActiveSection}
               />
+              <NavItem
+                icon={SunMoon}
+                label="Appearance"
+                section="appearance"
+                activeSection={displayedSection}
+                onSelect={setActiveSection}
+              />
 
               {showWorkspaceNav && (
                 <>
@@ -264,6 +273,8 @@ function SettingsModalContent() {
           <div className="flex min-w-0 flex-1 flex-col gap-6 overflow-x-hidden overflow-y-auto p-8">
             {displayedSection === "profile" ? (
               <ProfileSettings />
+            ) : displayedSection === "appearance" ? (
+              <AppearanceSettings />
             ) : workspaceId ? (
               <WorkspaceSettingsContainer
                 workspaceId={workspaceId}

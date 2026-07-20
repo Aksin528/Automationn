@@ -33,6 +33,7 @@ import { v4 as uuid4 } from "uuid"
 import "@xyflow/react/dist/style.css"
 
 import { MoveHorizontalIcon, MoveVerticalIcon, PlusIcon } from "lucide-react"
+import { useTheme } from "next-themes"
 import type {
   GraphOperation,
   GraphResponse,
@@ -157,6 +158,7 @@ export const WorkflowCanvas = React.forwardRef<
   const activeFitViewOptions = embedded
     ? embeddedFitViewOptions
     : fitViewOptions
+  const { resolvedTheme } = useTheme()
   const containerRef = useRef<HTMLDivElement>(null)
   const connectingNodeId = useRef<string | null>(null)
   const connectingHandleId = useRef<string | null>(null)
@@ -1033,8 +1035,9 @@ export const WorkflowCanvas = React.forwardRef<
         panOnScroll
         connectionLineType={ConnectionLineType.SmoothStep}
         onPaneContextMenu={onPaneContextMenu}
+        colorMode={resolvedTheme === "dark" ? "dark" : "light"}
       >
-        <Background bgColor="#fcfcfc" />
+        <Background />
         <Controls
           className="rounded-sm"
           fitViewOptions={activeFitViewOptions}
