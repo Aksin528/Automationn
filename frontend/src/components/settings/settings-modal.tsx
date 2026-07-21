@@ -170,10 +170,13 @@ function SettingsModalContent() {
   ])
 
   const showWorkspaceNav = !!workspaceId && canAdministerWorkspace
-  const canDisplaySection =
-    activeSection === "profile" || canAdministerWorkspace
+  const isAccountSection =
+    activeSection === "profile" || activeSection === "appearance"
+  const canDisplaySection = isAccountSection || canAdministerWorkspace
   const displayedSection =
-    showWorkspaceNav && canDisplaySection ? activeSection : "profile"
+    isAccountSection || (showWorkspaceNav && canDisplaySection)
+      ? activeSection
+      : "profile"
   const showSyncNav = hasEntitlement("git_sync")
 
   return (

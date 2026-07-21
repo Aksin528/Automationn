@@ -37,7 +37,6 @@ function createTemplateHighlightDecorations(state: EditorState): DecorationSet {
       attributes: {
         style: `
           background-color: rgb(59 130 246 / 0.1);
-          color: rgb(55 65 81 / 0.9);
           border-radius: 0.25rem;
           padding: 0.05rem 0.125rem;
           border: 1px solid rgb(59 130 246 / 0.2);
