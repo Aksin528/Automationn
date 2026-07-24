@@ -1,4 +1,5 @@
-"""SOC MCP Server — Splunk, Wazuh, Cortex XDR, Trellix DLP, Check Point Mail Security read-only tools for AI agents.
+"""SOC MCP Server — Splunk, Wazuh, Cortex XDR, Trellix DLP, Check Point Mail
+Security, Proxmox Mail Gateway read-only tools for AI agents.
 
 Investigative/read-only tools only. Destructive Cortex response actions
 (isolate, quarantine, blocklist, etc.) live in server_actions.py as a
@@ -14,6 +15,7 @@ from tools.ip_geolocation import register_ip_geolocation_tools
 from tools.cortex_read import register_cortex_read_tools
 from tools.trellix_read import register_trellix_read_tools
 from tools.checkpoint_read import register_checkpoint_read_tools
+from tools.pmg_read import register_pmg_read_tools
 
 # Gelecekde elave edilecek:
 # from tools.wazuh import register_wazuh_tools
@@ -28,6 +30,7 @@ register_ip_geolocation_tools(mcp)
 register_cortex_read_tools(mcp)
 register_trellix_read_tools(mcp)
 register_checkpoint_read_tools(mcp)
+register_pmg_read_tools(mcp)
 # register_wazuh_tools(mcp)
 
 if __name__ == "__main__":

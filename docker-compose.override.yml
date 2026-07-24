@@ -85,6 +85,9 @@ services:
       CHECKPOINT_MGMT_URL: "${CHECKPOINT_MGMT_URL}"
       CHECKPOINT_USER: "${CHECKPOINT_USER}"
       CHECKPOINT_PASS: "${CHECKPOINT_PASS}"
+      PMG_URL: "${PMG_URL}"
+      PMG_USER: "${PMG_USER}"
+      PMG_PASS: "${PMG_PASS}"
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "8100"
     ports:
