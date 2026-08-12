@@ -42,20 +42,17 @@ export function CodeEditor({
   className,
 }: CodeEditorProps) {
   const { resolvedTheme } = useTheme()
-  const codeMirrorTheme = resolvedTheme === "dark" ? "dark" : "light"
   const languageExtension = getLanguageExtension(language)
   const extensions = [
     ...(languageExtension ? [languageExtension] : []),
     ...(wrapLongLines ? [EditorView.lineWrapping] : []),
   ]
-  const { resolvedTheme } = useTheme()
 
   return (
     <ReactCodeMirror
       value={value}
       onChange={onChange}
       extensions={extensions}
-      theme={codeMirrorTheme}
       readOnly={readOnly}
       theme={resolvedTheme === "dark" ? "dark" : "light"}
       className={cn(
