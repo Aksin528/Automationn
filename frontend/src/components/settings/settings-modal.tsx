@@ -6,8 +6,8 @@ import {
   GitBranchIcon,
   LockIcon,
   LogOut,
+  Palette,
   Settings2,
-  SunMoon,
   UserIcon,
   WorkflowIcon,
 } from "lucide-react"
@@ -179,8 +179,26 @@ function SettingsModalContent() {
       : "profile"
   const showSyncNav = hasEntitlement("git_sync")
 
+  function renderSection() {
+    if (displayedSection === "profile") {
+      return <ProfileSettings />
+    }
+    if (displayedSection === "appearance") {
+      return <AppearanceSettings />
+    }
+    if (workspaceId) {
+      return (
+        <WorkspaceSettingsContainer
+          workspaceId={workspaceId}
+          activeSection={displayedSection}
+        />
+      )
+    }
+    return null
+  }
+
   return (
-    <DialogContent className="h-[600px] max-w-[900px] grid-rows-[100%] gap-0 overflow-hidden p-0">
+    <DialogContent className="h-[720px] max-w-[1080px] grid-rows-[100%] gap-0 overflow-hidden p-0">
       <TooltipProvider>
         <DialogTitle className="sr-only">Settings</DialogTitle>
         <DialogDescription className="sr-only">
@@ -201,7 +219,7 @@ function SettingsModalContent() {
                 onSelect={setActiveSection}
               />
               <NavItem
-                icon={SunMoon}
+                icon={Palette}
                 label="Appearance"
                 section="appearance"
                 activeSection={displayedSection}
@@ -274,16 +292,7 @@ function SettingsModalContent() {
 
           {/* Right content panel */}
           <div className="flex min-w-0 flex-1 flex-col gap-6 overflow-x-hidden overflow-y-auto p-8">
-            {displayedSection === "profile" ? (
-              <ProfileSettings />
-            ) : displayedSection === "appearance" ? (
-              <AppearanceSettings />
-            ) : workspaceId ? (
-              <WorkspaceSettingsContainer
-                workspaceId={workspaceId}
-                activeSection={displayedSection}
-              />
-            ) : null}
+            {renderSection()}
           </div>
         </div>
       </TooltipProvider>

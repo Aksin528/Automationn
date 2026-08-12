@@ -1,16 +1,9 @@
 "use client"
 
 import { ThemeProvider as NextThemesProvider } from "next-themes"
+import type { ThemeProviderProps } from "next-themes/dist/types"
 
-/**
- * Applies the user's light/dark/system theme preference to the whole app by
- * toggling the `dark` class on `<html>`. Wrap the root layout's body content
- * with this so every route (including logged-out pages) picks up the theme.
- */
-export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  return (
-    <NextThemesProvider attribute="class" defaultTheme="system" enableSystem>
-      {children}
-    </NextThemesProvider>
-  )
+/** App-wide theme provider backed by next-themes (class-based dark mode). */
+export function ThemeProvider({ children, ...props }: ThemeProviderProps) {
+  return <NextThemesProvider {...props}>{children}</NextThemesProvider>
 }

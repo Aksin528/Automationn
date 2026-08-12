@@ -6,12 +6,14 @@ import {
   ExternalLink,
   Globe2,
   Loader2,
+  MoreHorizontal,
+  PlayCircle,
   Plus,
   Server,
   Trash2,
 } from "lucide-react"
 import React, { useState } from "react"
-import { useFieldArray, useForm } from "react-hook-form"
+import { type Resolver, useFieldArray, useForm } from "react-hook-form"
 import {
   integrationsGetIntegration,
   mcpIntegrationsConnectPlatformMcpCatalog,
@@ -24,22 +26,24 @@ import type {
   MCPIntegrationRead,
   MCPIntegrationUpdate,
   MCPStdioIntegrationCreate,
+  MCPToolSummary,
   PlatformMCPCatalogRead,
 } from "@/client/types.gen"
 import { useScopeCheck } from "@/components/auth/scope-guard"
 import { CodeEditor } from "@/components/editor/codemirror/code-editor"
-import { ProviderIcon } from "@/components/icons"
+import { getMcpProviderIconId, ProviderIcon } from "@/components/icons"
 import {
   ALLOWED_COMMANDS,
   AUTH_TYPES,
+  buildMcpIntegrationFormSchema,
   catalogEntryToFormValues,
   isAllowedCommand,
   MCP_INTEGRATION_FORM_DEFAULTS,
   type MCPIntegrationFormValues,
-  mcpIntegrationFormSchema,
   missingRequiredOAuthClientCredentials,
   normalizeOAuthClientKey,
   SERVER_TYPES,
+  urlTypedStdioEnvKeys,
 } from "@/components/integrations/mcp-integration-schema"
 import {
   Accordion,
@@ -70,6 +74,12 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog"
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
   Form,
   FormControl,
   FormDescription,
@@ -86,6 +96,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { toast } from "@/components/ui/use-toast"
 import { getMcpOAuthConnectErrorDetail } from "@/lib/errors"
@@ -95,7 +106,10 @@ import {
   useDeleteMcpIntegration,
   useGetMcpIntegration,
   useIntegrations,
+  useTestMcpConnectionConfig,
+  useTestMcpIntegrationConnection,
   useUpdateMcpIntegration,
+  useUpdateMcpIntegrationToolPolicies,
 } from "@/lib/hooks"
 import { isMcpProvider } from "@/lib/integrations"
 import { cn } from "@/lib/utils"
@@ -125,9 +139,10 @@ function catalogOptionIdForIntegration(
     }
     if (spec.server_type === "http") {
       return (
-        !integration.server_uri ||
-        !("server_uri" in spec) ||
-        spec.server_uri === integration.server_uri
+        spec.auth_type === integration.auth_type &&
+        (!integration.server_uri ||
+          !("server_uri" in spec) ||
+          spec.server_uri === integration.server_uri)
       )
     }
     return true
@@ -203,8 +218,14 @@ function catalogMcpProviderId(
   return `custom_mcp_${entry.slug}${suffix}`.replace(/[^a-zA-Z0-9_]+/g, "_")
 }
 
-function CatalogEntrySummary({ entry }: { entry: PlatformMCPCatalogRead }) {
-  const providerId = entry.slug.replace(/-/g, "_")
+function CatalogEntrySummary({
+  entry,
+  actions,
+}: {
+  entry: PlatformMCPCatalogRead
+  actions?: React.ReactNode
+}) {
+  const providerId = getMcpProviderIconId(entry.provider_id ?? entry.slug)
   const transports = Array.from(
     new Set(
       (entry.connection_options?.length
@@ -249,7 +270,91 @@ function CatalogEntrySummary({ entry }: { entry: PlatformMCPCatalogRead }) {
           </a>
         ) : null}
       </div>
+      {actions}
     </div>
+  )
+}
+
+type MCPToolPolicyPatch = {
+  enabled?: boolean
+  requires_approval?: boolean
+}
+
+function MCPToolPolicyList({
+  tools,
+  canUpdate,
+  onPolicyChange,
+}: {
+  tools: MCPToolSummary[]
+  canUpdate: boolean
+  onPolicyChange: (tool: MCPToolSummary, patch: MCPToolPolicyPatch) => void
+}) {
+  return (
+    <ul className="divide-y divide-border/50">
+      {tools.map((tool) => {
+        const enabled = tool.enabled !== false
+        const requiresApproval = tool.requires_approval === true
+        const isMissing = tool.status === "missing"
+        const disabled = !canUpdate || isMissing
+
+        return (
+          <li
+            key={tool.name}
+            className="grid gap-3 py-3 sm:grid-cols-[minmax(0,1fr)_auto]"
+          >
+            <div className="min-w-0 space-y-1">
+              <div className="flex min-w-0 items-center gap-2">
+                <p className="truncate font-mono text-xs text-foreground">
+                  {tool.name}
+                </p>
+                {isMissing ? (
+                  <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                    Missing
+                  </Badge>
+                ) : !enabled ? (
+                  <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                    Disabled
+                  </Badge>
+                ) : requiresApproval ? (
+                  <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                    Approval
+                  </Badge>
+                ) : null}
+              </div>
+              {tool.description ? (
+                <p className="line-clamp-2 text-xs leading-5 text-muted-foreground">
+                  {tool.description}
+                </p>
+              ) : null}
+            </div>
+            <div className="grid grid-cols-2 gap-4 sm:flex sm:items-center sm:gap-5">
+              <label className="flex items-center justify-between gap-2 text-xs text-muted-foreground sm:justify-start">
+                Enabled
+                <Switch
+                  checked={enabled}
+                  disabled={disabled}
+                  onCheckedChange={(checked) =>
+                    onPolicyChange(tool, { enabled: checked })
+                  }
+                  aria-label={`Enable ${tool.name}`}
+                />
+              </label>
+              <label className="flex items-center justify-between gap-2 text-xs text-muted-foreground sm:justify-start">
+                Approval
+                <Switch
+                  checked={requiresApproval}
+                  disabled={disabled || !enabled}
+                  onCheckedChange={(checked) =>
+                    onPolicyChange(tool, { requires_approval: checked })
+                  }
+                  aria-label={`Require approval for ${tool.name}`}
+                />
+              </label>
+            </div>
+          </li>
+        )
+      })}
+    </ul>
   )
 }
 
@@ -282,6 +387,8 @@ export function MCPIntegrationDialog({
     useCreateMcpIntegration(workspaceId)
   const { updateMcpIntegration, updateMcpIntegrationIsPending } =
     useUpdateMcpIntegration(workspaceId)
+  const { updateMcpIntegrationToolPolicies } =
+    useUpdateMcpIntegrationToolPolicies(workspaceId)
   const { deleteMcpIntegration, deleteMcpIntegrationIsPending } =
     useDeleteMcpIntegration(workspaceId)
   const { integrations, providers, integrationsIsLoading } =
@@ -290,7 +397,16 @@ export function MCPIntegrationDialog({
     workspaceId,
     mcpIntegrationId ?? null
   )
+  const { testMcpConnectionConfig, testMcpConnectionConfigIsPending } =
+    useTestMcpConnectionConfig(workspaceId)
+  const {
+    testMcpIntegrationConnection,
+    testMcpIntegrationConnectionIsPending,
+  } = useTestMcpIntegrationConnection(workspaceId)
+  const testConnectionIsPending =
+    testMcpConnectionConfigIsPending || testMcpIntegrationConnectionIsPending
   const canDelete = useScopeCheck("integration:delete") === true
+  const canUpdate = useScopeCheck("integration:update") === true
   const [internalOpen, setInternalOpen] = useState(false)
   const [isEditHydrated, setIsEditHydrated] = useState(false)
   const [catalogOAuthClientIsPending, setCatalogOAuthClientIsPending] =
@@ -306,8 +422,17 @@ export function MCPIntegrationDialog({
     }
   }, [mcpIntegrationId, controlledOpen])
 
+  // The Zod schema needs the catalog's url-typed stdio_env keys, but those come
+  // from the connection spec (state), not the form data. Hold the active
+  // resolver in a ref and read it at validation time so we can swap it when the
+  // selected catalog option changes without re-mounting useForm.
+  const resolverRef = React.useRef(zodResolver(buildMcpIntegrationFormSchema()))
+  const resolver = React.useCallback<Resolver<MCPIntegrationFormValues>>(
+    (values, context, options) => resolverRef.current(values, context, options),
+    []
+  )
   const form = useForm<MCPIntegrationFormValues>({
-    resolver: zodResolver(mcpIntegrationFormSchema),
+    resolver,
     defaultValues: MCP_INTEGRATION_FORM_DEFAULTS,
   })
   const {
@@ -324,10 +449,102 @@ export function MCPIntegrationDialog({
   const authType = form.watch("auth_type")
   const oauthSetup = form.watch("oauth_setup")
   const connectionOptionId = form.watch("connection_option_id")
+
+  /**
+   * Test the form's current (possibly unsaved) values against the server.
+   * Ephemeral — nothing is persisted; saving runs its own verification.
+   */
+  async function handleTestConnection() {
+    const values = form.getValues()
+    const serverUri = values.server_uri?.trim()
+    if (values.server_type !== "http" || !serverUri) {
+      void form.trigger("server_uri")
+      return
+    }
+    // For a saved integration without unsaved connection edits, test through
+    // the integration-scoped endpoint so a successful probe persists the
+    // discovered tools and refreshes the Tools list (matching the "test the
+    // connection to discover tools" copy). With dirty connection fields, the
+    // stored config no longer reflects what would be saved, so test the form
+    // values through the ephemeral config-test endpoint instead; it back-fills
+    // secrets the form leaves blank from the saved integration.
+    const dirtyFields = form.formState.dirtyFields
+    const connectionFieldsAreDirty = Boolean(
+      dirtyFields.server_uri ||
+        dirtyFields.auth_type ||
+        dirtyFields.oauth_setup ||
+        dirtyFields.oauth_integration_id ||
+        dirtyFields.custom_credentials ||
+        dirtyFields.timeout
+    )
+    if (isEditMode && mcpIntegrationId && !connectionFieldsAreDirty) {
+      await testMcpIntegrationConnection(mcpIntegrationId)
+      return
+    }
+    // Mirror the save path: an edited-but-empty editor means the user cleared
+    // the credentials, so send "" (test without headers) rather than null,
+    // which the backend back-fills from the stored secret.
+    const trimmedCredentials = values.custom_credentials?.trim() ?? ""
+    let customCredentials: string | null = trimmedCredentials || null
+    if (!trimmedCredentials && dirtyFields.custom_credentials) {
+      customCredentials = ""
+    }
+    await testMcpConnectionConfig({
+      mcp_integration_id: mcpIntegrationId ?? null,
+      server_uri: serverUri,
+      auth_type: values.auth_type,
+      oauth_integration_id:
+        values.oauth_integration_id ||
+        mcpIntegration?.oauth_integration_id ||
+        null,
+      custom_credentials: customCredentials,
+      timeout: values.timeout ?? null,
+    })
+  }
+
+  async function handleToolPolicyChange(
+    tool: MCPToolSummary,
+    patch: MCPToolPolicyPatch
+  ) {
+    if (!mcpIntegrationId) {
+      return
+    }
+    // The switch flips optimistically; the mutation hook rolls back the
+    // cached integration and surfaces the API error on failure.
+    try {
+      await updateMcpIntegrationToolPolicies({
+        mcpIntegrationId,
+        tools: [
+          {
+            name: tool.name,
+            ...patch,
+          },
+        ],
+      })
+    } catch {
+      // Handled by the mutation hook.
+    }
+  }
+
   const selectedCatalogSpec = catalogSpecForOption(
     catalogEntry,
     connectionOptionId
   )
+
+  // Rebuild the resolver when the selected option's url-typed env keys change,
+  // then re-validate stdio_env so any existing error clears/updates. Keyed on a
+  // sorted string so the effect is stable across re-renders.
+  const urlEnvKeysKey = Array.from(urlTypedStdioEnvKeys(selectedCatalogSpec))
+    .sort()
+    .join(",")
+  React.useEffect(() => {
+    const urlEnvKeys = new Set(urlEnvKeysKey ? urlEnvKeysKey.split(",") : [])
+    resolverRef.current = zodResolver(buildMcpIntegrationFormSchema(urlEnvKeys))
+    if (form.formState.isSubmitted) {
+      void form.trigger("stdio_env")
+    }
+  }, [urlEnvKeysKey, form])
+
   const hasCatalogOAuthClient = hasOAuthClientConfig(selectedCatalogSpec)
   const catalogOptions = catalogEntry?.connection_options ?? []
   const connectedOAuthIntegrations =
@@ -687,6 +904,48 @@ export function MCPIntegrationDialog({
     connectMcpIntegrationIsPending ||
     createMcpIntegrationIsPending ||
     updateMcpIntegrationIsPending
+
+  // Connection actions menu mirroring the OAuth integration details dialog.
+  // Tests the form's current values; with unsaved connection edits the probe
+  // is ephemeral, otherwise it persists the discovered tools.
+  const connectionActions =
+    isEditMode && mcpIntegrationId && canUpdate ? (
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0 text-muted-foreground"
+            disabled={testConnectionIsPending}
+            aria-label="Connection actions"
+          >
+            {testConnectionIsPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <MoreHorizontal className="size-4" />
+            )}
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-44">
+          <DropdownMenuItem
+            disabled={serverType === "stdio" || testConnectionIsPending}
+            title={
+              serverType === "stdio"
+                ? "Stdio servers can't be tested"
+                : undefined
+            }
+            onClick={() => void handleTestConnection()}
+          >
+            <PlayCircle className="mr-2 size-4 text-muted-foreground" />
+            Test
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    ) : null
+  const availableToolCount =
+    mcpIntegration?.tools?.filter((tool) => tool.status !== "missing").length ??
+    0
   const dialogTitle = catalogEntry
     ? `Configure ${catalogEntry.name}`
     : isEditMode
@@ -705,7 +964,7 @@ export function MCPIntegrationDialog({
           <Button
             size="sm"
             variant="outline"
-            className={cn("h-7", triggerClassName)}
+            className={cn("h-7 bg-background", triggerClassName)}
             {...restTriggerProps}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
@@ -721,7 +980,34 @@ export function MCPIntegrationDialog({
         <div className="max-h-[calc(88vh-92px)] overflow-y-auto px-6 py-5">
           {catalogEntry ? (
             <div className="mb-6">
-              <CatalogEntrySummary entry={catalogEntry} />
+              <CatalogEntrySummary
+                entry={catalogEntry}
+                actions={connectionActions}
+              />
+            </div>
+          ) : null}
+          {!catalogEntry && isEditMode && mcpIntegration ? (
+            <div className="mb-6 flex items-start gap-3 rounded-md border bg-muted/30 p-3">
+              <ProviderIcon providerId="custom" className="size-9 shrink-0" />
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  <div className="truncate text-sm font-medium text-foreground">
+                    {mcpIntegration.name}
+                  </div>
+                  <Badge
+                    variant="outline"
+                    className="h-4 px-1.5 text-[10px] uppercase tracking-wide"
+                  >
+                    {mcpIntegration.server_type}
+                  </Badge>
+                </div>
+                <p className="line-clamp-2 text-xs leading-5 text-muted-foreground">
+                  {mcpIntegration.server_uri ??
+                    mcpIntegration.stdio_command ??
+                    "Custom MCP server"}
+                </p>
+              </div>
+              {connectionActions}
             </div>
           ) : null}
           {(integrationsIsLoading ||
@@ -730,7 +1016,7 @@ export function MCPIntegrationDialog({
                 mcpIntegrationIsLoading ||
                 mcpIntegration?.id !== mcpIntegrationId))) && (
             <div className="flex items-center justify-center py-8">
-              <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             </div>
           )}
           {!integrationsIsLoading &&
@@ -1157,8 +1443,56 @@ export function MCPIntegrationDialog({
                     </>
                   )}
 
-                  <Accordion type="single" collapsible>
-                    <AccordionItem value="advanced" className="border-b-0">
+                  {isEditMode &&
+                  serverType === "http" &&
+                  !mcpIntegration?.tools?.length ? (
+                    <p className="text-xs text-muted-foreground">
+                      Connection not verified — test the connection to discover
+                      tools.
+                    </p>
+                  ) : null}
+
+                  <Accordion type="multiple">
+                    {isEditMode &&
+                    serverType === "http" &&
+                    mcpIntegration?.tools?.length ? (
+                      <AccordionItem value="tools" className="border-t">
+                        <AccordionTrigger className="py-3 hover:no-underline">
+                          <span className="flex items-center gap-2">
+                            Tools ({mcpIntegration.tools.length})
+                            {availableToolCount !==
+                            mcpIntegration.tools.length ? (
+                              <Badge
+                                variant="outline"
+                                className="h-5 px-1.5 text-[10px]"
+                              >
+                                {availableToolCount} available
+                              </Badge>
+                            ) : null}
+                          </span>
+                        </AccordionTrigger>
+                        <AccordionContent>
+                          <MCPToolPolicyList
+                            tools={mcpIntegration.tools}
+                            canUpdate={canUpdate}
+                            onPolicyChange={(tool, patch) =>
+                              void handleToolPolicyChange(tool, patch)
+                            }
+                          />
+                        </AccordionContent>
+                      </AccordionItem>
+                    ) : null}
+                    <AccordionItem
+                      value="advanced"
+                      className={cn(
+                        "border-b-0",
+                        isEditMode &&
+                          serverType === "http" &&
+                          mcpIntegration?.tools?.length
+                          ? undefined
+                          : "border-t"
+                      )}
+                    >
                       <AccordionTrigger className="py-3 hover:no-underline">
                         Advanced
                       </AccordionTrigger>
@@ -1435,56 +1769,56 @@ export function MCPIntegrationDialog({
                   )}
 
                   <DialogFooter className="flex flex-col gap-2 sm:flex-row sm:justify-between">
-                    {isEditMode && mcpIntegrationId && canDelete ? (
-                      <AlertDialog>
-                        <AlertDialogTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                            disabled={
-                              isPending || deleteMcpIntegrationIsPending
-                            }
-                          >
-                            <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-                            Delete
-                          </Button>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle>
-                              Remove MCP server?
-                            </AlertDialogTitle>
-                            <AlertDialogDescription>
-                              Agents will no longer be able to call{" "}
-                              <span className="font-medium">
-                                {mcpIntegration?.name ?? "this server"}
-                              </span>
-                              .
-                            </AlertDialogDescription>
-                          </AlertDialogHeader>
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>Cancel</AlertDialogCancel>
-                            <AlertDialogAction
-                              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                              disabled={deleteMcpIntegrationIsPending}
-                              onClick={async (event) => {
-                                event.preventDefault()
-                                await deleteMcpIntegration(mcpIntegrationId)
-                                handleOpenChange(false)
-                              }}
+                    <div className="flex items-center gap-2">
+                      {isEditMode && mcpIntegrationId && canDelete ? (
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                              disabled={
+                                isPending || deleteMcpIntegrationIsPending
+                              }
                             >
-                              {deleteMcpIntegrationIsPending && (
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                              )}
-                              Remove
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
-                    ) : (
-                      <span />
-                    )}
+                              <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                              Delete
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>
+                                Remove MCP server?
+                              </AlertDialogTitle>
+                              <AlertDialogDescription>
+                                Agents will no longer be able to call{" "}
+                                <span className="font-medium">
+                                  {mcpIntegration?.name ?? "this server"}
+                                </span>
+                                .
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction
+                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                disabled={deleteMcpIntegrationIsPending}
+                                onClick={async (event) => {
+                                  event.preventDefault()
+                                  await deleteMcpIntegration(mcpIntegrationId)
+                                  handleOpenChange(false)
+                                }}
+                              >
+                                {deleteMcpIntegrationIsPending && (
+                                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                )}
+                                Remove
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      ) : null}
+                    </div>
                     <div className="flex items-center justify-end gap-2">
                       <Button
                         type="button"

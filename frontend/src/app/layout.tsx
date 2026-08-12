@@ -56,7 +56,12 @@ export default async function RootLayout({ children }: RootLayoutProps) {
             fontSans.variable
           )}
         >
-          <ThemeProvider>
+          <ThemeProvider
+            attribute="class"
+            defaultTheme="system"
+            enableSystem
+            disableTransitionOnChange
+          >
             <DefaultQueryClientProvider>
               <SettingsModalProvider>
                 <TooltipProvider>
@@ -70,8 +75,8 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                 <SettingsModalHost />
               </SettingsModalProvider>
             </DefaultQueryClientProvider>
-            <Toaster />
           </ThemeProvider>
+          <Toaster />
         </body>
       </MaybeAnalytics>
     </html>

@@ -20,6 +20,7 @@ import {
   type Viewport,
   type XYPosition,
 } from "@xyflow/react"
+import { useTheme } from "next-themes"
 import React, {
   type SetStateAction,
   useCallback,
@@ -33,7 +34,6 @@ import { v4 as uuid4 } from "uuid"
 import "@xyflow/react/dist/style.css"
 
 import { MoveHorizontalIcon, MoveVerticalIcon, PlusIcon } from "lucide-react"
-import { useTheme } from "next-themes"
 import type {
   GraphOperation,
   GraphResponse,
@@ -158,7 +158,6 @@ export const WorkflowCanvas = React.forwardRef<
   const activeFitViewOptions = embedded
     ? embeddedFitViewOptions
     : fitViewOptions
-  const { resolvedTheme } = useTheme()
   const containerRef = useRef<HTMLDivElement>(null)
   const connectingNodeId = useRef<string | null>(null)
   const connectingHandleId = useRef<string | null>(null)
@@ -172,6 +171,9 @@ export const WorkflowCanvas = React.forwardRef<
   const { toast } = useToast()
   const { workspaceId, workflowId } = useWorkflow()
   const { selectedNodeId, setSelectedNodeId } = useWorkflowBuilder()
+  const { resolvedTheme } = useTheme()
+  const backgroundPatternColor =
+    resolvedTheme === "dark" ? "#3f3f46" : "#91919a"
   const { data: graphData } = useGraph(workspaceId, workflowId ?? "")
   const { applyGraphOperations, refetchGraph } = useGraphOperations(
     workspaceId,
@@ -1035,9 +1037,11 @@ export const WorkflowCanvas = React.forwardRef<
         panOnScroll
         connectionLineType={ConnectionLineType.SmoothStep}
         onPaneContextMenu={onPaneContextMenu}
-        colorMode={resolvedTheme === "dark" ? "dark" : "light"}
       >
-        <Background />
+        <Background
+          bgColor="hsl(var(--background))"
+          color={backgroundPatternColor}
+        />
         <Controls
           className="rounded-sm"
           fitViewOptions={activeFitViewOptions}
@@ -1058,8 +1062,9 @@ export const WorkflowCanvas = React.forwardRef<
           </Button>
           <Button
             variant="outline"
-            className="m-0 size-6 p-0 text-xs"
+            className="m-0 hidden size-6 p-0 text-xs"
             onClick={() => onLayout("LR")}
+            disabled
           >
             <MoveHorizontalIcon className="size-3" strokeWidth={2} />
           </Button>

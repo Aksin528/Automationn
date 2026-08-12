@@ -41,6 +41,8 @@ export function CodeEditor({
   wrapLongLines = false,
   className,
 }: CodeEditorProps) {
+  const { resolvedTheme } = useTheme()
+  const codeMirrorTheme = resolvedTheme === "dark" ? "dark" : "light"
   const languageExtension = getLanguageExtension(language)
   const extensions = [
     ...(languageExtension ? [languageExtension] : []),
@@ -53,6 +55,7 @@ export function CodeEditor({
       value={value}
       onChange={onChange}
       extensions={extensions}
+      theme={codeMirrorTheme}
       readOnly={readOnly}
       theme={resolvedTheme === "dark" ? "dark" : "light"}
       className={cn(

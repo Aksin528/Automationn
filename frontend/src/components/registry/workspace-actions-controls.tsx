@@ -99,7 +99,7 @@ function RegistryActionsControlsMenu() {
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7">
+          <Button variant="outline" size="sm" className="h-7 bg-background">
             <RefreshCcw
               className={
                 syncRepoIsPending

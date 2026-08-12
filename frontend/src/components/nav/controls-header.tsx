@@ -148,6 +148,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
+import { WorkspaceResourceSyncActions } from "@/components/workspace-sync/resource-sync-actions"
 import { AddWorkspaceMember } from "@/components/workspaces/add-workspace-member"
 import {
   NewVariableDialog,
@@ -187,7 +188,7 @@ const CASE_STATUS_TINTS: Record<CaseStatus, string> = {
   resolved: "bg-green-500/[0.03] dark:bg-green-500/[0.08]",
   closed: "bg-violet-500/[0.03] dark:bg-violet-500/[0.08]",
   other: "bg-muted/5 dark:bg-muted/[0.12]",
-  unknown: "bg-slate-500/[0.03] dark:bg-slate-500/[0.08]",
+  unknown: "bg-muted/5 dark:bg-muted/[0.12]",
 }
 
 const CHAT_TOGGLE_KEY = "c"
@@ -211,6 +212,11 @@ function WorkflowsActions() {
         view={catalogView}
         workflowsHref={workflowsHref}
         tagsHref={tagsHref}
+      />
+      <WorkspaceResourceSyncActions
+        label="workflows"
+        branchSlug="workflows"
+        resources={["workflow"]}
       />
       {catalogView === WorkflowsCatalogViewMode.Tags ? (
         <AddWorkflowTag />
@@ -294,9 +300,14 @@ function TablesActions() {
 
   return (
     <>
+      <WorkspaceResourceSyncActions
+        label="tables"
+        branchSlug="tables"
+        resources={["table"]}
+      />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7">
+          <Button variant="outline" size="sm" className="h-7 bg-background">
             <Plus className="mr-1 h-3.5 w-3.5" />
             New table
             <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -351,7 +362,7 @@ function IntegrationsActions() {
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7">
+          <Button variant="outline" size="sm" className="h-7 bg-background">
             <Plus className="mr-1 h-3.5 w-3.5" />
             Add integration
             <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -403,7 +414,16 @@ function IntegrationsActions() {
 }
 
 function SkillsActions() {
-  return <CreateSkillButton />
+  return (
+    <>
+      <WorkspaceResourceSyncActions
+        label="skills"
+        branchSlug="skills"
+        resources={["skill"]}
+      />
+      <CreateSkillButton />
+    </>
+  )
 }
 
 function BreadcrumbEntityPage({
@@ -461,6 +481,61 @@ function normalizeAgentActionPath(rawPath: string | null): string {
     : withLeadingSlash
 }
 
+function AgentFoldersBreadcrumb({
+  workspaceId,
+  path,
+}: {
+  workspaceId: string
+  path: string | null
+}) {
+  const normalizedPath = normalizeAgentActionPath(path)
+  const segments = normalizedPath.split("/").filter(Boolean)
+  const baseHref = `/workspaces/${workspaceId}/agents`
+  const getFolderHref = (folderPath: string) => {
+    if (folderPath === "/") {
+      return `${baseHref}?view=folders&path=%2F`
+    }
+    return `${baseHref}?view=folders&path=${encodeURIComponent(folderPath)}`
+  }
+
+  return (
+    <Breadcrumb>
+      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
+        <BreadcrumbItem>
+          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
+            <Link href={baseHref}>Agents</Link>
+          </BreadcrumbLink>
+        </BreadcrumbItem>
+        {segments.map((segment, index) => {
+          const folderPath = `/${segments.slice(0, index + 1).join("/")}`
+          const isLast = index === segments.length - 1
+          return (
+            <Fragment key={folderPath}>
+              <BreadcrumbSeparator className="shrink-0">
+                <span className="text-muted-foreground">/</span>
+              </BreadcrumbSeparator>
+              <BreadcrumbItem>
+                {isLast ? (
+                  <BreadcrumbPage className="font-semibold">
+                    {segment}
+                  </BreadcrumbPage>
+                ) : (
+                  <BreadcrumbLink
+                    asChild
+                    className="font-semibold hover:no-underline"
+                  >
+                    <Link href={getFolderHref(folderPath)}>{segment}</Link>
+                  </BreadcrumbLink>
+                )}
+              </BreadcrumbItem>
+            </Fragment>
+          )
+        })}
+      </BreadcrumbList>
+    </Breadcrumb>
+  )
+}
+
 function AgentsActions() {
   const pathname = usePathname()
   const workspaceId = useWorkspaceId()
@@ -498,7 +573,7 @@ function AgentsActions() {
         <>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="h-7">
+              <Button variant="outline" size="sm" className="h-7 bg-background">
                 <Plus className="mr-1 h-3.5 w-3.5" />
                 Create new
                 <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -556,6 +631,11 @@ function AgentsActions() {
         agentsHref={agentsHref}
         tagsHref={tagsHref}
       />
+      <WorkspaceResourceSyncActions
+        label="agents"
+        branchSlug="agents"
+        resources={["agent_preset"]}
+      />
       {agentActionControls}
     </>
   )
@@ -578,7 +658,7 @@ function AddAgentTag({
       <Button
         variant="outline"
         size="sm"
-        className="h-7"
+        className="h-7 bg-background"
         onClick={() => onOpenChange(true)}
       >
         <Plus className="mr-1 h-3.5 w-3.5" />
@@ -631,6 +711,40 @@ function CasesActions() {
   const durationsHref = workspaceId
     ? `/workspaces/${workspaceId}/cases/durations`
     : undefined
+  let syncActions: ReactNode = null
+  if (view === CasesViewMode.CustomFields) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case custom fields"
+        branchSlug="case-fields"
+        resources={["case_field"]}
+      />
+    )
+  } else if (view === CasesViewMode.Durations) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case durations"
+        branchSlug="case-durations"
+        resources={["case_duration"]}
+      />
+    )
+  } else if (view === CasesViewMode.Tags) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case tags"
+        branchSlug="case-tags"
+        resources={["case_tag"]}
+      />
+    )
+  } else if (view === CasesViewMode.Dropdowns) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case dropdowns"
+        branchSlug="case-dropdowns"
+        resources={["case_dropdown"]}
+      />
+    )
+  }
 
   return (
     <>
@@ -643,6 +757,7 @@ function CasesActions() {
         closureRequirementsHref={closureRequirementsHref}
         durationsHref={durationsHref}
       />
+      {syncActions}
       {view === CasesViewMode.CustomFields ? (
         <AddCustomField />
       ) : view === CasesViewMode.Durations ? (
@@ -656,7 +771,7 @@ function CasesActions() {
           <Button
             variant="outline"
             size="sm"
-            className="h-7"
+            className="h-7 bg-background"
             onClick={() => setDialogOpen(true)}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
@@ -1554,23 +1669,30 @@ function CredentialsActions() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const canCreateSecrets = useScopeCheck("secret:create")
 
-  if (canCreateSecrets !== true) {
-    return null
-  }
-
   return (
     <>
-      <Button
-        variant="outline"
-        size="sm"
-        className="h-7"
-        onClick={() => setDialogOpen(true)}
-      >
-        <Plus className="mr-1 h-3.5 w-3.5" />
-        Add credential
-      </Button>
-
-      <CreateCredentialDialog open={dialogOpen} onOpenChange={setDialogOpen} />
+      <WorkspaceResourceSyncActions
+        label="credential metadata"
+        branchSlug="credentials"
+        resources={["secret_metadata"]}
+      />
+      {canCreateSecrets === true && (
+        <>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 bg-background"
+            onClick={() => setDialogOpen(true)}
+          >
+            <Plus className="mr-1 h-3.5 w-3.5" />
+            Add credential
+          </Button>
+          <CreateCredentialDialog
+            open={dialogOpen}
+            onOpenChange={setDialogOpen}
+          />
+        </>
+      )}
     </>
   )
 }
@@ -1591,7 +1713,7 @@ function ServiceAccountsActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7"
+      className="h-7 bg-background"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createServiceAccount", Date.now().toString())
@@ -1620,7 +1742,7 @@ function McpServersActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7"
+      className="h-7 bg-background"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createMcpServer", Date.now().toString())
@@ -1649,7 +1771,7 @@ function McpAccessActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7"
+      className="h-7 bg-background"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createMcpToken", Date.now().toString())
@@ -1666,14 +1788,21 @@ function McpAccessActions() {
 
 function VariablesActions() {
   return (
-    <NewVariableDialog>
-      <NewVariableDialogTrigger asChild>
-        <Button variant="outline" size="sm" className="h-7">
-          <Plus className="mr-1 h-3.5 w-3.5" />
-          Add variable
-        </Button>
-      </NewVariableDialogTrigger>
-    </NewVariableDialog>
+    <>
+      <WorkspaceResourceSyncActions
+        label="variables"
+        branchSlug="variables"
+        resources={["variable"]}
+      />
+      <NewVariableDialog>
+        <NewVariableDialogTrigger asChild>
+          <Button variant="outline" size="sm" className="h-7 bg-background">
+            <Plus className="mr-1 h-3.5 w-3.5" />
+            Add variable
+          </Button>
+        </NewVariableDialogTrigger>
+      </NewVariableDialog>
+    </>
   )
 }
 
@@ -1824,6 +1953,11 @@ function TableBreadcrumb({
 function TableDetailsActions() {
   return (
     <>
+      <WorkspaceResourceSyncActions
+        label="tables"
+        branchSlug="tables"
+        resources={["table"]}
+      />
       <TableSelectionActionsBar />
       <TableLinkRowsToCaseCommand />
       <TableInsertButton />
@@ -1923,11 +2057,26 @@ function getPageConfig(
             workspaceId={workspaceId}
           />
         ),
+        actions: (
+          <WorkspaceResourceSyncActions
+            label="agents"
+            branchSlug="agents"
+            resources={["agent_preset"]}
+          />
+        ),
       }
     }
 
+    const agentsView = searchParams?.get("view") === "list" ? "list" : "folders"
     return {
-      title: "Agents",
+      title: (
+        <AgentFoldersBreadcrumb
+          workspaceId={workspaceId}
+          path={
+            agentsView === "folders" ? (searchParams?.get("path") ?? "/") : "/"
+          }
+        />
+      ),
       actions: <AgentsActions />,
     }
   }
@@ -2000,7 +2149,16 @@ function getPageConfig(
         title: (
           <SkillsBreadcrumb workspaceId={workspaceId} skillId={skillMatch[1]} />
         ),
-        actions: <SkillsDetailActions />,
+        actions: (
+          <>
+            <WorkspaceResourceSyncActions
+              label="skills"
+              branchSlug="skills"
+              resources={["skill"]}
+            />
+            <SkillsDetailActions />
+          </>
+        ),
       }
     }
     return {
