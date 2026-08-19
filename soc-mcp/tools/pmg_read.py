@@ -69,7 +69,7 @@ def _extract_detail(logs: list[str]) -> dict:
 def register_pmg_read_tools(mcp):
 
     @mcp.tool()
-    async def pmg_get_blocked_mail(
+    async def pmg_get_flagged_mail(
         hours_back: int = 24,
         max_results: int = 100,
     ) -> dict:

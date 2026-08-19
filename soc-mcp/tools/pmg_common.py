@@ -31,6 +31,18 @@ async def _login(client: httpx.AsyncClient) -> str:
     return resp.json().get("data", {}).get("ticket", "")
 
 
+async def _login_full(client: httpx.AsyncClient) -> tuple[str, str]:
+    """Returns (ticket, CSRFPreventionToken). The CSRF token is required
+    (in addition to the PMGAuthCookie) for any write call (POST/PUT/DELETE)."""
+    resp = await client.post(
+        f"{PMG_URL}/api2/json/access/ticket",
+        data={"username": PMG_USER, "password": PMG_PASS},
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+    return data.get("ticket", ""), data.get("CSRFPreventionToken", "")
+
+
 async def _get_node(client: httpx.AsyncClient, ticket: str) -> str:
     resp = await client.get(
         f"{PMG_URL}/api2/json/nodes",

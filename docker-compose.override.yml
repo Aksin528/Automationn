@@ -106,6 +106,9 @@ services:
       TRELLIX_EPO_URL: "${TRELLIX_EPO_URL}"
       TRELLIX_USER: "${TRELLIX_USER}"
       TRELLIX_PASS: "${TRELLIX_PASS}"
+      PMG_URL: "${PMG_URL}"
+      PMG_USER: "${PMG_USER}"
+      PMG_PASS: "${PMG_PASS}"
       MCP_HOST: "0.0.0.0"
       MCP_ACTIONS_PORT: "8101"
     ports:

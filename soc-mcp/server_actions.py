@@ -10,14 +10,16 @@ module docstring for the full rationale.
 from fastmcp import FastMCP
 from tools.cortex_actions import register_cortex_action_tools
 from tools.trellix_actions import register_trellix_action_tools
+from tools.pmg_actions import register_pmg_action_tools
 
 mcp = FastMCP(
     name="soc-mcp-actions",
-    instructions="SOC response-action MCP server. Executes real, state-changing actions (Cortex XDR containment, Trellix DLP incident status/severity/comment updates) on live systems. Only call these after explicit human approval.",
+    instructions="SOC response-action MCP server. Executes real, state-changing actions (Cortex XDR containment, Trellix DLP incident status/severity/comment updates, PMG mail blacklist) on live systems. Only call these after explicit human approval.",
 )
 
 register_cortex_action_tools(mcp)
 register_trellix_action_tools(mcp)
+register_pmg_action_tools(mcp)
 
 if __name__ == "__main__":
     import os
