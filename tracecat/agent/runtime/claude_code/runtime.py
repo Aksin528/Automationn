@@ -236,6 +236,17 @@ CUSTOM_MODEL_PROVIDER_AUTO_COMPACT_WINDOW = "128000"
 # (e.g. structured-output schema validation). Without a cap the CLI can death-loop
 # when the model keeps emitting output that fails validation.
 MAX_STOP_HOOK_RETRIES = 3
+# When a model turn contains multiple tool_use blocks and more than one
+# requires approval, the SDK dispatches a PreToolUse hook per tool call as
+# an independent async task. Interrupting the client immediately after the
+# FIRST approval-required tool is handled races ahead of the still-pending
+# hook callbacks for any sibling tool calls in the same turn, so those
+# never get a chance to stream/persist their own approval request. Instead
+# of interrupting inline, we debounce: each approval request (re)starts a
+# short timer, and the client is only interrupted once that timer elapses
+# with no new approval arriving - i.e. once every tool_use block in the
+# turn has had its hook evaluated.
+APPROVAL_INTERRUPT_DEBOUNCE_SECONDS = 0.3
 
 
 class ClaudeAgentRuntime:
@@ -274,6 +285,7 @@ class ClaudeAgentRuntime:
         self._pending_approval_tool_ids: set[str] = set()
         self.client: ClaudeSDKClient | None = None
         self._was_interrupted: bool = False
+        self._interrupt_debounce_task: asyncio.Task[None] | None = None
         # For incremental JSONL line tracking
         self._sdk_session_id: str | None = None
         self._last_seen_byte_offset: int = 0
@@ -848,10 +860,13 @@ class ClaudeAgentRuntime:
         tool_input: dict[str, Any],
         tool_use_id: str,
     ) -> None:
-        """Handle an approval request by streaming and interrupting.
+        """Handle an approval request by streaming it and scheduling an interrupt.
 
-        Streams APPROVAL_REQUEST event via socket and interrupts the client.
-        The orchestrator handles persistence and coordination.
+        Streams APPROVAL_REQUEST event via socket. The orchestrator handles
+        persistence and coordination. The client interrupt is debounced (see
+        `_schedule_interrupt`) rather than fired inline, so that sibling
+        tool_use blocks in the same model turn get a chance to also stream
+        their own approval request before the session is paused.
         """
         self._pending_approval_tool_ids.add(tool_use_id)
 
@@ -866,9 +881,35 @@ class ClaudeAgentRuntime:
         )
         await self._event_writer.send_stream_event(approval_event)
 
-        logger.info("Approval request streamed, interrupting", tool_name=tool_name)
+        logger.info(
+            "Approval request streamed, scheduling interrupt", tool_name=tool_name
+        )
+
+        self._schedule_interrupt()
+
+    def _schedule_interrupt(self) -> None:
+        """(Re)start the debounced client interrupt.
+
+        Called once per approval-required tool call. Each call cancels any
+        previously scheduled interrupt and restarts the debounce window, so
+        the client is only actually interrupted after
+        `APPROVAL_INTERRUPT_DEBOUNCE_SECONDS` pass with no new approval
+        request arriving - i.e. once every tool_use block in the current
+        turn has been evaluated by the PreToolUse hook, not just the first.
+        """
+        if self._interrupt_debounce_task is not None:
+            self._interrupt_debounce_task.cancel()
+        self._interrupt_debounce_task = asyncio.create_task(self._debounced_interrupt())
+
+    async def _debounced_interrupt(self) -> None:
+        try:
+            await asyncio.sleep(APPROVAL_INTERRUPT_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            # Superseded by a newer approval request in the same turn.
+            return
 
         if self.client is not None:
+            logger.info("Debounce window elapsed, interrupting client")
             self._was_interrupted = True
             await self.client.interrupt()
 

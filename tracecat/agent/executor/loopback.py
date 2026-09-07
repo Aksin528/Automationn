@@ -548,10 +548,19 @@ class LoopbackHandler:
                 items=event.approval_items,
             )
             self._result.approval_requested = True
-            self._result.approval_items = [
+            # A single model turn can contain multiple tool_use blocks that
+            # each require approval; the runtime streams one APPROVAL_REQUEST
+            # event per tool call. Accumulate across events instead of
+            # overwriting, so every gated tool call in the turn ends up
+            # persisted as its own approval - not just the last one to
+            # arrive before the (debounced) client interrupt. Dedup by
+            # tool_call_id in case the same request is ever re-delivered.
+            existing_ids = {item.id for item in self._result.approval_items}
+            self._result.approval_items.extend(
                 ToolCallContent(id=item.id, name=item.name, input=item.input)
                 for item in (event.approval_items or [])
-            ]
+                if item.id not in existing_ids
+            )
             self._pending_approval_tool_call_ids.update(
                 item.id for item in (event.approval_items or [])
             )
