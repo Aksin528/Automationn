@@ -37,7 +37,9 @@ if TYPE_CHECKING:
 class ApprovalsInboxProvider(BaseCursorPaginator):
     """Provides approval items for the inbox.
 
-    Filters to workflow-initiated sessions only and enriches with workflow metadata.
+    Filters to workflow-initiated ("workflow"/"external_channel") and
+    case-linked ("case") sessions -- not preset-builder or plain chat
+    sessions -- and enriches with workflow metadata where available.
     """
 
     def __init__(self, session: AsyncDBSession, role: Role):
@@ -113,7 +115,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
             .where(
                 AgentSession.workspace_id == self.workspace_id,
                 AgentSession.parent_session_id.is_(None),
-                AgentSession.entity_type.in_(["workflow", "external_channel"]),
+                AgentSession.entity_type.in_(["workflow", "external_channel", "case"]),
             )
             .distinct()
         )
@@ -280,7 +282,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                 Approval.status == ApprovalStatus.PENDING,
                 AgentSession.workspace_id == self.workspace_id,
                 AgentSession.parent_session_id.is_(None),
-                AgentSession.entity_type.in_(["workflow", "external_channel"]),
+                AgentSession.entity_type.in_(["workflow", "external_channel", "case"]),
             )
         )
         count = await self.session.scalar(stmt)
@@ -317,6 +319,15 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
         workflows_by_id: dict[uuid.UUID, Workflow] = {}
         temporal_statuses = await self._resolve_temporal_statuses(sessions)
 
+        # No proactive per-session Temporal liveness check here on purpose:
+        # with unlimited workflow timeouts enabled for this workspace,
+        # checking every pending session on every inbox list/poll call would
+        # be pure overhead in the common case (expiry only happens from an
+        # external disruption like a deploy/restart, not routine aging).
+        # Expiry is surfaced reactively instead, at the moment an
+        # approve/reject actually fails (see the case-panel's
+        # submit_approvals endpoint), not shown speculatively here.
+
         if workflow_ids:
             workflow_stmt = select(Workflow).where(Workflow.id.in_(list(workflow_ids)))
             workflow_result = await self.session.execute(workflow_stmt)
@@ -342,9 +353,13 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                 status = InboxItemStatus.PENDING
             elif temporal_status in FAILED_STATUSES:
                 status = InboxItemStatus.FAILED
-            elif failed_count > 0:
-                status = InboxItemStatus.FAILED
             else:
+                # A human rejecting one or more proposed tool calls
+                # (failed_count > 0) is a normal, deliberate outcome, not a
+                # technical failure -- the session still completed. Only a
+                # real Temporal-level failure (above) should mark the whole
+                # session FAILED. The rejected count is still surfaced
+                # separately in the preview text below.
                 status = InboxItemStatus.COMPLETED
 
             # Build preview text
