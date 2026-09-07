@@ -7,9 +7,11 @@ dispatched from DSL workflows.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Callable
 from typing import Any
 
+from pydantic import BaseModel
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from tenacity import (
@@ -20,6 +22,9 @@ from tenacity import (
 )
 
 from tracecat import config
+from tracecat.agent.common.types import MCPHttpServerConfig
+from tracecat.agent.mcp.user_client import UserMCPClient
+from tracecat.agent.preset.service import AgentPresetService
 from tracecat.auth.types import Role
 from tracecat.authz.scopes import backfill_legacy_role_scopes
 from tracecat.contexts import ctx_logger, ctx_role, ctx_run
@@ -37,6 +42,23 @@ from tracecat.executor.backends import get_executor_backend
 from tracecat.executor.service import dispatch_action
 from tracecat.logger import logger
 from tracecat.storage.object import StoredObject, action_key, get_object_storage
+
+
+class ExecuteMCPToolActivityInput(BaseModel):
+    """Input for ExecutorActivities.execute_mcp_tool_activity."""
+
+    mcp_server_config: MCPHttpServerConfig
+    """Metadata-only config (name/url/transport/timeout/id) for the target
+    MCP server, as returned by AgentPresetService.resolve_mcp_integration_refs.
+    Secrets are re-resolved fresh inside the activity via the config's ``id``
+    -- never propagate resolved headers across a Temporal workflow boundary.
+    """
+
+    tool_name: str
+    """Bare tool name on that server, without the mcp.<server>. prefix."""
+
+    args: dict[str, Any]
+    """Tool call arguments."""
 
 
 async def _heartbeat_loop(interval: int, task_ref: str, action_name: str) -> None:
@@ -276,3 +298,71 @@ class ExecutorActivities:
         # Unreachable: AsyncRetrying either returns in the loop or raises RetryError
         # (caught by Exception handler above) when retries are exhausted
         raise AssertionError("Unreachable: AsyncRetrying loop must return or raise")
+
+    @staticmethod
+    @activity.defn
+    async def execute_mcp_tool_activity(
+        input: ExecuteMCPToolActivityInput, role: Role
+    ) -> Any:
+        """Execute an approved tool call directly against a user MCP server.
+
+        Approval reconciliation (durable.py's
+        _execute_and_reconcile_approved_tools) resolves most tool calls
+        through execute_action_activity, which looks the action up in the
+        static core registry_lock. MCP tools (mcp.<server>.<tool>, e.g. the
+        soc-mcp-actions containment actions) are never bound in that lock --
+        they're discovered live from a user-configured MCP server, not
+        synced into the registry. Routing an approved MCP tool through
+        execute_action_activity therefore always fails with "not bound in
+        registry_lock", even after a human approves it, so it must be
+        executed here instead, the same way a live (non-approval-gated)
+        call reaches the server.
+
+        Secrets for the target server are re-resolved fresh via the config's
+        source ``id`` -- the workflow-side MCPServerConfig deliberately
+        never carries headers/secrets across the Temporal boundary.
+        """
+        role = backfill_legacy_role_scopes(role)
+        ctx_role.set(role)
+
+        server_name = input.mcp_server_config.get("name")
+        log = logger.bind(mcp_server=server_name, tool_name=input.tool_name)
+        ctx_logger.set(log)
+
+        if not server_name:
+            raise ApplicationError(
+                "MCP server config is missing a name",
+                type="MCPConfigError",
+                non_retryable=True,
+            )
+
+        resolved_config: MCPHttpServerConfig = {**input.mcp_server_config}
+        mcp_integration_id = input.mcp_server_config.get("id")
+        if mcp_integration_id:
+            try:
+                async with AgentPresetService.with_session(role=role) as svc:
+                    headers = await svc.resolve_mcp_integration_secrets(
+                        uuid.UUID(mcp_integration_id)
+                    )
+            except Exception as e:
+                kind = e.__class__.__name__
+                log.error("Failed to resolve MCP integration secrets", error=str(e))
+                raise ApplicationError(
+                    f"Failed to resolve secrets for MCP server '{server_name}': {e}",
+                    type=kind,
+                    non_retryable=True,
+                ) from e
+            if headers:
+                resolved_config["headers"] = headers
+
+        log.info("Calling approved MCP tool")
+        client = UserMCPClient([resolved_config])
+        try:
+            return await client.call_tool(server_name, input.tool_name, input.args)
+        except Exception as e:
+            kind = e.__class__.__name__
+            log.error("Approved MCP tool execution failed", error=str(e))
+            raise ApplicationError(
+                f"MCP tool '{input.tool_name}' on server '{server_name}' failed: {e}",
+                type=kind,
+            ) from e

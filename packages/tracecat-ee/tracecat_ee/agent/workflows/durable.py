@@ -17,9 +17,12 @@ with workflow.unsafe.imports_passed_through():
     from tracecat import config
     from tracecat.agent.common.stream_types import HarnessType
     from tracecat.agent.common.types import (
+        MCPHttpServerConfig,
+        MCPServerConfig,
         MCPToolDefinition,
         SandboxAgentConfig,
         SandboxSubagentConfig,
+        is_http_mcp_server,
     )
     from tracecat.agent.executor.activity import (
         AgentExecutorInput,
@@ -36,7 +39,11 @@ with workflow.unsafe.imports_passed_through():
         build_tracecat_mcp_role,
     )
     from tracecat.agent.mcp.metadata import strip_proxy_tool_metadata
-    from tracecat.agent.mcp.utils import normalize_mcp_tool_name
+    from tracecat.agent.mcp.utils import (
+        LEGACY_REGISTRY_MCP_SERVER_NAME,
+        REGISTRY_MCP_SERVER_NAME,
+        normalize_mcp_tool_name,
+    )
     from tracecat.agent.parsers import try_parse_json
     from tracecat.agent.preset.activities import (
         ResolveAgentPresetConfigActivityInput,
@@ -75,7 +82,10 @@ with workflow.unsafe.imports_passed_through():
     from tracecat.chat.schemas import ChatMessage
     from tracecat.contexts import ctx_role
     from tracecat.dsl.common import RETRY_POLICIES
-    from tracecat.executor.activities import ExecutorActivities
+    from tracecat.executor.activities import (
+        ExecuteMCPToolActivityInput,
+        ExecutorActivities,
+    )
     from tracecat.logger import logger
     from tracecat.registry.lock.types import RegistryLock
     from tracecat.workflow.executions.correlation import (
@@ -143,6 +153,42 @@ def _build_approved_tool_run_input(
         execution_id=execution_id,
         logical_time=logical_time,
     )
+
+
+def _parse_user_mcp_tool_call(tool_name: str) -> tuple[str, str] | None:
+    """Split a persisted ``mcp.<server>.<tool>`` name into its parts.
+
+    Approval tool names are persisted in dot form (e.g.
+    ``mcp.soc-mcp-actions.cortex_scan_endpoint``), not the SDK's
+    ``mcp__<server>__<tool>`` form. Note that ``normalize_mcp_tool_name`` is
+    NOT the inverse of this -- it's a display helper that discards the
+    server name entirely (returning just ``cortex_scan_endpoint``), which is
+    exactly why routing an approved MCP tool through it loses the
+    information needed to actually resolve and execute the call.
+
+    Returns None for anything that isn't a genuine user MCP server tool
+    call. That excludes two cases, both left to the registry_lock path
+    (via normalize_mcp_tool_name, unchanged from before this function
+    existed):
+    - Plain core registry actions like ``core.cases.create_comment``,
+      which never carry the ``mcp.`` prefix at all.
+    - Core registry actions routed through the internal
+      ``tracecat-registry``/``tracecat_registry`` MCP proxy (e.g.
+      ``mcp.tracecat-registry.core.http_request``) -- that reserved
+      server name is Tracecat's own registry exposed as MCP, not a
+      user-configured external server, so it has no entry in
+      mcp_servers/mcp_server_by_name and must not be routed through
+      execute_mcp_tool_activity.
+    """
+    if not tool_name.startswith("mcp."):
+        return None
+    parts = tool_name.split(".", 2)
+    if len(parts) != 3:
+        return None
+    _, server_name, bare_tool_name = parts
+    if server_name in (REGISTRY_MCP_SERVER_NAME, LEGACY_REGISTRY_MCP_SERVER_NAME):
+        return None
+    return server_name, bare_tool_name
 
 
 def _llm_route_for_config(
@@ -928,6 +974,7 @@ class DurableAgentWorkflow:
                         approved_tools=approved_tools,
                         denied_tools=denied_tools,
                         registry_lock=root_registry_lock,
+                        mcp_servers=cfg.mcp_servers,
                     )
                     logger.info(
                         "Tool execution completed",
@@ -1107,6 +1154,7 @@ class DurableAgentWorkflow:
         approved_tools: list[ApprovedToolCall],
         denied_tools: list[DeniedToolCall],
         registry_lock: RegistryLock,
+        mcp_servers: list[MCPServerConfig] | None,
     ) -> list:
         logical_time = workflow.now()
         service_role = build_tracecat_mcp_role(
@@ -1115,7 +1163,80 @@ class DurableAgentWorkflow:
             user_id=self.role.user_id,
         )
         pending_results: list[PendingToolResult] = []
+        # Approval-gated MCP tools (mcp.<server>.<tool>, e.g. every
+        # soc-mcp-actions containment action) are never bound in
+        # registry_lock -- they're discovered live from a user-configured
+        # MCP server, not synced into the static core registry. Route those
+        # through execute_mcp_tool_activity instead of execute_action_activity;
+        # core registry actions keep using the unchanged registry_lock path
+        # below.
+        mcp_server_by_name: dict[str, MCPHttpServerConfig] = {
+            server["name"]: server
+            for server in (mcp_servers or [])
+            if is_http_mcp_server(server)
+        }
         for tool_call in approved_tools:
+            parsed_mcp = _parse_user_mcp_tool_call(tool_call.tool_name)
+            if parsed_mcp is not None:
+                server_name, bare_tool_name = parsed_mcp
+                mcp_server_config = mcp_server_by_name.get(server_name)
+                if mcp_server_config is None:
+                    pending_results.append(
+                        PendingToolResult(
+                            tool_call_id=tool_call.tool_call_id,
+                            tool_name=tool_call.tool_name,
+                            tool_input=tool_call.args,
+                            raw_result=(
+                                "Tool execution failed: no configured MCP "
+                                f"server named '{server_name}' for this agent."
+                            ),
+                            is_error=True,
+                        )
+                    )
+                    continue
+                try:
+                    mcp_result = await workflow.execute_activity(
+                        ExecutorActivities.execute_mcp_tool_activity,
+                        args=[
+                            ExecuteMCPToolActivityInput(
+                                mcp_server_config=mcp_server_config,
+                                tool_name=bare_tool_name,
+                                args=strip_proxy_tool_metadata(tool_call.args),
+                            ),
+                            service_role,
+                        ],
+                        task_queue=config.TRACECAT__EXECUTOR_QUEUE,
+                        start_to_close_timeout=timedelta(
+                            seconds=int(config.TRACECAT__EXECUTOR_CLIENT_TIMEOUT)
+                        ),
+                        heartbeat_timeout=timedelta(
+                            seconds=config.TRACECAT__ACTIVITY_HEARTBEAT_TIMEOUT
+                        )
+                        if config.TRACECAT__ACTIVITY_HEARTBEAT_TIMEOUT > 0
+                        else None,
+                        retry_policy=RETRY_POLICIES["activity:fail_fast"],
+                        priority=AGENT_TOOL_PRIORITY,
+                    )
+                    pending_results.append(
+                        PendingToolResult(
+                            tool_call_id=tool_call.tool_call_id,
+                            tool_name=tool_call.tool_name,
+                            tool_input=tool_call.args,
+                            raw_result=mcp_result,
+                        )
+                    )
+                except ActivityError as e:
+                    pending_results.append(
+                        PendingToolResult(
+                            tool_call_id=tool_call.tool_call_id,
+                            tool_name=tool_call.tool_name,
+                            tool_input=tool_call.args,
+                            raw_result=f"Tool execution failed: {_activity_error_message(e)}",
+                            is_error=True,
+                        )
+                    )
+                continue
+
             try:
                 stored = await workflow.execute_activity(
                     ExecutorActivities.execute_action_activity,
@@ -1166,7 +1287,19 @@ class DurableAgentWorkflow:
                 PendingToolResult(
                     tool_call_id=denied_tool.tool_call_id,
                     tool_name=denied_tool.tool_name,
-                    raw_result=f"Tool denied by user: {denied_tool.reason}",
+                    # Explicit and directive on purpose: a plain "Tool denied
+                    # by user" gives the model no signal not to retry, and in
+                    # practice models do retry the identical call. Spelling
+                    # out "don't call this again" here, in the tool_result
+                    # itself, is far more reliable than relying on system
+                    # instructions the model may not weigh as strongly.
+                    raw_result=(
+                        f"REJECTED by human reviewer: {denied_tool.reason}. "
+                        "Do not call this exact tool with the same arguments "
+                        "again in this session -- if other planned actions "
+                        "remain, proceed with those instead; otherwise stop "
+                        "and summarize what was rejected."
+                    ),
                     is_error=True,
                 )
             )
