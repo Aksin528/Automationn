@@ -186,6 +186,103 @@ const DATA_TYPE_OUTPUT_TYPES = [
 ] as const
 
 const DEFAULT_RETRIES = 3
+
+/** Known tools on our custom soc-mcp-actions MCP server. The registry-actions
+ * catalog (`registryActions`) only covers native `tools.*`/`core.*` actions —
+ * it has no endpoint for listing an MCP integration's own tool definitions —
+ * so tools served over MCP never show up as selectable/labeled options in
+ * the action pickers below. Hardcoded here as a small, known list so they at
+ * least render correctly (rather than a blank "Select an action..." row) for
+ * the specific containment tools we gate behind manual approval. The `value`
+ * must match what `normalize_mcp_tool_name` produces at runtime for an MCP
+ * tool call, i.e. `mcp.<integration name>.<tool name>` — see
+ * `tracecat/agent/mcp/utils.py`. */
+const SOC_MCP_ACTIONS_TOOL_SUGGESTIONS: Suggestion[] = [
+  {
+    id: "mcp.soc-mcp-actions.cortex_isolate_endpoint",
+    label: "Isolate endpoint (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_isolate_endpoint",
+    description: "Isolate a host from the network via Cortex XDR.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.cortex_unisolate_endpoint",
+    label: "Unisolate endpoint (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_unisolate_endpoint",
+    description: "Reverse network isolation on a host via Cortex XDR.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.cortex_scan_endpoint",
+    label: "Scan endpoint (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_scan_endpoint",
+    description: "Trigger a scan on an endpoint via Cortex XDR.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.cortex_quarantine_file",
+    label: "Quarantine file (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_quarantine_file",
+    description: "Quarantine a file on an endpoint via Cortex XDR.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.cortex_blocklist_hash",
+    label: "Blocklist hash (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_blocklist_hash",
+    description: "Add a file hash to the Cortex XDR blocklist.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.cortex_allowlist_hash",
+    label: "Allowlist hash (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_allowlist_hash",
+    description: "Add a file hash to the Cortex XDR allowlist.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.cortex_update_case_status",
+    label: "Update case status (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_update_case_status",
+    description: "Update a Cortex XDR case's status.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.cortex_append_case_note",
+    label: "Append case note (Cortex)",
+    value: "mcp.soc-mcp-actions.cortex_append_case_note",
+    description: "Add a note to a Cortex XDR case.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.pmg_add_to_blacklist",
+    label: "Add to blacklist (PMG)",
+    value: "mcp.soc-mcp-actions.pmg_add_to_blacklist",
+    description: "Add an email/domain to the PMG mail blacklist.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.trellix_set_status",
+    label: "Set status (Trellix)",
+    value: "mcp.soc-mcp-actions.trellix_set_status",
+    description: "Update a Trellix DLP incident's status.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.trellix_set_severity",
+    label: "Set severity (Trellix)",
+    value: "mcp.soc-mcp-actions.trellix_set_severity",
+    description: "Update a Trellix DLP incident's severity.",
+    group: "soc-mcp-actions",
+  },
+  {
+    id: "mcp.soc-mcp-actions.trellix_add_comment",
+    label: "Add comment (Trellix)",
+    value: "mcp.soc-mcp-actions.trellix_add_comment",
+    description: "Add a comment to a Trellix DLP incident.",
+    group: "soc-mcp-actions",
+  },
+]
 const SUBAGENT_ALIAS_REGEX = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
 const POSITIVE_INTEGER_REGEX = /^[1-9]\d*$/
 const RESERVED_SUBAGENT_ALIASES = new Set([
@@ -524,16 +621,19 @@ export function AgentPresetsBuilder({
       return []
     }
     return registryActions
-      .map((action) => ({
-        id: action.id,
-        label: action.default_title ?? action.name,
-        value: action.action,
-        description: action.description,
-        group: action.namespace,
-        icon: getIcon(action.action, {
-          className: "size-6 p-[3px] border-[0.5px]",
-        }),
-      }))
+      .map(
+        (action): Suggestion => ({
+          id: action.id,
+          label: action.default_title ?? action.name,
+          value: action.action,
+          description: action.description,
+          group: action.namespace,
+          icon: getIcon(action.action, {
+            className: "size-6 p-[3px] border-[0.5px]",
+          }),
+        })
+      )
+      .concat(SOC_MCP_ACTIONS_TOOL_SUGGESTIONS)
       .sort((a, b) => a.label.localeCompare(b.label))
   }, [registryActions])
 
@@ -698,16 +798,19 @@ export function AgentPresetArtifactView({
       return []
     }
     return registryActions
-      .map((action) => ({
-        id: action.id,
-        label: action.default_title ?? action.name,
-        value: action.action,
-        description: action.description,
-        group: action.namespace,
-        icon: getIcon(action.action, {
-          className: "size-6 p-[3px] border-[0.5px]",
-        }),
-      }))
+      .map(
+        (action): Suggestion => ({
+          id: action.id,
+          label: action.default_title ?? action.name,
+          value: action.action,
+          description: action.description,
+          group: action.namespace,
+          icon: getIcon(action.action, {
+            className: "size-6 p-[3px] border-[0.5px]",
+          }),
+        })
+      )
+      .concat(SOC_MCP_ACTIONS_TOOL_SUGGESTIONS)
       .sort((a, b) => a.label.localeCompare(b.label))
   }, [registryActions])
 

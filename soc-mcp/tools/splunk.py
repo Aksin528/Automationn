@@ -211,6 +211,7 @@ def register_splunk_tools(mcp):
         earliest: str = "-24h",
         limit: int = 10,
         full: bool = False,
+        event_id: str = "",
     ) -> dict:
         """Get Splunk ES Incident Review notable events with enriched data
         (owner, status, disposition, MITRE ATT&CK, risk scores). By default the
@@ -219,9 +220,15 @@ def register_splunk_tools(mcp):
         full=true to get every field (drilldown_searches, full descriptions,
         _raw, etc.) — used by automation/workflows that build case descriptions,
         not by chat agents.
-        Severity options: informational, low, medium, high, critical, all (default: all)"""
-        earliest = _normalize_earliest(earliest)
+        Severity options: informational, low, medium, high, critical, all (default: all)
+        Pass event_id to fetch one specific notable event (e.g. from a
+        real-time webhook trigger) instead of listing recent events — earliest
+        is widened automatically in this mode so the target event isn't missed
+        if it's older than the default window."""
+        earliest = _normalize_earliest(earliest if not event_id else "-24h")
         query = f"search `get_notable_index` earliest={earliest} {_ES_NOTABLE_ENRICHMENT}"
+        if event_id:
+            query += f' | search event_id="{event_id}"'
         if severity != "all":
             query += f" | search severity={severity}"
         query += f" | head {limit}"

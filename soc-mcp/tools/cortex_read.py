@@ -24,19 +24,31 @@ def register_cortex_read_tools(mcp):
         status. Returns an empty 'endpoints' list if no match found.
         """
         url = f"{CORTEX_API_URL}/public_api/v1/endpoints/get_endpoints"
-        payload = {
-            "request_data": {
-                "filters": [
-                    {"field": "ip_list", "operator": "in", "value": [ip]}
-                ]
-            }
-        }
+        # Confirmed on this tenant: get_endpoints ignores "filters" (and
+        # search_from/search_to) entirely for this route -- every variant
+        # tried (field=ip_list, operator=in vs eq, with/without pagination,
+        # even no filters at all) returned the identical full inventory
+        # (2775 endpoints). So filtering has to happen client-side here
+        # instead of relying on the server to narrow the result.
+        payload = {"request_data": {}}
         async with _client() as client:
             resp = await client.post(url, headers=_headers(), json=payload)
         if resp.status_code >= 400:
             return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
         data = resp.json()
-        endpoints = data.get("reply", {}).get("data", [])
+        reply = data.get("reply", [])
+        # get_endpoints returns "reply" as a plain list of endpoint objects,
+        # unlike some other Cortex APIs that nest results under a "data" or
+        # named key inside a dict -- handle both shapes defensively.
+        endpoints = (
+            reply
+            if isinstance(reply, list)
+            else reply.get("data") or reply.get("endpoints") or []
+        )
+        # Each endpoint's "ip" field is itself a list (an endpoint can have
+        # multiple NICs/IPs), so match if the target ip appears anywhere in
+        # it.
+        matches = [e for e in endpoints if ip in (e.get("ip") or [])]
         return {
             "endpoints": [
                 {
@@ -46,53 +58,40 @@ def register_cortex_read_tools(mcp):
                     "agent_status": e.get("agent_status"),
                     "operational_status": e.get("operational_status"),
                 }
-                for e in endpoints
+                for e in matches
             ]
         }
 
     @mcp.tool()
-    async def cortex_get_incidents(status: str = "", limit: int = 20) -> dict:
-        """List Cortex XDR incidents, optionally filtered by status
-        (new, under_investigation, resolved_threat_handled,
-        resolved_known_issue, resolved_duplicate, resolved_false_positive,
-        resolved_other, resolved_auto). Sorted newest-first by modification
-        time. Use cortex_get_incident_extra_data for full detail on one.
+    async def cortex_get_action_status(action_id: str) -> dict:
+        """Check the status of a response action previously triggered by an
+        action-returning tool (cortex_isolate_endpoint, cortex_scan_endpoint,
+        cortex_quarantine_file, etc.) -- those actions run asynchronously on
+        the endpoint, so this is how you find out whether one actually
+        completed. Pass the action_id from that earlier tool's response
+        (response.reply.action_id). Returns per-endpoint status, e.g.
+        PENDING, IN_PROGRESS, COMPLETED_SUCCESSFULLY,
+        COMPLETED_SUCCESSFULLY_WITH_EXCEPTIONS, FAILED, TIMEOUT, CANCELED.
         """
-        url = f"{CORTEX_API_URL}/public_api/v1/incidents/get_incidents"
-        request_data: dict = {
-            "sort": {"field": "modification_time", "keyword": "desc"},
-            "search_from": 0,
-            "search_to": limit,
-        }
-        if status:
-            request_data["filters"] = [
-                {"field": "status", "operator": "eq", "value": status}
-            ]
-        payload = {"request_data": request_data}
+        try:
+            group_action_id = int(action_id)
+        except ValueError:
+            return {"error": f"action_id must be numeric, got {action_id!r}"}
+        url = f"{CORTEX_API_URL}/public_api/v1/actions/get_action_status"
+        payload = {"request_data": {"group_action_id": group_action_id}}
         async with _client() as client:
             resp = await client.post(url, headers=_headers(), json=payload)
         if resp.status_code >= 400:
             return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
-        return resp.json()
-
-    @mcp.tool()
-    async def cortex_get_incident_extra_data(incident_id: str, alerts_limit: int = 100) -> dict:
-        """Get full detail for one Cortex XDR incident: alerts, network
-        artifacts, file artifacts, and other enrichment beyond what
-        cortex_get_incidents returns.
-        """
-        url = f"{CORTEX_API_URL}/public_api/v1/incidents/get_incident_extra_data"
-        payload = {
-            "request_data": {
-                "incident_id": incident_id,
-                "alerts_limit": alerts_limit,
-            }
-        }
-        async with _client() as client:
-            resp = await client.post(url, headers=_headers(), json=payload)
-        if resp.status_code >= 400:
-            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
-        return resp.json()
+        data = resp.json()
+        reply = data.get("reply", {})
+        # Not yet confirmed against this tenant's real response shape --
+        # Cortex's own docs describe reply.data as {endpoint_id: status},
+        # but other endpoints/get_endpoints already turned out to disagree
+        # with its own docs (see cortex_get_endpoint_by_ip's fix), so handle
+        # a plain dict-of-statuses reply too, defensively.
+        statuses = reply.get("data", reply) if isinstance(reply, dict) else reply
+        return {"action_id": action_id, "statuses": statuses}
 
     @mcp.tool()
     async def cortex_get_cases(status: str = "New", limit: int = 20) -> dict:

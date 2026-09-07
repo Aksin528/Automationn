@@ -44,40 +44,6 @@ def register_cortex_action_tools(mcp):
         return {"status": "unisolation_requested", "endpoint_id": endpoint_id, "response": resp.json()}
 
     @mcp.tool()
-    async def cortex_update_incident(
-        incident_id: str,
-        status: str = "",
-        severity: str = "",
-        assigned_user_mail: str = "",
-        comment: str = "",
-    ) -> dict:
-        """Update a Cortex XDR incident's status, severity, assignee, and/or
-        add a resolution comment. Only the fields you pass are changed. This
-        writes to a live incident — only call after explicit human approval.
-        """
-        update_data = {}
-        if status:
-            update_data["status"] = status
-        if severity:
-            update_data["manual_severity"] = severity
-        if assigned_user_mail:
-            update_data["assigned_user_mail"] = assigned_user_mail
-        if comment:
-            update_data["resolve_comment"] = comment
-        url = f"{CORTEX_API_URL}/public_api/v1/incidents/update_incident"
-        payload = {
-            "request_data": {
-                "incident_id": incident_id,
-                "update_data": update_data,
-            }
-        }
-        async with _client() as client:
-            resp = await client.post(url, headers=_headers(), json=payload)
-        if resp.status_code >= 400:
-            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
-        return {"status": "update_requested", "incident_id": incident_id, "response": resp.json()}
-
-    @mcp.tool()
     async def cortex_scan_endpoint(endpoint_id: str) -> dict:
         """Trigger a full AV scan on a Cortex XDR endpoint. Use
         cortex_get_endpoint_by_ip first if you only have an IP.
@@ -184,6 +150,14 @@ def register_cortex_action_tools(mcp):
         """Add a SHA256 file hash to the Cortex XDR global blocklist, so it's
         blocked from executing across all endpoints. This is a tenant-wide
         prevention policy change — only call after explicit human approval.
+
+        There is no way to undo this via API -- Cortex's public API has no
+        endpoint to remove a hash from the blocklist (confirmed: only the
+        add endpoints exist; removal is only exposed through Cortex's own
+        web console, via an internal session-cookie-authenticated route we
+        cannot call). If this needs to be reversed, it must be done manually
+        in the Cortex console (Endpoints > Policy Management > Exceptions
+        Configuration).
         """
         url = f"{CORTEX_API_URL}/public_api/v1/hash_exceptions/blocklist"
         request_data: dict = {"hash_list": [file_hash]}
@@ -199,9 +173,18 @@ def register_cortex_action_tools(mcp):
     @mcp.tool()
     async def cortex_allowlist_hash(file_hash: str, comment: str = "") -> dict:
         """Add a SHA256 file hash to the Cortex XDR global allowlist, so it's
-        exempt from prevention across all endpoints. Use to undo a false
-        positive or a mistaken blocklist entry. This is a tenant-wide policy
-        change — only call after explicit human approval.
+        exempt from prevention across all endpoints. This is a tenant-wide
+        policy change — only call after explicit human approval.
+
+        Cortex rejects adding a hash that's already present in the OTHER
+        list (confirmed on this tenant: "All hashes have already been added
+        to the allow or block list"). There is no API way to remove a hash
+        from the blocklist first -- Cortex's public API only exposes add
+        endpoints for hash exceptions, not removal (removal is web-console-
+        only, via an internal session-cookie-authenticated route we cannot
+        call). So a hash already on the blocklist can only be moved to the
+        allowlist by removing it manually in the Cortex console first
+        (Endpoints > Policy Management > Exceptions Configuration).
         """
         url = f"{CORTEX_API_URL}/public_api/v1/hash_exceptions/allowlist"
         request_data: dict = {"hash_list": [file_hash]}
