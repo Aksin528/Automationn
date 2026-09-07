@@ -1,15 +1,18 @@
 """EE Approvals API router for submitting approval decisions."""
 
 import uuid
+from datetime import datetime
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+from temporalio.service import RPCError, RPCStatusCode
 
 from tracecat.agent.approvals.enums import ApprovalStatus
 from tracecat.agent.session.service import AgentSessionService
 from tracecat.agent.types import ToolApproved, ToolDenied
-from tracecat.auth.dependencies import WorkspaceUserRouteRole
+from tracecat.auth.dependencies import WorkspaceActorRouteRole, WorkspaceUserRouteRole
 from tracecat.authz.controls import require_scope
 from tracecat.chat.schemas import ApprovalDecision, ContinueRunRequest
 from tracecat.db.engine import get_async_session
@@ -24,6 +27,79 @@ class ApprovalSubmission(BaseModel):
     """Request model for submitting approval decisions."""
 
     approvals: ApprovalMap
+
+
+class ApprovalListItem(BaseModel):
+    """Lightweight approval record for polling/listing purposes.
+
+    Deliberately does not resolve `approved_by` into a full user object (see
+    `ApprovalRead` for that) -- this endpoint exists for external pollers
+    (e.g. a scheduled workflow that forwards newly-pending tool-call
+    approvals to Telegram) that only need the tool call identity, not
+    reviewer identity.
+    """
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    case_id: uuid.UUID | None = None
+    tool_call_id: str
+    tool_name: str
+    status: ApprovalStatus
+    tool_call_args: dict[str, Any] | None = None
+    created_at: datetime
+    is_expired: bool = False
+    """True when status is PENDING but the underlying agent session's
+    Temporal execution is confirmed gone (e.g. it outlived its own
+    execution timeout unresolved). Submitting a decision for one of these
+    will fail -- the UI should offer to dismiss/retry instead of approve/
+    reject. Always False for non-PENDING approvals."""
+
+
+@router.get("", response_model=list[ApprovalListItem])
+@require_scope("agent:read")
+async def list_approvals(
+    *,
+    role: WorkspaceActorRouteRole,
+    status_filter: ApprovalStatus | None = Query(default=None, alias="status"),
+    case_id: uuid.UUID | None = Query(default=None),
+    session: AsyncSession = Depends(get_async_session),
+) -> list[ApprovalListItem]:
+    """List approvals in the workspace, optionally filtered by status and/or case.
+
+    Used by external notification pollers to discover approvals without
+    already knowing a specific session_id -- e.g. a scheduled workflow that
+    checks for newly-created pending tool-call approvals and forwards them
+    to Telegram. Also used by the case detail page's Approvals tab
+    (case_id filter) to show pending approvals for that case directly.
+    """
+    # No proactive Temporal liveness check here on purpose: with unlimited
+    # workflow timeouts enabled for this workspace, checking every pending
+    # approval's session on every list/poll call would be pure overhead in
+    # the common case. `is_expired` is always False from this endpoint --
+    # expiry is detected reactively, at the moment an approve/reject
+    # actually fails (see submit_approvals below), not shown speculatively.
+    approval_service = ApprovalService(session=session, role=role)
+    approvals = await approval_service.list_approvals(
+        status=status_filter, case_id=case_id
+    )
+    return [
+        ApprovalListItem(
+            id=a.id,
+            session_id=a.session_id,
+            case_id=a.case_id,
+            tool_call_id=a.tool_call_id,
+            tool_name=a.tool_name,
+            status=ApprovalStatus(a.status),
+            tool_call_args=a.tool_call_args,
+            created_at=a.created_at,
+        )
+        for a in approvals
+        # session_id is nullable on the model but every approval created via
+        # create_approval/create_approvals always sets it; a null here means
+        # a decision could never be submitted for it anyway, so it can't be
+        # actioned by this endpoint's consumers -- skip rather than 500.
+        if a.session_id is not None
+    ]
 
 
 def _to_approval_decisions(approvals: ApprovalMap) -> list[ApprovalDecision]:
@@ -75,7 +151,7 @@ def _to_approval_decisions(approvals: ApprovalMap) -> list[ApprovalDecision]:
 @require_scope("agent:update")
 async def submit_approvals(
     *,
-    role: WorkspaceUserRouteRole,
+    role: WorkspaceActorRouteRole,
     session_id: uuid.UUID,
     payload: ApprovalSubmission,
     session: AsyncSession = Depends(get_async_session),
@@ -85,8 +161,14 @@ async def submit_approvals(
     This endpoint sends approval decisions back to an agent workflow
     that is waiting for human-in-the-loop approval on tool calls.
 
+    Accepts both interactive user sessions (the case-panel UI) and
+    scoped service-account API keys (e.g. an automation forwarding a
+    Telegram button decision) -- the `agent:update` scope requirement
+    above is the actual gate; this only controls which credential
+    types are allowed to present it.
+
     Args:
-        role: The authenticated user role.
+        role: The authenticated user or service-account role.
         session_id: The agent session ID (used to lookup the workflow).
         payload: The approval decisions mapping tool_call_id to decision.
         session: Database session for workspace-scoped lookups.
@@ -139,6 +221,30 @@ async def submit_approvals(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
+        ) from exc
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            # The agent session's Temporal execution is confirmed gone
+            # (outlived unresolved -- typically from a deployment/restart
+            # while it was paused, not a routine timeout). 410 Gone lets
+            # the frontend distinguish this from a generic failure and
+            # switch that approval to an "expired" + Dismiss state instead
+            # of just showing an error.
+            logger.warning(
+                "Agent session's Temporal execution no longer exists",
+                session_id=session_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="This approval's session has expired and can no longer be resolved.",
+            ) from exc
+        logger.exception(
+            "Unexpected Temporal RPC error while submitting approvals",
+            session_id=session_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to submit approvals",
         ) from exc
     except Exception as exc:
         logger.exception(
