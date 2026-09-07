@@ -4,6 +4,7 @@ import type { DynamicToolUIPart, ToolUIPart } from "ai"
 import {
   ChevronDownIcon,
   CircleCheckIcon,
+  CircleMinusIcon,
   ClockIcon,
   DownloadIcon,
   WrenchIcon,
@@ -51,6 +52,7 @@ export type ToolPart = ToolUIPart | DynamicToolUIPart
 type LegacyToolState =
   | "approval-requested"
   | "approval-responded"
+  | "approval-rejected"
   | "output-denied"
 type ToolState = ToolPart["state"] | LegacyToolState
 
@@ -66,6 +68,7 @@ export type ToolHeaderProps = {
 const statusLabels: Record<ToolState, string> = {
   "approval-requested": "Approval required",
   "approval-responded": "Completed",
+  "approval-rejected": "Rejected",
   "input-available": "In progress",
   "input-streaming": "In progress",
   "output-available": "Completed",
@@ -79,6 +82,9 @@ const statusIcons: Record<ToolState, ReactNode> = {
   ),
   "approval-responded": (
     <CircleCheckIcon className="size-4 fill-emerald-500 stroke-background" />
+  ),
+  "approval-rejected": (
+    <CircleMinusIcon className="size-4 fill-slate-400 stroke-background" />
   ),
   "input-available": (
     <ClockIcon className="size-3.5 text-amber-500 animate-pulse" />
@@ -392,10 +398,40 @@ ToolInput.displayName = "ToolInput"
 export type ToolOutputProps = ComponentProps<"div"> & {
   output: ToolPart["output"]
   errorText: ToolPart["errorText"]
+  /**
+   * How to label and style the errorText block. Defaults to "error" so
+   * existing callers that don't distinguish approval states keep the prior
+   * red "Error" styling.
+   */
+  variant?: "error" | "approval-requested" | "approval-rejected"
+}
+
+const errorBlockLabels: Record<
+  NonNullable<ToolOutputProps["variant"]>,
+  string
+> = {
+  error: "Error",
+  "approval-requested": "Approval required",
+  "approval-rejected": "Rejected",
+}
+
+const errorBlockClasses: Record<
+  NonNullable<ToolOutputProps["variant"]>,
+  string
+> = {
+  error: "bg-destructive/10 text-destructive",
+  "approval-requested": "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+  "approval-rejected": "bg-muted text-muted-foreground",
 }
 
 export const ToolOutput = memo(
-  ({ className, output, errorText, ...props }: ToolOutputProps) => {
+  ({
+    className,
+    output,
+    errorText,
+    variant = "error",
+    ...props
+  }: ToolOutputProps) => {
     const hasOutput = output !== undefined && output !== null
     if (!hasOutput && !errorText) {
       return null
@@ -404,10 +440,15 @@ export const ToolOutput = memo(
     return (
       <div className={cn("space-y-2", className)} {...props}>
         <h4 className="font-medium text-[11px] text-muted-foreground tracking-wide">
-          {errorText ? "Error" : "RESULT"}
+          {errorText ? errorBlockLabels[variant] : "RESULT"}
         </h4>
         {errorText && (
-          <div className="rounded-md bg-destructive/10 px-2.5 py-1.5 text-[11px] text-destructive">
+          <div
+            className={cn(
+              "rounded-md px-2.5 py-1.5 text-[11px]",
+              errorBlockClasses[variant]
+            )}
+          >
             {errorText}
           </div>
         )}

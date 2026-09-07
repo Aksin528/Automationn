@@ -1644,9 +1644,26 @@ export function MessagePart({
         ? (outputAsAny as { errorText?: string }).errorText
         : undefined
     const derivedErrorText = partErrorText ?? outputErrorText
-    const derivedState = derivedErrorText
-      ? ("output-error" as const)
-      : part.state
+    // A denied tool call is surfaced by the runtime as a generic error
+    // (is_error / errorText), but the reason text distinguishes three very
+    // different situations that should not all render as a red "Error":
+    // still awaiting a human decision, rejected by a human reviewer (both
+    // expected, not failures), versus an actual execution failure. Check
+    // both the error text and the raw output, since the pending-approval
+    // reason arrives as errorText while the post-decision reconciliation
+    // text arrives as the tool's output.
+    const outputAsText =
+      typeof outputAsAny === "string" ? outputAsAny : undefined
+    const denialText = derivedErrorText ?? outputAsText ?? ""
+    const derivedState = denialText.includes(
+      "requires approval. Request sent for review"
+    )
+      ? ("approval-requested" as const)
+      : denialText.includes("REJECTED by human reviewer")
+        ? ("approval-rejected" as const)
+        : derivedErrorText
+          ? ("output-error" as const)
+          : part.state
     return (
       <Tool key={`${id}-${partIdx}`}>
         <ToolHeader
@@ -1657,7 +1674,16 @@ export function MessagePart({
         />
         <ToolContent>
           <ToolInput input={part.input} />
-          <ToolOutput output={part.output} errorText={derivedErrorText} />
+          <ToolOutput
+            output={part.output}
+            errorText={derivedErrorText}
+            variant={
+              derivedState === "approval-requested" ||
+              derivedState === "approval-rejected"
+                ? derivedState
+                : "error"
+            }
+          />
         </ToolContent>
       </Tool>
     )
