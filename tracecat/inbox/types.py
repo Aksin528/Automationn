@@ -25,6 +25,7 @@ class InboxItemStatus(StrEnum):
     PENDING = "pending"
     COMPLETED = "completed"
     FAILED = "failed"
+    EXPIRED = "expired"
 
 
 class InboxProvider(Protocol):

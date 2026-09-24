@@ -715,6 +715,42 @@ class TaskWorkflowChangedEventRead(CaseEventReadBase, TaskWorkflowChangedEvent):
     """Event for when a task workflow is changed."""
 
 
+# Approval-gate events. Mirrored onto every case a workflow execution is
+# linked to (same wf_exec_id -> case_id linkage `list_pending_approvals`
+# uses in reverse), written from `record_vote` / `create_interaction_activity`
+# / the timeout path in `packages/tracecat-ee/tracecat_ee/interactions/
+# service.py` — so the case Activity tab shows an approval gate's lifecycle
+# without a second, separate timeline mechanism.
+class ApprovalRequestedEvent(CaseEventBase):
+    type: Literal[CaseEventType.APPROVAL_REQUESTED] = CaseEventType.APPROVAL_REQUESTED
+    action_ref: str
+    required_approvers: int
+
+
+class ApprovalResolvedEvent(CaseEventBase):
+    type: Literal[CaseEventType.APPROVAL_RESOLVED] = CaseEventType.APPROVAL_RESOLVED
+    action_ref: str
+    resolution: Literal["approved", "rejected"]
+
+
+class ApprovalTimedOutEvent(CaseEventBase):
+    type: Literal[CaseEventType.APPROVAL_TIMED_OUT] = CaseEventType.APPROVAL_TIMED_OUT
+    action_ref: str
+
+
+class ApprovalRequestedEventRead(CaseEventReadBase, ApprovalRequestedEvent):
+    """Event for when an approval-gated action requests approval."""
+
+
+class ApprovalResolvedEventRead(CaseEventReadBase, ApprovalResolvedEvent):
+    """Event for when an approval-gated action is approved or rejected."""
+
+
+class ApprovalTimedOutEventRead(CaseEventReadBase, ApprovalTimedOutEvent):
+    """Event for when an approval-gated action's approval window expires
+    unresolved."""
+
+
 # Type unions
 type CaseEventVariant = Annotated[
     CreatedEvent
@@ -746,7 +782,10 @@ type CaseEventVariant = Annotated[
     | TaskWorkflowChangedEvent
     | DropdownValueChangedEvent
     | TableRowLinkedEvent
-    | TableRowUnlinkedEvent,
+    | TableRowUnlinkedEvent
+    | ApprovalRequestedEvent
+    | ApprovalResolvedEvent
+    | ApprovalTimedOutEvent,
     Field(discriminator="type"),
 ]
 
@@ -786,6 +825,9 @@ class CaseEventRead(RootModel):
         | DropdownValueChangedEventRead
         | TableRowLinkedEventRead
         | TableRowUnlinkedEventRead
+        | ApprovalRequestedEventRead
+        | ApprovalResolvedEventRead
+        | ApprovalTimedOutEventRead
     ) = Field(discriminator="type")
 
 

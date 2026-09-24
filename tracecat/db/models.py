@@ -2549,6 +2549,52 @@ class Interaction(WorkspaceModel):
     )
 
 
+class ApprovalVote(WorkspaceModel):
+    """Database model for a single approver's decision on an `Interaction`.
+
+    A workflow-level `ApprovalInteraction` (as opposed to the agent tool-call
+    `Approval` model below) can require more than one approver. Each vote is
+    recorded here; `tracecat.interactions.votes` tallies them against
+    `required_approvers` and only then signals the paused workflow.
+    """
+
+    __tablename__ = "approval_vote"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "interaction_id",
+            "user_id",
+            name="uq_approval_vote_workspace_interaction_user",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    interaction_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("interaction.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    decision: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        doc="'approve' or 'reject'",
+    )
+    comment: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
 class Approval(WorkspaceModel):
     """Database model for storing agent tool approval state."""
 
@@ -2576,6 +2622,18 @@ class Approval(WorkspaceModel):
         nullable=True,
         index=True,
         doc="Agent session identifier (FK to agent_session.id)",
+    )
+    case_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("case.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        doc=(
+            "Case this approval belongs to, when the originating session is "
+            "case-linked (entity_type=CASE). Best-effort: null for sessions "
+            "without a known case (e.g. generic workflow or preset-builder "
+            "sessions)."
+        ),
     )
     tool_call_id: Mapped[str] = mapped_column(
         String,

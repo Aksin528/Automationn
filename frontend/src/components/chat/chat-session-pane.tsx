@@ -18,14 +18,17 @@ import {
   MousePointerClickIcon,
   PencilIcon,
   RefreshCcwIcon,
+  TriangleAlertIcon,
   XIcon,
 } from "lucide-react"
 import { motion } from "motion/react"
 import {
   type ChangeEvent,
   type FocusEvent,
+  Fragment,
   type KeyboardEvent,
   memo,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -1269,6 +1272,14 @@ export function ChatSessionPane({
                 const sourceUrlParts = visibleParts.filter(
                   (part) => part.type === "source-url"
                 )
+                // Index of this message's "StructuredOutput" tool call, if
+                // any -- any text part after it is redundant (see
+                // MessagePart's isAfterStructuredOutput prop).
+                const structuredOutputIdx = visibleParts.findIndex(
+                  (part) =>
+                    isToolUIPart(part) &&
+                    getToolName(part).toLowerCase() === "structuredoutput"
+                )
                 return (
                   <div key={id} className="group relative">
                     {role === "assistant" && sourceUrlParts.length > 0 && (
@@ -1295,6 +1306,10 @@ export function ChatSessionPane({
                         status={status}
                         isLastMessage={isLastMessage}
                         onSubmitApprovals={handleSubmitApprovals}
+                        isAfterStructuredOutput={
+                          structuredOutputIdx !== -1 &&
+                          partIdx > structuredOutputIdx
+                        }
                       />
                     ))}
                     {role === "assistant" && !isWaitingForResponse && (
@@ -1576,6 +1591,7 @@ export function MessagePart({
   status,
   isLastMessage,
   onSubmitApprovals,
+  isAfterStructuredOutput,
 }: {
   part: UIMessagePart<UIDataTypes, UITools>
   partIdx: number
@@ -1584,6 +1600,16 @@ export function MessagePart({
   status?: ChatStatus
   isLastMessage: boolean
   onSubmitApprovals?: (decisions: ApprovalDecision[]) => Promise<void>
+  /**
+   * True when an earlier part in this same message was the Claude Code
+   * CLI's synthetic "StructuredOutput" tool call. Per our system prompt,
+   * that call is supposed to be the very last thing an output_type agent
+   * sends -- but not every model reliably stays silent afterward. A text
+   * part in that position is always redundant noise (a trivial "{}", a
+   * full re-typed copy of the same JSON, or a prose summary), regardless
+   * of its actual content, so it's never worth rendering.
+   */
+  isAfterStructuredOutput?: boolean
 }) {
   if (part.type === "data-approval-request") {
     const payload = (part as { data?: unknown }).data
@@ -1600,13 +1626,26 @@ export function MessagePart({
   }
 
   if (part.type === "text") {
+    // Some models, even when told an output_type tool call ends their turn,
+    // still emit a trailing text part afterward instead of staying silent
+    // -- a trivial "{}", a full re-typed copy of the same JSON, or a prose
+    // summary. Whatever it is, it's redundant noise once StructuredOutput
+    // has already answered, so skip it entirely. Otherwise, still catch
+    // the empty/"{}" case on its own (e.g. a lone trailing part with no
+    // preceding tool call). Skip only once the part has settled (not
+    // mid-stream), since a real reply can legitimately start empty/short
+    // before more text arrives.
+    const isStreamingPart = status === "streaming" && isLastMessage
+    const trimmedText = part.text.trim()
+    const isTrivialPlaceholder =
+      trimmedText === "" || trimmedText === "{}" || isJsonLikeText(trimmedText)
+    if (!isStreamingPart && (isAfterStructuredOutput || isTrivialPlaceholder)) {
+      return null
+    }
     return (
       <Message key={`${id}-${partIdx}`} from={role}>
         <MessageContent variant="flat">
-          <SmoothResponse
-            text={part.text}
-            animate={status === "streaming" && isLastMessage}
-          />
+          <SmoothResponse text={part.text} animate={isStreamingPart} />
         </MessageContent>
       </Message>
     )
@@ -1628,6 +1667,16 @@ export function MessagePart({
 
   if (isToolUIPart(part)) {
     const toolName = getToolName(part).replaceAll("__", ".")
+    // The Claude Code CLI enforces an agent's output_type schema by having
+    // the model call a synthetic "StructuredOutput" tool instead of
+    // replying with plain text -- the model's actual answer is the tool's
+    // *input*, not its output (the CLI just acks it with an empty {}).
+    // The Tool card below still shows that call happened (unchanged), but
+    // its answer is easy to miss behind a collapsed chevron with a blank
+    // "RESULT" -- so also render it as a normal, readable reply right
+    // after the card. Works generically across every agent preset's own
+    // output schema; it doesn't assume specific field names.
+    const isStructuredOutput = toolName.toLowerCase() === "structuredoutput"
     const toolTitle = getToolTitle(toolName, part.input)
     // Derive an error state for streaming when servers send
     // a tool output that encodes validation feedback in `output`
@@ -1665,31 +1714,489 @@ export function MessagePart({
           ? ("output-error" as const)
           : part.state
     return (
-      <Tool key={`${id}-${partIdx}`}>
-        <ToolHeader
-          title={toolTitle}
-          type={part.type}
-          state={derivedState}
-          icon={getIcon(toolName, TOOL_ICON_PROPS)}
-        />
-        <ToolContent>
-          <ToolInput input={part.input} />
-          <ToolOutput
-            output={part.output}
-            errorText={derivedErrorText}
-            variant={
-              derivedState === "approval-requested" ||
-              derivedState === "approval-rejected"
-                ? derivedState
-                : "error"
-            }
+      <Fragment key={`${id}-${partIdx}`}>
+        <Tool>
+          <ToolHeader
+            title={toolTitle}
+            type={part.type}
+            state={derivedState}
+            icon={getIcon(toolName, TOOL_ICON_PROPS)}
           />
-        </ToolContent>
-      </Tool>
+          <ToolContent>
+            <ToolInput input={part.input} />
+            <ToolOutput
+              output={part.output}
+              errorText={derivedErrorText}
+              variant={
+                derivedState === "approval-requested" ||
+                derivedState === "approval-rejected"
+                  ? derivedState
+                  : "error"
+              }
+            />
+          </ToolContent>
+        </Tool>
+        {isStructuredOutput && <StructuredOutputAnswer input={part.input} />}
+      </Fragment>
     )
   }
 
   return null
+}
+
+/**
+ * Renders an agent's `output_type` answer -- delivered as the *input* of
+ * the Claude Code CLI's synthetic "StructuredOutput" tool call -- as a
+ * plain, readable reply instead of raw JSON hidden inside a collapsed tool
+ * card. Generic across every agent preset's own output schema: each field
+ * is shown as "Field Name: value" without assuming specific keys.
+ */
+function StructuredOutputAnswer({ input }: { input: unknown }) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null
+  }
+  const entries = Object.entries(input as Record<string, unknown>)
+  if (entries.length === 0) {
+    return null
+  }
+  // A model doesn't reliably emit JSON keys in the schema's declared order,
+  // so a verdict-style boolean field (e.g. "verdict", "malicious") can end
+  // up buried at the bottom one run and at the top the next. Always sort
+  // fields with a recognized risk polarity to the front, regardless of
+  // where the model happened to put them -- Array.sort is stable, so
+  // relative order within each group (priority vs. the rest) is preserved.
+  const ordered = [...entries].sort((a, b) => {
+    const aPriority = isPriorityVerdictField(a[0], a[1]) ? 0 : 1
+    const bPriority = isPriorityVerdictField(b[0], b[1]) ? 0 : 1
+    return aPriority - bPriority
+  })
+  // Group threat-intel's malware_family/attribution_confidence/tlp into one
+  // compact stat strip instead of three separate plain rows. Only kicks in
+  // when at least one of these fields is actually present, so it has no
+  // effect on other agents' (triage/investigator/reporter) answers.
+  const attributionKeys = new Set([
+    "malware_family",
+    "attribution_confidence",
+    "tlp",
+  ])
+  const attributionEntries = ordered.filter(([key]) =>
+    attributionKeys.has(key.toLowerCase())
+  )
+  const restEntries = ordered.filter(
+    ([key]) => !attributionKeys.has(key.toLowerCase())
+  )
+  return (
+    <Message from="assistant">
+      <MessageContent variant="flat">
+        <div className="space-y-2">
+          {attributionEntries.length > 0 && (
+            <AttributionStatStrip entries={attributionEntries} />
+          )}
+          {restEntries.map(([key, value]) => (
+            <StructuredOutputField key={key} fieldKey={key} value={value} />
+          ))}
+        </div>
+      </MessageContent>
+    </Message>
+  )
+}
+
+function AttributionStatStrip({ entries }: { entries: [string, unknown][] }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {entries.map(([key, value]) => {
+        const isTlp = key.toLowerCase() === "tlp"
+        const isConfidence = key.toLowerCase() === "attribution_confidence"
+        const display =
+          value === null || value === undefined || value === ""
+            ? "—"
+            : isConfidence && typeof value === "number"
+              ? `${Math.round(value * 100)}%`
+              : String(value)
+        return (
+          <div
+            key={key}
+            className="min-w-[110px] flex-1 rounded-md border bg-muted/30 px-3 py-2"
+          >
+            <div className="text-[0.65rem] text-muted-foreground uppercase tracking-wide">
+              {humanizeFieldName(key)}
+            </div>
+            <div
+              className={cn(
+                "font-semibold text-sm",
+                isTlp && value === "RED" && "text-red-500",
+                isTlp && value === "AMBER" && "text-amber-500",
+                isTlp && value === "GREEN" && "text-green-600"
+              )}
+            >
+              {display}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function isPriorityVerdictField(key: string, value: unknown): boolean {
+  return typeof value === "boolean" && getBooleanRisk(key, value) !== null
+}
+
+function humanizeFieldName(key: string): string {
+  return key.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+/** Field name fragments that make a `true` boolean a risk signal (shown in red). */
+const RISK_TRUE_KEYWORDS = [
+  "malicious",
+  "malware",
+  "is_tor",
+  "ransomware",
+  "c2_communication",
+  "data_exfiltration",
+  "lateral_movement",
+  "multiple_correlated_alerts",
+  "off_hours_activity",
+]
+
+/**
+ * Field name fragments where `true` is reassuring instead -- the inverse of
+ * RISK_TRUE_KEYWORDS (e.g. an IP being whitelisted, or a case being a
+ * confirmed false positive, is good news, so it renders green at `true`).
+ */
+const RISK_FALSE_KEYWORDS = [
+  "whitelisted",
+  "false_positive",
+  "benign",
+  "verdict",
+]
+
+/** Decides whether a boolean field should render as a colored risk badge, and which color. Returns `null` for fields with no recognized risk polarity, so callers fall back to plain "Yes"/"No" text rather than guessing. */
+function getBooleanRisk(
+  fieldKey: string,
+  value: boolean
+): "danger" | "safe" | null {
+  const key = fieldKey.toLowerCase()
+  if (RISK_TRUE_KEYWORDS.some((keyword) => key.includes(keyword))) {
+    return value ? "danger" : "safe"
+  }
+  if (RISK_FALSE_KEYWORDS.some((keyword) => key.includes(keyword))) {
+    return value ? "safe" : "danger"
+  }
+  return null
+}
+
+/**
+ * A field name like "is_false_positive" already contains a negation, so
+ * pairing it with a literal "No" reads as a confusing double negative
+ * ("Is False Positive: No" means it's a real threat, not obvious on a first
+ * read). For these fields, show a plain verdict phrase instead of Yes/No.
+ * Returns `null` for fields where Yes/No already reads fine, so the caller
+ * falls back to that.
+ */
+function getVerdictLabel(fieldKey: string, value: boolean): string | null {
+  const key = fieldKey.toLowerCase()
+  if (key.includes("false_positive") || key === "verdict") {
+    return value ? "False Positive" : "Confirmed Threat"
+  }
+  return null
+}
+
+function BooleanIndicator({
+  fieldKey,
+  value,
+}: {
+  fieldKey: string
+  value: boolean
+}) {
+  const risk = getBooleanRisk(fieldKey, value)
+  if (risk === null) {
+    return <span>{value ? "Yes" : "No"}</span>
+  }
+  const isDanger = risk === "danger"
+  const label = getVerdictLabel(fieldKey, value) ?? (value ? "Yes" : "No")
+  return (
+    <Badge
+      variant="outline"
+      className={cn(
+        "gap-1 font-medium",
+        isDanger
+          ? "border-red-500/50 bg-red-500/15 text-red-500"
+          : "border-green-600/50 bg-green-600/15 text-green-600"
+      )}
+    >
+      {isDanger ? (
+        <TriangleAlertIcon className="size-3" />
+      ) : (
+        <CheckIcon className="size-3" />
+      )}
+      {label}
+    </Badge>
+  )
+}
+
+/**
+ * Renders one top-level field of a StructuredOutput answer. Non-empty
+ * arrays of objects (e.g. a list of {value, type, malicious} IOCs) get a
+ * dedicated card per element instead of collapsing into one dense line, so
+ * risk badges inside them stay legible.
+ */
+function StructuredOutputField({
+  fieldKey,
+  value,
+}: {
+  fieldKey: string
+  value: unknown
+}) {
+  if (Array.isArray(value) && value.length > 0 && value.every(isPlainRecord)) {
+    return (
+      <div className="space-y-1">
+        <p className="text-sm font-medium">{humanizeFieldName(fieldKey)}:</p>
+        <div className="space-y-1.5">
+          {value.map((item, index) => (
+            <StructuredOutputCard key={index} item={item} />
+          ))}
+        </div>
+      </div>
+    )
+  }
+  if (
+    fieldKey.toLowerCase() === "recommendations" &&
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((item) => typeof item === "string")
+  ) {
+    return (
+      <div className="space-y-1">
+        <p className="text-sm font-medium">{humanizeFieldName(fieldKey)}:</p>
+        <ul className="space-y-1 text-sm">
+          {value.map((item, index) => (
+            <li key={index} className="flex gap-2">
+              <span className="text-muted-foreground">→</span>
+              <span>{item}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    )
+  }
+  return (
+    <p className="text-sm">
+      <span className="font-medium">{humanizeFieldName(fieldKey)}:</span>{" "}
+      {formatStructuredOutputValue(fieldKey, value)}
+    </p>
+  )
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+/**
+ * True when a text part's entire (trimmed) content is a parseable JSON
+ * object/array -- e.g. a model describing its StructuredOutput answer as
+ * raw JSON text instead of (or in addition to) actually calling the tool.
+ * Real prose never parses as JSON on its own, so this is safe to hide as
+ * redundant noise regardless of whether it appears before or after the
+ * StructuredOutput tool call in the message.
+ */
+function isJsonLikeText(text: string): boolean {
+  if (!text.startsWith("{") && !text.startsWith("[")) {
+    return false
+  }
+  try {
+    JSON.parse(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Renders one array-item card. When the item has a recognized risk boolean
+ * (e.g. `malicious`), that field becomes a bold verdict line up top --
+ * "⚠ Malicious — hash" -- with the item's `value`/`context` fields (when
+ * present) below it, so the risk reads before the details. Items with no
+ * risk field (e.g. investigator's endpoint_lookups) fall back to a plain
+ * key: value list.
+ */
+function StructuredOutputCard({ item }: { item: Record<string, unknown> }) {
+  const entries = Object.entries(item)
+  const riskEntry = entries.find(
+    (entry): entry is [string, boolean] =>
+      typeof entry[1] === "boolean" &&
+      getBooleanRisk(entry[0], entry[1]) !== null
+  )
+
+  if (!riskEntry) {
+    return (
+      <div className="space-y-0.5 rounded-md border bg-muted/30 px-2.5 py-1.5 text-sm">
+        {entries.map(([key, value]) => (
+          <div key={key} className="flex flex-wrap items-center gap-1">
+            <span className="font-medium">{humanizeFieldName(key)}:</span>
+            {formatStructuredOutputValue(key, value)}
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  const [riskKey, riskValue] = riskEntry
+  const isDanger = getBooleanRisk(riskKey, riskValue) === "danger"
+  const typeEntry = entries.find(
+    ([key, value]) => key.toLowerCase() === "type" && typeof value === "string"
+  )
+  const valueEntry = entries.find(([key]) => key.toLowerCase() === "value")
+  const contextEntry = entries.find(([key]) => key.toLowerCase() === "context")
+  const sourcesEntry = entries.find(
+    ([key, value]) => key.toLowerCase() === "sources" && isPlainRecord(value)
+  )
+  const consumedKeys = new Set(
+    [
+      riskKey,
+      typeEntry?.[0],
+      valueEntry?.[0],
+      contextEntry?.[0],
+      sourcesEntry?.[0],
+    ].filter((key): key is string => key !== undefined)
+  )
+  const remaining = entries.filter(([key]) => !consumedKeys.has(key))
+  const verdictLabel = riskValue
+    ? humanizeFieldName(riskKey)
+    : `Not ${humanizeFieldName(riskKey)}`
+
+  return (
+    <div className="space-y-1 rounded-md border bg-muted/30 px-3 py-2 text-sm">
+      <div
+        className={cn(
+          "flex items-center gap-1.5 font-semibold",
+          isDanger ? "text-red-500" : "text-green-600"
+        )}
+      >
+        {isDanger ? (
+          <TriangleAlertIcon className="size-3.5" />
+        ) : (
+          <CheckIcon className="size-3.5" />
+        )}
+        {verdictLabel}
+        {typeEntry && (
+          <span className="font-normal text-muted-foreground">
+            — {String(typeEntry[1])}
+          </span>
+        )}
+      </div>
+      {valueEntry && (
+        <div className="break-all font-medium font-mono text-sm">
+          {String(valueEntry[1])}
+        </div>
+      )}
+      {contextEntry && (
+        <div className="text-muted-foreground text-sm">
+          {String(contextEntry[1])}
+        </div>
+      )}
+      {sourcesEntry && (
+        <SourceBreakdown sources={sourcesEntry[1] as Record<string, unknown>} />
+      )}
+      {remaining.map(([key, value]) => (
+        <div
+          key={key}
+          className="flex flex-wrap items-center gap-1 text-muted-foreground"
+        >
+          <span className="font-medium text-foreground">
+            {humanizeFieldName(key)}:
+          </span>
+          {formatStructuredOutputValue(key, value)}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * Renders a per-source CTI breakdown (e.g. hash_lookup_all_sources' own
+ * "sources" object, copied verbatim into the model's answer) as a compact
+ * dot list -- one row per source, so each platform's result is visible on
+ * its own line instead of buried inside one dense "context" sentence.
+ */
+function SourceBreakdown({ sources }: { sources: Record<string, unknown> }) {
+  const rows = Object.entries(sources).filter(([, value]) =>
+    isPlainRecord(value)
+  )
+  if (rows.length === 0) {
+    return null
+  }
+  return (
+    <div className="space-y-1 border-t pt-1.5">
+      {rows.map(([name, value]) => {
+        const record = value as Record<string, unknown>
+        const status = typeof record.status === "string" ? record.status : ""
+        const isHit = status === "malicious"
+        const detail =
+          typeof record.detail === "string" ? record.detail : status || "—"
+        return (
+          <div key={name} className="flex items-start gap-2 text-xs">
+            <span
+              className={cn(
+                "mt-1 size-1.5 flex-shrink-0 rounded-full",
+                isHit ? "bg-red-500" : "bg-muted-foreground/40"
+              )}
+            />
+            <span
+              className={cn(
+                "w-24 flex-shrink-0 font-semibold",
+                isHit ? "text-red-500" : "text-muted-foreground"
+              )}
+            >
+              {humanizeFieldName(name)}
+            </span>
+            <span className="text-muted-foreground">{detail}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function formatStructuredOutputValue(
+  fieldKey: string,
+  value: unknown
+): ReactNode {
+  if (typeof value === "boolean") {
+    return <BooleanIndicator fieldKey={fieldKey} value={value} />
+  }
+  if (value === null || value === undefined || value === "") {
+    return "—"
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0
+      ? value
+          .map((item) => formatStructuredOutputArrayItemText(item))
+          .join("; ")
+      : "—"
+  }
+  if (typeof value === "object") {
+    return JSON.stringify(value)
+  }
+  return String(value)
+}
+
+/**
+ * Plain-text fallback for a nested array inside a single card field (rare --
+ * e.g. a list-of-lists value). Object elements expand as "key: value" text;
+ * this path doesn't render risk badges since it isn't the primary IOC-card
+ * rendering above.
+ */
+function formatStructuredOutputArrayItemText(item: unknown): string {
+  if (isPlainRecord(item)) {
+    return Object.entries(item)
+      .map(
+        ([key, value]) =>
+          `${key}: ${typeof value === "boolean" ? (value ? "Yes" : "No") : String(value)}`
+      )
+      .join(", ")
+  }
+  return String(item)
 }
 
 function getToolTitle(toolName: string, input: unknown): string {
@@ -1756,7 +2263,8 @@ const MemoizedMessagePart = memo(MessagePart, (prev, next) => {
     prev.role !== next.role ||
     prev.status !== next.status ||
     prev.isLastMessage !== next.isLastMessage ||
-    prev.onSubmitApprovals !== next.onSubmitApprovals
+    prev.onSubmitApprovals !== next.onSubmitApprovals ||
+    prev.isAfterStructuredOutput !== next.isAfterStructuredOutput
   ) {
     return false
   }

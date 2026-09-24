@@ -8,6 +8,7 @@ from pydantic import (
     ConfigDict,
     ValidationError,
 )
+from sqlalchemy import select
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry import (
@@ -18,6 +19,7 @@ from tracecat_registry import (
 from tracecat.auth.types import Role
 from tracecat.concurrency import GatheringTaskGroup
 from tracecat.db.engine import get_async_session_context_manager
+from tracecat.db.models import Group
 from tracecat.dsl.common import DSLInput, ExecuteSubflowArgs
 from tracecat.dsl.enums import PlatformAction
 from tracecat.dsl.schemas import ActionStatement
@@ -33,7 +35,7 @@ from tracecat.expressions.validator.validator import (
 from tracecat.integrations.enums import OAuthGrantType
 from tracecat.integrations.schemas import ProviderKey
 from tracecat.integrations.service import IntegrationService
-from tracecat.interactions.schemas import ResponseInteraction
+from tracecat.interactions.schemas import ApprovalInteraction, ResponseInteraction
 from tracecat.logger import logger
 from tracecat.registry.actions.service import RegistryActionsService
 from tracecat.registry.versions.schemas import RegistryVersionManifest
@@ -468,6 +470,40 @@ async def validate_dsl_actions(
                             msg=f"Response interactions are only supported for the following actions:\n"
                             f"{('\n'.join(f'- {x}' for x in PERMITTED_INTERACTION_ACTIONS))}\n",
                             loc=(act_stmt.ref, "interaction"),
+                        )
+                    )
+            case ApprovalInteraction() as approval:
+                if approval.required_approvers < 1:
+                    details.append(
+                        ValidationDetail(
+                            type="action",
+                            msg="`required_approvers` must be at least 1.",
+                            loc=(act_stmt.ref, "interaction", "required_approvers"),
+                        )
+                    )
+                if approval.approver_groups:
+                    result = await session.execute(
+                        select(Group.name).where(
+                            Group.organization_id == role.organization_id,
+                            Group.name.in_(approval.approver_groups),
+                        )
+                    )
+                    found = set(result.scalars().all())
+                    missing = set(approval.approver_groups) - found
+                    if missing:
+                        details.append(
+                            ValidationDetail(
+                                type="action",
+                                msg=f"`approver_groups` references unknown group(s): {', '.join(sorted(missing))}.",
+                                loc=(act_stmt.ref, "interaction", "approver_groups"),
+                            )
+                        )
+                if approval.approve_if and not is_template_only(approval.approve_if):
+                    details.append(
+                        ValidationDetail(
+                            type="action",
+                            msg=f"`approve_if` must only contain an expression. Got {approval.approve_if!r}.",
+                            loc=(act_stmt.ref, "interaction", "approve_if"),
                         )
                     )
             case None:

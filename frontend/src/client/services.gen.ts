@@ -229,6 +229,8 @@ import type {
   AgentUpdateProviderCredentialsResponse,
   ApprovalsDeleteApprovalData,
   ApprovalsDeleteApprovalResponse,
+  ApprovalsListApprovalsData,
+  ApprovalsListApprovalsResponse,
   ApprovalsSubmitApprovalsData,
   ApprovalsSubmitApprovalsResponse,
   AuthAuthDatabaseLoginData,
@@ -337,6 +339,8 @@ import type {
   CasesListEventsWithUsersResponse,
   CasesListFieldsData,
   CasesListFieldsResponse,
+  CasesListPendingApprovalsData,
+  CasesListPendingApprovalsResponse,
   CasesListTagsData,
   CasesListTagsResponse,
   CasesListTasksData,
@@ -830,6 +834,8 @@ import type {
   WorkflowExecutionsSearchWorkflowExecutionsResponse,
   WorkflowExecutionsTerminateWorkflowExecutionData,
   WorkflowExecutionsTerminateWorkflowExecutionResponse,
+  WorkflowExecutionsVoteOnInteractionData,
+  WorkflowExecutionsVoteOnInteractionResponse,
   WorkflowsAddTagData,
   WorkflowsAddTagResponse,
   WorkflowsCommitWorkflowData,
@@ -2520,6 +2526,36 @@ export const graphApplyGraphOperations = (
     path: {
       workspace_id: data.workspaceId,
       workflow_id: data.workflowId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Vote On Interaction
+ * Cast an authenticated in-app approve/reject vote on a pending approval interaction.
+ * @param data The data for the request.
+ * @param data.interactionId
+ * @param data.workspaceId
+ * @param data.executionId
+ * @param data.requestBody
+ * @returns ApprovalVoteResult Successful Response
+ * @throws ApiError
+ */
+export const workflowExecutionsVoteOnInteraction = (
+  data: WorkflowExecutionsVoteOnInteractionData
+): CancelablePromise<WorkflowExecutionsVoteOnInteractionResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/workflow-executions/{execution_id}/interactions/{interaction_id}/votes",
+    path: {
+      interaction_id: data.interactionId,
+      workspace_id: data.workspaceId,
+      execution_id: data.executionId,
     },
     body: data.requestBody,
     mediaType: "application/json",
@@ -6753,6 +6789,41 @@ export const agentSessionsForkSession = (
 }
 
 /**
+ * List Approvals
+ * List approvals in the workspace, optionally filtered by status and/or case.
+ *
+ * Used by external notification pollers to discover approvals without
+ * already knowing a specific session_id -- e.g. a scheduled workflow that
+ * checks for newly-created pending tool-call approvals and forwards them
+ * to Telegram. Also used by the case detail page's Approvals tab
+ * (case_id filter) to show pending approvals for that case directly.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.status
+ * @param data.caseId
+ * @returns ApprovalListItem Successful Response
+ * @throws ApiError
+ */
+export const approvalsListApprovals = (
+  data: ApprovalsListApprovalsData
+): CancelablePromise<ApprovalsListApprovalsResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/approvals",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    query: {
+      status: data.status,
+      case_id: data.caseId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Submit Approvals
  * Submit approval decisions to a running agent workflow.
  *
@@ -9618,6 +9689,36 @@ export const casesCreateComment = (
     },
     body: data.requestBody,
     mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * List Pending Approvals
+ * List pending workflow approval interactions for workflow runs linked to this case.
+ *
+ * A workflow execution is "linked" to a case when it recorded a case event
+ * carrying its `wf_exec_id` (e.g. it changed the case's status/fields, or
+ * was triggered by this case) — the same linkage already shown in the
+ * case's activity timeline.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.workspaceId
+ * @returns InteractionRead Successful Response
+ * @throws ApiError
+ */
+export const casesListPendingApprovals = (
+  data: CasesListPendingApprovalsData
+): CancelablePromise<CasesListPendingApprovalsResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/pending-approvals",
+    path: {
+      case_id: data.caseId,
+      workspace_id: data.workspaceId,
+    },
     errors: {
       422: "Validation Error",
     },

@@ -127,6 +127,11 @@ class LLMRoute:
             provider-specific body cleanup before forwarding. Managed fallback
             routes that may represent synthetic subagent models should defer
             that cleanup to LiteLLM.
+        enable_thinking: The originating agent config's own thinking toggle.
+            Only consulted for `model_provider == "custom-model-provider"`
+            (see `_forward_data`): the Claude Agent SDK CLI does not reliably
+            honor its own `thinking` request field for non-Anthropic
+            backends, so the proxy overrides it directly from this instead.
     """
 
     base_url: str
@@ -136,6 +141,7 @@ class LLMRoute:
     catalog_id: uuid.UUID | None = None
     authorization: str | None = field(default=None, repr=False)
     local_provider_cleanup: bool = True
+    enable_thinking: bool = True
 
     @property
     def is_direct(self) -> bool:
@@ -257,17 +263,33 @@ class LLMRoute:
         if self.local_provider_cleanup and self.model_provider != "anthropic":
             for field_name in _ANTHROPIC_ONLY_FIELDS:
                 forward_data.pop(field_name, None)
-            if self.model_provider == "custom-model-provider" and isinstance(
-                forward_data.get("thinking"), dict
+            if (
+                self.model_provider == "custom-model-provider"
+                and not self.enable_thinking
             ):
-                # The Claude Agent SDK CLI always emits thinking={"type": "adaptive"}
-                # for this route regardless of the enable_thinking preset setting, and
-                # Ollama's adaptive-thinking handling sometimes ends the turn right
-                # after the thinking block without emitting the actual tool call or
-                # text. Ollama's /v1/messages endpoint honors "disabled" correctly
-                # (verified directly), so force it here since the CLI gives us no
-                # other way to control this per request.
-                forward_data["thinking"] = {"type": "disabled"}
+                # The Claude Agent SDK CLI's own "thinking" field is Anthropic/
+                # Ollama-shaped: when present it is {"type": "adaptive"} regardless
+                # of the enable_thinking preset setting, and Ollama's /v1/messages
+                # endpoint honors an explicit "disabled" override there (verified
+                # directly). But for a "direct" (passthrough) route the CLI does
+                # not send a "thinking" field at all -- confirmed via live logging
+                # against this exact route (thinking_field: None) -- so gating the
+                # override on that field's presence silently skipped it. Only
+                # override "thinking" itself when the CLI actually sent it.
+                if isinstance(forward_data.get("thinking"), dict):
+                    forward_data["thinking"] = {"type": "disabled"}
+                # This is the override that actually matters for a raw vLLM
+                # server, which ignores the Anthropic-shaped "thinking" field
+                # entirely and instead controls Qwen3's reasoning through its own
+                # chat-template parameter -- confirmed directly against a real
+                # vLLM 0.29 /v1/messages endpoint: with this key it returns a
+                # clean answer (no "<think>" block, 3 completion tokens); without
+                # it, every answer is prefixed by a "<think>...</think>"
+                # reasoning block regardless of the "thinking" field above. Set
+                # unconditionally (not gated on "thinking" being present) so it
+                # still applies on routes where the CLI sends no "thinking" field
+                # at all.
+                forward_data["chat_template_kwargs"] = {"enable_thinking": False}
             if (
                 self.model_provider == "custom-model-provider"
                 and isinstance(forward_data.get("max_tokens"), int)
@@ -448,6 +470,7 @@ def _normalize_direct_route(route: LLMRoute) -> LLMRoute:
         catalog_id=route.catalog_id,
         authorization=route.authorization,
         local_provider_cleanup=route.local_provider_cleanup,
+        enable_thinking=route.enable_thinking,
     )
 
 

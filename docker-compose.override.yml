@@ -18,8 +18,13 @@ services:
     environment:
       HOST: "0.0.0.0"
       PORT: "8000"
+      # Base docker-compose.yml hardcodes this to http://minio:9000 for the
+      # api service only (worker/executor/agent-* all read it from .env) --
+      # override it here so api also respects TRACECAT__BLOB_STORAGE_ENDPOINT.
+      TRACECAT__BLOB_STORAGE_ENDPOINT: ${TRACECAT__BLOB_STORAGE_ENDPOINT:-http://minio:9000}
     volumes:
       - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
       - ./ca_wrapper.sh:/ca_wrapper.sh:ro
       - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
       - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
@@ -34,17 +39,24 @@ services:
 
   worker:
     volumes:
+      - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
+      - ./ca_wrapper_minio_only.sh:/ca_wrapper_minio_only.sh:ro
       - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
       - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+    entrypoint: ["/bin/bash", "/ca_wrapper_minio_only.sh"]
 
   executor:
     volumes:
+      - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
+      - ./ca_wrapper_minio_only.sh:/ca_wrapper_minio_only.sh:ro
       - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
       - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+    entrypoint: ["/bin/bash", "/ca_wrapper_minio_only.sh"]
 
   agent-executor:
     volumes:
       - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
       - ./ca_wrapper.sh:/ca_wrapper.sh:ro
       - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
       - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
@@ -54,6 +66,7 @@ services:
   agent-worker:
     volumes:
       - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
       - ./ca_wrapper.sh:/ca_wrapper.sh:ro
       - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
       - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
@@ -65,10 +78,26 @@ services:
       GROQ_API_KEY: "${GROQ_API_KEY}"
     volumes:
       - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
+      - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
       - ./ca_wrapper.sh:/ca_wrapper.sh:ro
       - ./tracecat/agent/litellm_config.yaml:/app/tracecat/agent/litellm_config.yaml:ro
       - ./tracecat/agent/gateway.py:/app/tracecat/agent/gateway.py:ro
     entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
+
+  minio:
+    volumes:
+      - ./caddy_certs/server.crt:/root/.minio/certs/public.crt:ro
+      - ./caddy_certs/server.key:/root/.minio/certs/private.key:ro
+    healthcheck:
+      # MinIO-nun oz "local" alias-i daxili olaraq HEMISE http://localhost:9000
+      # kimi qurulur (bizim TLS deyisikliyimizden xebersiz), TLS aktiv olanda
+      # "Client sent an HTTP request to an HTTPS server" xetasi verir. Ona gore
+      # her yoxlamadan evvel alias-i https+insecure (self-signed sert) ile
+      # yenidan qururuq.
+      test: ["CMD-SHELL", "mc alias set local https://localhost:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD --insecure && mc ready local --insecure"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   soc-mcp:
     build: ./soc-mcp

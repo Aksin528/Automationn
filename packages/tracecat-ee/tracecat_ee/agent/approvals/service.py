@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_ai.messages import (
     ToolCallPart,
@@ -225,9 +225,10 @@ class ApprovalService(BaseWorkspaceService):
         self,
         status: ApprovalStatus | None = None,
         case_id: uuid.UUID | None = None,
+        tool_call_ids: Sequence[str] | None = None,
     ) -> Sequence[Approval]:
-        """List all approvals in the workspace, optionally filtered by status
-        and/or case.
+        """List all approvals in the workspace, optionally filtered by status,
+        case, and/or a specific set of tool_call_ids.
 
         Used by external pollers (e.g. a Telegram-notification workflow) that
         need to discover newly-created pending approvals without already
@@ -235,6 +236,14 @@ class ApprovalService(BaseWorkspaceService):
         Approvals tab (filtered to one case_id) to show pending approvals
         for that case without needing any workflow to write them there
         separately.
+
+        `tool_call_ids` exists for the same Telegram-sync poller's second
+        pass: reconciling a small, already-known set of tool_call_ids whose
+        Telegram message hasn't reflected their decision yet. Filtering by
+        the exact IDs it's tracking keeps that lookup cheap regardless of
+        how large the workspace's total approval history grows -- unlike
+        `status`/`case_id` alone, which without either one still scans every
+        approval ever created in the workspace.
         """
         statement = select(Approval).where(
             Approval.workspace_id == self.workspace_id,
@@ -243,6 +252,10 @@ class ApprovalService(BaseWorkspaceService):
             statement = statement.where(Approval.status == status)
         if case_id is not None:
             statement = statement.where(Approval.case_id == case_id)
+        if tool_call_ids is not None:
+            statement = statement.where(
+                cast(Any, Approval.tool_call_id).in_(tool_call_ids)
+            )
         statement = statement.order_by(Approval.created_at.asc())
         result = await self.session.execute(statement)
         return result.scalars().all()
@@ -585,6 +598,15 @@ class ApprovalManager:
         """Get the approval decision for a specific tool call ID."""
         return self._approvals.get(tool_call_id)
 
+    def get_expected_tool_call(self, tool_call_id: str) -> ToolCallPart | None:
+        """Look up the pending tool call this approval was requested for.
+
+        Used to eagerly execute a single newly-approved tool as soon as its
+        own decision arrives, without waiting for sibling approvals in the
+        same batch -- see DurableAgentWorkflow._eagerly_execute_newly_approved_mcp_tools.
+        """
+        return self._expected_tool_calls.get(tool_call_id)
+
     def validate_responses(self, approvals: ApprovalMap) -> None:
         """Validate a (possibly partial) batch of approval responses.
 
@@ -632,47 +654,74 @@ class ApprovalManager:
                     f"cannot be None. Please provide a valid approval decision."
                 )
 
+    def _build_decision_payload(
+        self, tool_call_id: str, result: bool | DeferredToolApprovalResult
+    ) -> ApprovalDecisionPayload:
+        approved = False
+        reason: str | None = None
+        decision: bool | dict[str, Any] | None = None
+
+        match result:
+            case bool(value):
+                approved = value
+                decision = value
+            case ToolApproved(override_args=override_args):
+                approved = True
+                decision_payload: dict[str, Any] = {"kind": "tool-approved"}
+                if override_args is not None:
+                    decision_payload["override_args"] = override_args
+                decision = decision_payload
+            case ToolDenied(message=message):
+                approved = False
+                reason = message
+                decision_payload = {"kind": "tool-denied"}
+                if message:
+                    decision_payload["message"] = message
+                decision = decision_payload
+            case _:
+                raise RuntimeError("Invalid approval result", approval_result=result)
+        return ApprovalDecisionPayload(
+            tool_call_id=tool_call_id,
+            approved=approved,
+            reason=reason,
+            decision=decision,
+            decision_metadata=self._decision_metadata_by_tool_call_id.get(tool_call_id),
+            approved_by=self._approved_by,
+        )
+
+    async def apply_single_decision(self, tool_call_id: str) -> None:
+        """Persist one tool_call_id's decision to the DB immediately.
+
+        The `approval` row a reviewer's UI (Telegram, the case panel, the
+        Inbox) reads its APPROVED/REJECTED status from is normally only
+        written once, by handle_decisions(), after every expected
+        tool_call_id in the batch has a decision -- so a reviewer deciding
+        one card doesn't see it reflected anywhere until every sibling card
+        is also decided. Call this the moment a single decision arrives
+        (see DurableAgentWorkflow.set_approvals) so that row updates right
+        away instead. handle_decisions() still re-applies every decision at
+        full-batch time -- idempotent, since it just re-writes the same
+        status -- so this is purely an earlier, per-card mirror of that
+        same write, not a replacement for it.
+        """
+        result = self._approvals.get(tool_call_id)
+        if result is None:
+            return
+        await workflow.execute_activity(
+            ApprovalManager.apply_approval_decisions,
+            arg=ApplyApprovalResultsActivityInputs(
+                role=self.role,
+                session_id=self.session_id,
+                decisions=[self._build_decision_payload(tool_call_id, result)],
+            ),
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
     async def handle_decisions(self) -> None:
-        decisions: list[ApprovalDecisionPayload] = []
-
-        for tool_call_id, result in self._approvals.items():
-            approved = False
-            reason: str | None = None
-            decision: bool | dict[str, Any] | None = None
-
-            match result:
-                case bool(value):
-                    approved = value
-                    decision = value
-                case ToolApproved(override_args=override_args):
-                    approved = True
-                    decision_payload: dict[str, Any] = {"kind": "tool-approved"}
-                    if override_args is not None:
-                        decision_payload["override_args"] = override_args
-                    decision = decision_payload
-                case ToolDenied(message=message):
-                    approved = False
-                    reason = message
-                    decision_payload = {"kind": "tool-denied"}
-                    if message:
-                        decision_payload["message"] = message
-                    decision = decision_payload
-                case _:
-                    raise RuntimeError(
-                        "Invalid approval result", approval_result=result
-                    )
-            decisions.append(
-                ApprovalDecisionPayload(
-                    tool_call_id=tool_call_id,
-                    approved=approved,
-                    reason=reason,
-                    decision=decision,
-                    decision_metadata=self._decision_metadata_by_tool_call_id.get(
-                        tool_call_id
-                    ),
-                    approved_by=self._approved_by,
-                )
-            )
+        decisions: list[ApprovalDecisionPayload] = [
+            self._build_decision_payload(tool_call_id, result)
+            for tool_call_id, result in self._approvals.items()
+        ]
         if decisions:
             await workflow.execute_activity(
                 ApprovalManager.apply_approval_decisions,

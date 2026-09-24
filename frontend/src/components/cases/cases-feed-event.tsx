@@ -2,18 +2,25 @@ import {
   BracesIcon,
   ClockPlusIcon,
   EyeIcon,
+  HourglassIcon,
   type LucideIcon,
   MessageSquareIcon,
   PaperclipIcon,
   PencilIcon,
   PencilLineIcon,
   PlusIcon,
+  ShieldCheckIcon,
+  ShieldQuestionIcon,
+  ShieldXIcon,
   TagIcon,
   TrashIcon,
   UserIcon,
   UserXIcon,
 } from "lucide-react"
 import type {
+  ApprovalRequestedEventRead,
+  ApprovalResolvedEventRead,
+  ApprovalTimedOutEventRead,
   AssigneeChangedEventRead,
   AttachmentCreatedEventRead,
   AttachmentDeletedEventRead,
@@ -831,6 +838,68 @@ export function TagRemovedEvent({
       <span>
         <EventActor user={actor} /> removed tag{" "}
         <span className="font-medium">{event.tag_name}</span>
+      </span>
+    </div>
+  )
+}
+
+// Approval-gate events. No human "actor" at these points — a workflow
+// requesting/timing out an approval isn't a case-panel action the way a
+// comment or a status change is, and the approve/reject decision belongs
+// to whoever voted on the interaction, not whoever's viewing the case —
+// so unlike the events above, these render without `EventActor`.
+
+export function ApprovalRequestedEvent({
+  event,
+}: {
+  event: ApprovalRequestedEventRead
+}) {
+  return (
+    <div className="flex items-center space-x-2 text-xs">
+      <EventIcon icon={ShieldQuestionIcon} />
+      <span>
+        Approval requested for{" "}
+        <span className="font-medium">{event.action_ref}</span> (
+        {event.required_approvers} approval
+        {event.required_approvers === 1 ? "" : "s"} required)
+      </span>
+    </div>
+  )
+}
+
+export function ApprovalResolvedEvent({
+  event,
+}: {
+  event: ApprovalResolvedEventRead
+}) {
+  const approved = event.resolution === "approved"
+  return (
+    <div className="flex items-center space-x-2 text-xs">
+      <EventIcon
+        icon={approved ? ShieldCheckIcon : ShieldXIcon}
+        className={
+          approved ? "text-emerald-600 bg-emerald-50" : "text-red-600 bg-red-50"
+        }
+      />
+      <span>
+        Approval {event.resolution} for{" "}
+        <span className="font-medium">{event.action_ref}</span>
+      </span>
+    </div>
+  )
+}
+
+export function ApprovalTimedOutEvent({
+  event,
+}: {
+  event: ApprovalTimedOutEventRead
+}) {
+  return (
+    <div className="flex items-center space-x-2 text-xs">
+      <EventIcon icon={HourglassIcon} className="text-amber-600 bg-amber-50" />
+      <span>
+        Approval for <span className="font-medium">{event.action_ref}</span>{" "}
+        timed out
       </span>
     </div>
   )

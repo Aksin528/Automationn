@@ -449,6 +449,11 @@ TRACECAT__BLOB_STORAGE_BUCKET_ATTACHMENTS = os.environ.get(
 )
 """Bucket for case attachments."""
 
+TRACECAT__BLOB_STORAGE_BUCKET_REPORTS = os.environ.get(
+    "TRACECAT__BLOB_STORAGE_BUCKET_REPORTS", "reports"
+)
+"""Bucket for generated case incident-report PDFs."""
+
 TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY = os.environ.get(
     "TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY", "tracecat-registry"
 )

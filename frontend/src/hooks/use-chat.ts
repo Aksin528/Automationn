@@ -8,6 +8,7 @@ import {
 import {
   type ChatOnDataCallback,
   DefaultChatTransport,
+  isToolUIPart,
   type UIMessage,
 } from "ai"
 import { useCallback, useMemo, useState } from "react"
@@ -384,8 +385,56 @@ export function useGetChatVercel({
       })
     },
     enabled: !!chatId,
+    // A tool-call card's approve/reject status can be decided from
+    // somewhere other than this tab (Telegram, the case panel, another
+    // browser tab) -- there's no push notification back to this query, so
+    // without polling this pane keeps showing the stale "awaiting
+    // approval" card indefinitely until the user manually reloads. Only
+    // poll while a decision is actually outstanding, same idea as
+    // useCaseApprovals in lib/hooks.tsx -- a finished chat with no pending
+    // tool calls left has nothing that can change on its own, so there's
+    // no reason to keep hitting the API for it.
+    refetchInterval: (query) =>
+      hasPendingApprovalToolCall(query.state.data) ? 15_000 : false,
   })
   return { chat, chatLoading, chatError }
+}
+
+/**
+ * True when the chat's message history still has a tool call whose
+ * approval decision is outstanding (rendered as the amber "awaiting
+ * approval" clock badge in chat-session-pane.tsx). Mirrors the same
+ * "requires approval. Request sent for review" marker MessagePart checks
+ * there -- used here only to decide whether useGetChatVercel should keep
+ * polling, not to render anything.
+ */
+function hasPendingApprovalToolCall(
+  chat: AgentSessionsGetSessionVercelResponse | undefined
+): boolean {
+  for (const message of chat?.messages ?? []) {
+    for (const part of message.parts ?? []) {
+      if (part.type === "data-approval-request") {
+        const payload = (part as { data?: unknown }).data
+        if (Array.isArray(payload) && payload.some(Boolean)) {
+          return true
+        }
+        continue
+      }
+      if (isToolUIPart(part as Parameters<typeof isToolUIPart>[0])) {
+        const errorText =
+          "errorText" in part
+            ? (part as { errorText?: string }).errorText
+            : undefined
+        const output = (part as { output?: unknown }).output
+        const outputText = typeof output === "string" ? output : undefined
+        const text = errorText ?? outputText ?? ""
+        if (text.includes("requires approval. Request sent for review")) {
+          return true
+        }
+      }
+    }
+  }
+  return false
 }
 
 function applyArtifactsToVercelChat(

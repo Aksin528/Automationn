@@ -90,6 +90,9 @@ class CaseEventType(StrEnum):
     COMMENT_REPLY_CREATED = "comment_reply_created"
     COMMENT_REPLY_UPDATED = "comment_reply_updated"
     COMMENT_REPLY_DELETED = "comment_reply_deleted"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_RESOLVED = "approval_resolved"
+    APPROVAL_TIMED_OUT = "approval_timed_out"
 
 
 class CaseTaskStatus(StrEnum):

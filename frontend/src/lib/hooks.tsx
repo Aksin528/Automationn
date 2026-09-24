@@ -21,6 +21,12 @@ import {
   type AgentSessionsListSessionsResponse,
   type AgentSettingsRead,
   ApiError,
+  type ApprovalListItem,
+  type ApprovalsDeleteApprovalData,
+  type ApprovalsListApprovalsData,
+  type ApprovalsSubmitApprovalsData,
+  type ApprovalVoteRequest,
+  type ApprovalVoteResult,
   type AppSettingsRead,
   type AuditSettingsRead,
   type AwsAssumeRoleAccessRead,
@@ -37,6 +43,9 @@ import {
   agentSessionsListSessions,
   agentSetDefaultModel,
   agentUpdateProviderCredentials,
+  approvalsDeleteApproval,
+  approvalsListApprovals,
+  approvalsSubmitApprovals,
   type CaseCommentCreate,
   type CaseCommentRead,
   type CaseCommentThreadRead,
@@ -59,6 +68,7 @@ import {
   type CasesGetCaseData,
   type CasesListCommentsData,
   type CasesListCommentThreadsData,
+  type CasesListPendingApprovalsData,
   type CasesListTagsData,
   type CasesListTasksData,
   type CasesSearchCasesData,
@@ -93,6 +103,7 @@ import {
   casesListCommentThreads,
   casesListEventsWithUsers,
   casesListFields,
+  casesListPendingApprovals,
   casesListTags,
   casesListTasks,
   casesRemoveTag,
@@ -129,6 +140,7 @@ import {
   type IntegrationRead,
   type IntegrationReadMinimal,
   type IntegrationUpdate,
+  type InteractionRead,
   integrationsConnectProvider,
   integrationsDeleteIntegration,
   integrationsDisconnectIntegration,
@@ -328,6 +340,7 @@ import {
   type WorkflowExecutionCreate,
   type WorkflowExecutionRead,
   type WorkflowExecutionReadMinimal,
+  type WorkflowExecutionsVoteOnInteractionData,
   type WorkflowFolderCreate,
   type WorkflowFolderRead,
   type WorkflowReadMinimal,
@@ -343,6 +356,7 @@ import {
   workflowExecutionsGetWorkflowExecution,
   workflowExecutionsGetWorkflowExecutionCompact,
   workflowExecutionsListWorkflowExecutions,
+  workflowExecutionsVoteOnInteraction,
   workflowsAddTag,
   workflowsCreateWorkflow,
   workflowsDeleteWorkflow,
@@ -3961,6 +3975,264 @@ export function useDeleteCaseComment({
     deleteComment,
     deleteCommentIsPending,
     deleteCommentError,
+  }
+}
+
+/**
+ * List pending approval-gated workflow interactions linked to a case.
+ *
+ * Polls faster while there's at least one pending approval, since these are
+ * time-sensitive (they can be voted on by someone else, or time out, at any
+ * moment) — and backs off to a slower interval once the queue is empty.
+ */
+export function usePendingApprovals({
+  caseId,
+  workspaceId,
+  enabled = true,
+}: CasesListPendingApprovalsData & { enabled?: boolean }) {
+  const {
+    data: pendingApprovals,
+    isLoading: pendingApprovalsIsLoading,
+    error: pendingApprovalsError,
+  } = useQuery<InteractionRead[], TracecatApiError>({
+    queryKey: ["pending-approvals", caseId, workspaceId],
+    queryFn: async () =>
+      await casesListPendingApprovals({ caseId, workspaceId }),
+    enabled,
+    refetchInterval: (query) =>
+      (query.state.data?.length ?? 0) > 0 ? 10_000 : 30_000,
+  })
+
+  return {
+    pendingApprovals,
+    pendingApprovalsIsLoading,
+    pendingApprovalsError,
+  }
+}
+
+/**
+ * Record an approve/reject decision on a pending approval interaction.
+ *
+ * `record_vote` is idempotent server-side (a duplicate or late vote is a
+ * no-op reporting the interaction's existing outcome rather than an error),
+ * so this hook doesn't need to pre-check "did I already vote" — it always
+ * just submits and lets the response's `resolution` reflect reality.
+ */
+export function useVoteOnInteraction({
+  caseId,
+  workspaceId,
+}: {
+  caseId: string
+  workspaceId: string
+}) {
+  const queryClient = useQueryClient()
+
+  const {
+    mutateAsync: voteOnInteraction,
+    isPending: voteOnInteractionIsPending,
+    error: voteOnInteractionError,
+  } = useMutation({
+    mutationFn: async (params: {
+      executionId: string
+      interactionId: string
+      requestBody: ApprovalVoteRequest
+    }): Promise<ApprovalVoteResult> =>
+      await workflowExecutionsVoteOnInteraction({
+        ...params,
+        workspaceId,
+      } satisfies WorkflowExecutionsVoteOnInteractionData),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["pending-approvals", caseId, workspaceId],
+      })
+    },
+    onError: (error: TracecatApiError) => {
+      console.error("Error voting on interaction", error)
+      toast({
+        title: "Error submitting vote",
+        description: `An error occurred while submitting your vote: ${error.body.detail}`,
+        variant: "destructive",
+      })
+    },
+  })
+
+  return {
+    voteOnInteraction,
+    voteOnInteractionIsPending,
+    voteOnInteractionError,
+  }
+}
+
+/**
+ * List pending native tool-call approvals (the same `Approval` records
+ * gating an agent session's containment actions) linked to a case, via the
+ * `case_id` the session was created with.
+ *
+ * Unlike `usePendingApprovals` (the older `Interaction`/`ApprovalVote`
+ * system, not currently wired to any real workflow), this reads the same
+ * data the Agents "Review approvals" dialog, the Inbox, and the
+ * "Sync approvals to Telegram" workflow already act on -- resolving one
+ * from any of those surfaces resolves it everywhere.
+ */
+export function useCaseApprovals({
+  caseId,
+  workspaceId,
+  enabled = true,
+}: {
+  caseId: string
+  workspaceId: string
+  enabled?: boolean
+}) {
+  const {
+    data: caseApprovals,
+    isLoading: caseApprovalsIsLoading,
+    error: caseApprovalsError,
+  } = useQuery<ApprovalListItem[], TracecatApiError>({
+    queryKey: ["case-approvals", caseId, workspaceId],
+    queryFn: async () =>
+      // No status filter -- the panel shows the case's full approval
+      // history (pending, approved, rejected) together, in the order the
+      // agent proposed each action, not just whichever one is pending right
+      // now. Resolved cards render read-only; see ApprovalCard below.
+      await approvalsListApprovals({
+        workspaceId,
+        caseId,
+      } satisfies ApprovalsListApprovalsData),
+    enabled,
+    refetchInterval: (query) =>
+      query.state.data?.some((a) => a.status === "pending") ? 10_000 : 30_000,
+  })
+
+  return {
+    caseApprovals,
+    caseApprovalsIsLoading,
+    caseApprovalsError,
+  }
+}
+
+/**
+ * Approve or reject one pending tool-call approval from the case panel.
+ *
+ * Submits to the same endpoint the Agents "Review approvals" dialog and
+ * Inbox use (`POST /approvals/{session_id}`), so the decision resumes the
+ * paused agent session directly -- this isn't a separate, comment-only
+ * sign-off.
+ */
+export function useSubmitCaseApproval({
+  caseId,
+  workspaceId,
+}: {
+  caseId: string
+  workspaceId: string
+}) {
+  const queryClient = useQueryClient()
+
+  const {
+    mutateAsync: submitCaseApproval,
+    isPending: submitCaseApprovalIsPending,
+    error: submitCaseApprovalError,
+  } = useMutation({
+    mutationFn: async (params: {
+      sessionId: string
+      toolCallId: string
+      approved: boolean
+    }) =>
+      await approvalsSubmitApprovals({
+        sessionId: params.sessionId,
+        workspaceId,
+        requestBody: {
+          approvals: { [params.toolCallId]: params.approved },
+        },
+      } satisfies ApprovalsSubmitApprovalsData),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["case-approvals", caseId, workspaceId],
+      })
+      toast({
+        title: variables.approved ? "Approval approved" : "Approval rejected",
+        description: variables.approved
+          ? "The agent will resume and run the approved action."
+          : "The agent will not run this action.",
+      })
+    },
+    onError: (error: TracecatApiError) => {
+      // 410 Gone: the session's Temporal execution is confirmed dead (see
+      // submit_approvals in the backend router). This is detected reactively,
+      // right here at click-time, not shown speculatively by the list --
+      // the caller (ApprovalCard) checks error.status === 410 and switches
+      // that card to an "Expired" state instead of showing this toast.
+      if (error.status === 410) {
+        return
+      }
+      console.error("Error submitting case approval decision", error)
+      toast({
+        title: "Error submitting decision",
+        description: `An error occurred while submitting your decision: ${error.body.detail}`,
+        variant: "destructive",
+      })
+    },
+  })
+
+  return {
+    submitCaseApproval,
+    submitCaseApprovalIsPending,
+    submitCaseApprovalError,
+  }
+}
+
+/**
+ * Dismiss an expired approval from the case panel.
+ *
+ * Calls `DELETE /approvals/{session_id}`: if the session's Temporal
+ * execution is still alive this denies the pending approvals so the agent
+ * step fails cleanly; if it's already gone (the expired case this button is
+ * for) it just deletes the stale Approval record. Either way there is
+ * nothing left to approve/reject afterward -- retrying the action means
+ * sending a new chat message to the case, which starts a fresh session.
+ */
+export function useDismissCaseApproval({
+  caseId,
+  workspaceId,
+}: {
+  caseId: string
+  workspaceId: string
+}) {
+  const queryClient = useQueryClient()
+
+  const {
+    mutateAsync: dismissCaseApproval,
+    isPending: dismissCaseApprovalIsPending,
+    error: dismissCaseApprovalError,
+  } = useMutation({
+    mutationFn: async (params: { sessionId: string }) =>
+      await approvalsDeleteApproval({
+        sessionId: params.sessionId,
+        workspaceId,
+      } satisfies ApprovalsDeleteApprovalData),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ["case-approvals", caseId, workspaceId],
+      })
+      toast({
+        title: "Approval dismissed",
+        description:
+          "Send a new chat message to the case if you want the agent to retry this action.",
+      })
+    },
+    onError: (error: TracecatApiError) => {
+      console.error("Error dismissing case approval", error)
+      toast({
+        title: "Error dismissing approval",
+        description: `An error occurred while dismissing this approval: ${error.body.detail}`,
+        variant: "destructive",
+      })
+    },
+  })
+
+  return {
+    dismissCaseApproval,
+    dismissCaseApprovalIsPending,
+    dismissCaseApprovalError,
   }
 }
 

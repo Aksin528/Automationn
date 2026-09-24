@@ -4,6 +4,7 @@ from typing import Literal, NoReturn, TypedDict
 
 from asyncpg import DuplicateColumnError
 from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError, NoResultFound, ProgrammingError
 from starlette.status import (
     HTTP_200_OK,
@@ -57,17 +58,21 @@ from tracecat.cases.service import (
 from tracecat.cases.tags.schemas import CaseTagRead
 from tracecat.cases.tags.service import CaseTagsService
 from tracecat.db.dependencies import AsyncDBSession
+from tracecat.db.models import ApprovalVote, CaseEvent, Interaction
+from tracecat.ee.interactions.schemas import InteractionRead
 from tracecat.exceptions import (
     TracecatAuthorizationError,
     TracecatNotFoundError,
     TracecatValidationError,
 )
 from tracecat.identifiers.workflow import WorkflowUUID
+from tracecat.interactions.enums import InteractionStatus, InteractionType
 from tracecat.logger import logger
 from tracecat.pagination import (
     CursorPaginatedResponse,
     CursorPaginationParams,
 )
+from tracecat.settings.service import get_setting
 from tracecat.tiers.enums import Entitlement
 
 cases_router = APIRouter(prefix="/cases", tags=["cases"])
@@ -669,6 +674,102 @@ async def list_comments(
     return await comments_svc.list_comments(case)
 
 
+@cases_router.get("/{case_id}/pending-approvals", status_code=HTTP_200_OK)
+@require_scope("case:read")
+async def list_pending_approvals(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> list[InteractionRead]:
+    """List pending workflow approval interactions for workflow runs linked to this case.
+
+    A workflow execution is "linked" to a case when it recorded a case event
+    carrying its `wf_exec_id` (e.g. it changed the case's status/fields, or
+    was triggered by this case) — the same linkage already shown in the
+    case's activity timeline.
+    """
+    if not await get_setting("app_interactions_enabled", default=False):
+        return []
+    service = CasesService(session, role)
+    case = await service.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+    wf_exec_id_col = CaseEvent.data["wf_exec_id"].astext
+    result = await session.execute(
+        select(wf_exec_id_col)
+        .where(
+            CaseEvent.workspace_id == role.workspace_id,
+            CaseEvent.case_id == case_id,
+            wf_exec_id_col.is_not(None),
+        )
+        .distinct()
+    )
+    wf_exec_ids = [v for v in result.scalars().all() if v]
+    if not wf_exec_ids:
+        return []
+
+    interactions_result = await session.execute(
+        select(Interaction)
+        .where(
+            Interaction.workspace_id == role.workspace_id,
+            Interaction.wf_exec_id.in_(wf_exec_ids),
+            Interaction.type == InteractionType.APPROVAL,
+            Interaction.status == InteractionStatus.PENDING,
+        )
+        .order_by(Interaction.created_at)
+    )
+    interactions = interactions_result.scalars().all()
+    if not interactions:
+        return []
+
+    # Live "approve" vote counts for these still-PENDING interactions.
+    # `response_payload["votes"]` (the resolved-outcome breakdown) isn't
+    # populated yet at this point, so this is the only source for "how many
+    # of the required approvals are already in" — see `InteractionRead.
+    # current_approvals`.
+    interaction_ids = [i.id for i in interactions]
+    vote_counts_result = await session.execute(
+        select(ApprovalVote.interaction_id, func.count())
+        .where(
+            ApprovalVote.workspace_id == role.workspace_id,
+            ApprovalVote.interaction_id.in_(interaction_ids),
+            ApprovalVote.decision == "approve",
+        )
+        .group_by(ApprovalVote.interaction_id)
+    )
+    # dict(vote_counts_result.all()) is what ruff's C416 wants, but
+    # basedpyright can't resolve the right dict.__init__ overload for a
+    # sequence of SQLAlchemy Row objects that way (matches an unrelated
+    # bytes-keyed overload instead) — the explicit comprehension is the one
+    # that actually type-checks clean.
+    vote_counts: dict[uuid.UUID, int] = {  # noqa: C416
+        interaction_id: count for interaction_id, count in vote_counts_result.all()
+    }
+
+    return [
+        InteractionRead(
+            id=i.id,
+            wf_exec_id=i.wf_exec_id,
+            type=i.type,
+            status=i.status,
+            request_payload=i.request_payload,
+            response_payload=i.response_payload,
+            expires_at=i.expires_at,
+            created_at=i.created_at,
+            updated_at=i.updated_at,
+            actor=i.actor,
+            action_ref=i.action_ref,
+            action_type=i.action_type,
+            current_approvals=vote_counts.get(i.id, 0),
+        )
+        for i in interactions
+    ]
+
+
 @cases_router.get("/{case_id}/comments/threads", status_code=HTTP_200_OK)
 @require_scope("case:read")
 async def list_comment_threads(
@@ -711,6 +812,86 @@ async def create_comment(
         await comments_svc.create_comment(case, params)
     except (TracecatAuthorizationError, TracecatValidationError) as exc:
         _raise_comment_http_error(exc)
+
+
+@cases_router.post("/{case_id}/report/pdf", status_code=HTTP_204_NO_CONTENT)
+@require_scope("case:update")
+async def upload_incident_report_pdf(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> None:
+    """Render the saved incident report to PDF and persist it to blob storage.
+
+    The report form itself (`Case.payload["incident_report"]`) stays in
+    Postgres -- that's what the "Edit report" dialog reads back to repopulate
+    its fields -- so this endpoint takes no body: it reads that same payload
+    (already saved by the case-update call the frontend makes right before
+    this one) and renders it server-side via `incident_report_pdf`.
+
+    Rendering happens here rather than in the browser (html2canvas/jsPDF)
+    specifically because that rasterized every block as a lossless PNG,
+    which blocked the tab's main thread for up to a minute on a fully-filled
+    report; reportlab paginates real PDF text and costs the browser nothing.
+    Keyed by the case's short_id so each save overwrites the previous
+    snapshot instead of accumulating duplicates, mirroring how
+    `CaseAttachmentService` uploads to the attachments bucket.
+    """
+    from tracecat.cases.incident_report_pdf import render_incident_report_pdf
+    from tracecat.cases.service import CasesService
+    from tracecat.storage import blob
+
+    cases_svc = CasesService(session, role)
+    case = await cases_svc.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+
+    incident_report = (case.payload or {}).get("incident_report")
+    if not isinstance(incident_report, dict):
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="No incident report saved on this case",
+        )
+
+    try:
+        content = render_incident_report_pdf(incident_report, case.short_id)
+    except Exception as exc:
+        logger.error(
+            "Failed to render incident report PDF",
+            case_id=case_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to render incident report PDF",
+        ) from exc
+
+    bucket = config.TRACECAT__BLOB_STORAGE_BUCKET_REPORTS
+    key = f"reports/{case.short_id}.pdf"
+    try:
+        await blob.ensure_bucket_exists(bucket)
+        await blob.upload_file(
+            content=content,
+            key=key,
+            bucket=bucket,
+            content_type="application/pdf",
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to upload incident report PDF",
+            case_id=case_id,
+            bucket=bucket,
+            key=key,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to store incident report PDF",
+        ) from exc
 
 
 @cases_router.patch(

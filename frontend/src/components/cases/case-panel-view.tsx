@@ -3,9 +3,11 @@
 import {
   Activity,
   Braces,
+  FileText,
   MessageSquare,
   MoreHorizontal,
   Paperclip,
+  ShieldCheck,
   Table2,
   X,
 } from "lucide-react"
@@ -22,6 +24,7 @@ import type {
 import { CaseAttachmentsSection } from "@/components/cases/case-attachments-section"
 import { CaseClosureDialog } from "@/components/cases/case-closure-dialog"
 import { CommentSection } from "@/components/cases/case-comments-section"
+import { CaseIncidentReportSection } from "@/components/cases/case-incident-report-section"
 import { CaseLinkedRowsSection } from "@/components/cases/case-linked-rows-section"
 import { CustomField } from "@/components/cases/case-panel-custom-fields"
 import { CasePanelDescription } from "@/components/cases/case-panel-description"
@@ -35,11 +38,13 @@ import {
 } from "@/components/cases/case-panel-selectors"
 import { CasePanelSummary } from "@/components/cases/case-panel-summary"
 import { CasePayloadSection } from "@/components/cases/case-payload-section"
+import { PendingApprovalsSection } from "@/components/cases/case-pending-approvals-section"
 import { CaseTasksSection } from "@/components/cases/case-tasks-section"
 import { CaseWorkflowTrigger } from "@/components/cases/case-workflow-trigger"
 import { CaseFeed } from "@/components/cases/cases-feed"
 import { AlertNotification } from "@/components/notifications"
 import { TagBadge } from "@/components/tag-badge"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -68,6 +73,8 @@ import {
   useCaseFields,
   useCaseTagCatalog,
   useGetCase,
+  useOrgAppSettings,
+  usePendingApprovals,
   useRemoveCaseTag,
   useSetCaseDropdownValue,
   useUpdateCase,
@@ -75,13 +82,22 @@ import {
 import { cn, undoSlugify } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
-type CasePanelTab = "comments" | "activity" | "attachments" | "rows" | "payload"
+type CasePanelTab =
+  | "comments"
+  | "activity"
+  | "approvals"
+  | "attachments"
+  | "rows"
+  | "payload"
+  | "report"
 const CASE_PANEL_TABS = new Set<CasePanelTab>([
   "comments",
   "activity",
+  "approvals",
   "attachments",
   "rows",
   "payload",
+  "report",
 ])
 
 function parseCasePanelTab(
@@ -122,6 +138,14 @@ export function CasePanelView({
   const router = useRouter()
   const searchParams = useSearchParams()
   const caseAddonsEnabled = true
+  const { appSettings } = useOrgAppSettings()
+  const interactionsEnabled = !!appSettings?.app_interactions_enabled
+  const { pendingApprovals } = usePendingApprovals({
+    caseId,
+    workspaceId,
+    enabled: interactionsEnabled,
+  })
+  const pendingApprovalsCount = pendingApprovals?.length ?? 0
 
   const { caseData, caseDataIsLoading, caseDataError } = useGetCase({
     caseId,
@@ -670,6 +694,21 @@ export function CasePanelView({
                   </TabsTrigger>
                   <TabsTrigger
                     className={tabTriggerClassName}
+                    value="approvals"
+                  >
+                    <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />
+                    Approvals
+                    {pendingApprovalsCount > 0 ? (
+                      <Badge
+                        variant="secondary"
+                        className="ml-1.5 h-4 min-w-4 rounded-full px-1 text-[10px] leading-none"
+                      >
+                        {pendingApprovalsCount}
+                      </Badge>
+                    ) : null}
+                  </TabsTrigger>
+                  <TabsTrigger
+                    className={tabTriggerClassName}
                     value="attachments"
                   >
                     <Paperclip className="mr-1.5 h-3.5 w-3.5" />
@@ -683,6 +722,10 @@ export function CasePanelView({
                     <Braces className="mr-1.5 h-3.5 w-3.5" />
                     Payload
                   </TabsTrigger>
+                  <TabsTrigger className={tabTriggerClassName} value="report">
+                    <FileText className="mr-1.5 h-3.5 w-3.5" />
+                    Report
+                  </TabsTrigger>
                 </TabsList>
                 <Separator className="mt-0" />
 
@@ -692,6 +735,13 @@ export function CasePanelView({
 
                 <TabsContent value="activity" className="mt-4">
                   <CaseFeed caseId={caseId} workspaceId={workspaceId} />
+                </TabsContent>
+
+                <TabsContent value="approvals" className="mt-4 space-y-4">
+                  <PendingApprovalsSection
+                    caseId={caseId}
+                    workspaceId={workspaceId}
+                  />
                 </TabsContent>
 
                 <TabsContent value="attachments" className="mt-4">
@@ -707,6 +757,14 @@ export function CasePanelView({
 
                 <TabsContent value="payload" className="mt-4">
                   <CasePayloadSection caseData={caseData} />
+                </TabsContent>
+
+                <TabsContent value="report" className="mt-4">
+                  <CaseIncidentReportSection
+                    caseId={caseId}
+                    workspaceId={workspaceId}
+                    caseData={caseData}
+                  />
                 </TabsContent>
               </Tabs>
             </div>

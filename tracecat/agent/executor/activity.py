@@ -281,6 +281,7 @@ class SandboxedAgentExecutor:
                 # Managed subagent requests use synthetic LiteLLM route keys, so
                 # the proxy should let LiteLLM do provider-specific body cleanup.
                 local_provider_cleanup=not self.input.subagents,
+                enable_thinking=config.enable_thinking,
             ),
             direct_routes=self._direct_passthrough_routes(),
         )
@@ -308,6 +309,7 @@ class SandboxedAgentExecutor:
                 config.base_url,
                 model_provider=config.model_provider,
                 catalog_id=config.catalog_id,
+                enable_thinking=config.enable_thinking,
             )
 
         for subagent in self.input.subagents:
@@ -326,6 +328,7 @@ class SandboxedAgentExecutor:
                 model_provider=config.model_provider,
                 catalog_id=config.catalog_id,
                 upstream_model_name=config.model_name,
+                enable_thinking=config.enable_thinking,
             )
         return routes
 
@@ -336,6 +339,7 @@ class SandboxedAgentExecutor:
         model_provider: str,
         catalog_id: uuid.UUID | None,
         upstream_model_name: str | None = None,
+        enable_thinking: bool = True,
     ) -> LLMRoute:
         """Create one direct passthrough route.
 
@@ -344,6 +348,7 @@ class SandboxedAgentExecutor:
             model_provider: Provider behind the custom route.
             catalog_id: Optional custom-provider catalog row for credentials.
             upstream_model_name: Optional model name to send to the upstream.
+            enable_thinking: This route's own agent config's thinking toggle.
 
         Returns:
             Direct route for the model config.
@@ -361,6 +366,7 @@ class SandboxedAgentExecutor:
             model_provider=model_provider,
             catalog_id=catalog_id,
             upstream_model_name=upstream_model_name,
+            enable_thinking=enable_thinking,
         )
 
     def _build_runtime_init_payload(self) -> RuntimeInitPayload:

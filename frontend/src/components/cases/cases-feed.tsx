@@ -12,6 +12,9 @@ import Link from "next/link"
 import { useMemo } from "react"
 import type { CaseEventRead } from "@/client"
 import {
+  ApprovalRequestedEvent,
+  ApprovalResolvedEvent,
+  ApprovalTimedOutEvent,
   AssigneeChangedEvent,
   AttachmentCreatedEvent,
   AttachmentDeletedEvent,
@@ -95,6 +98,9 @@ const HANDLED_FEED_EVENT_TYPES = new Set([
   "table_row_unlinked",
   "tag_added",
   "tag_removed",
+  "approval_requested",
+  "approval_resolved",
+  "approval_timed_out",
 ])
 
 function CaseFeedEvent({
@@ -251,6 +257,19 @@ function CaseFeedEvent({
 
         {event.type === "tag_removed" && (
           <TagRemovedEvent event={event} actor={actor} />
+        )}
+
+        {/* Approval-gate events */}
+        {event.type === "approval_requested" && (
+          <ApprovalRequestedEvent event={event} />
+        )}
+
+        {event.type === "approval_resolved" && (
+          <ApprovalResolvedEvent event={event} />
+        )}
+
+        {event.type === "approval_timed_out" && (
+          <ApprovalTimedOutEvent event={event} />
         )}
 
         {event.type && !HANDLED_FEED_EVENT_TYPES.has(event.type) && (

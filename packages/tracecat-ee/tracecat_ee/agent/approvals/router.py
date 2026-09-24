@@ -2,10 +2,11 @@
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from temporalio.service import RPCError, RPCStatusCode
 
@@ -16,6 +17,7 @@ from tracecat.auth.dependencies import WorkspaceActorRouteRole, WorkspaceUserRou
 from tracecat.authz.controls import require_scope
 from tracecat.chat.schemas import ApprovalDecision, ContinueRunRequest
 from tracecat.db.engine import get_async_session
+from tracecat.db.models import User
 from tracecat.exceptions import TracecatNotFoundError
 from tracecat.logger import logger
 from tracecat_ee.agent.approvals.service import ApprovalMap, ApprovalService
@@ -32,11 +34,11 @@ class ApprovalSubmission(BaseModel):
 class ApprovalListItem(BaseModel):
     """Lightweight approval record for polling/listing purposes.
 
-    Deliberately does not resolve `approved_by` into a full user object (see
-    `ApprovalRead` for that) -- this endpoint exists for external pollers
-    (e.g. a scheduled workflow that forwards newly-pending tool-call
-    approvals to Telegram) that only need the tool call identity, not
-    reviewer identity.
+    Does not resolve `approved_by` into a full user object (see
+    `ApprovalRead` for that) -- only its email, via `approved_by_email`
+    below, since external pollers (e.g. the Telegram sync workflow, so it
+    can show who decided a card that wasn't decided through Telegram
+    itself) need just enough to display who acted, not a full user object.
     """
 
     id: uuid.UUID
@@ -53,6 +55,12 @@ class ApprovalListItem(BaseModel):
     execution timeout unresolved). Submitting a decision for one of these
     will fail -- the UI should offer to dismiss/retry instead of approve/
     reject. Always False for non-PENDING approvals."""
+    approved_by_email: str | None = None
+    """Email of the user who decided this approval, when it was decided by
+    a real Tracecat user (e.g. from the case panel) rather than an
+    external channel like the Telegram bot. None while PENDING, and also
+    None for a decision attributed to a service account or made with no
+    role at all."""
 
 
 @router.get("", response_model=list[ApprovalListItem])
@@ -62,15 +70,28 @@ async def list_approvals(
     role: WorkspaceActorRouteRole,
     status_filter: ApprovalStatus | None = Query(default=None, alias="status"),
     case_id: uuid.UUID | None = Query(default=None),
+    tool_call_id: list[str] | None = Query(default=None),
     session: AsyncSession = Depends(get_async_session),
 ) -> list[ApprovalListItem]:
-    """List approvals in the workspace, optionally filtered by status and/or case.
+    """List approvals in the workspace, optionally filtered by status,
+    case, and/or an explicit set of tool_call_ids.
 
     Used by external notification pollers to discover approvals without
     already knowing a specific session_id -- e.g. a scheduled workflow that
     checks for newly-created pending tool-call approvals and forwards them
     to Telegram. Also used by the case detail page's Approvals tab
     (case_id filter) to show pending approvals for that case directly.
+
+    `tool_call_id` (repeatable) is for the same Telegram-sync poller's
+    reconciliation pass: after `?status=pending` gets a card in front of a
+    reviewer, this endpoint has no way to tell it that a *specific*
+    previously-seen tool_call_id has since been decided somewhere else
+    (Telegram, the case panel) without asking for status/case-unfiltered,
+    which means every approval ever created in the workspace -- that scan
+    only gets slower as the workspace's history grows, and it did: this is
+    exactly what caused the poller's ReadTimeout in production. Passing the
+    exact, already-known IDs keeps the query cheap regardless of history
+    size.
     """
     # No proactive Temporal liveness check here on purpose: with unlimited
     # workflow timeouts enabled for this workspace, checking every pending
@@ -80,8 +101,15 @@ async def list_approvals(
     # actually fails (see submit_approvals below), not shown speculatively.
     approval_service = ApprovalService(session=session, role=role)
     approvals = await approval_service.list_approvals(
-        status=status_filter, case_id=case_id
+        status=status_filter, case_id=case_id, tool_call_ids=tool_call_id
     )
+    approver_ids = {a.approved_by for a in approvals if a.approved_by is not None}
+    email_by_user_id: dict[uuid.UUID, str] = {}
+    if approver_ids:
+        result = await session.execute(
+            select(User).where(cast(Any, User.id).in_(approver_ids))
+        )
+        email_by_user_id = {user.id: user.email for user in result.scalars().all()}
     return [
         ApprovalListItem(
             id=a.id,
@@ -92,6 +120,9 @@ async def list_approvals(
             status=ApprovalStatus(a.status),
             tool_call_args=a.tool_call_args,
             created_at=a.created_at,
+            approved_by_email=email_by_user_id.get(a.approved_by)
+            if a.approved_by is not None
+            else None,
         )
         for a in approvals
         # session_id is nullable on the model but every approval created via

@@ -1124,6 +1124,19 @@ class DSLWorkflow:
                         wf_info, task.ref
                     )
                     session_id = preset_action_args.session_id or workflow.uuid4()
+                    # Link the session to the case this workflow was
+                    # triggered for, when known, instead of the generic
+                    # "belongs to this workflow" default -- lets sessions
+                    # from different cases be told apart later (e.g. by an
+                    # approval-notification poller). Falls back to the
+                    # original behavior for any workflow without a
+                    # `case_id` trigger input.
+                    if preset_action_args.trigger_case_id is not None:
+                        agent_entity_type = AgentSessionEntity.CASE
+                        agent_entity_id = preset_action_args.trigger_case_id
+                    else:
+                        agent_entity_type = AgentSessionEntity.WORKFLOW
+                        agent_entity_id = self.run_context.wf_id
                     arg = AgentWorkflowArgs(
                         role=self.role,
                         agent_args=RunAgentArgs(
@@ -1136,8 +1149,8 @@ class DSLWorkflow:
                             max_tool_calls=preset_action_args.max_tool_calls,
                         ),
                         title=self.dsl.title,
-                        entity_type=AgentSessionEntity.WORKFLOW,
-                        entity_id=self.run_context.wf_id,
+                        entity_type=agent_entity_type,
+                        entity_id=agent_entity_id,
                         agent_preset_id=preset_ref.preset_id,
                         agent_preset_version_id=preset_ref.preset_version_id,
                         continue_existing_session=preset_action_args.session_id

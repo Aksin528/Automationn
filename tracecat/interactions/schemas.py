@@ -75,6 +75,15 @@ class ApprovalInteraction(BaseModel):
         default=None,
         description="Condition to approve the action.",
     )
+    separation_of_duties: bool = Field(
+        default=False,
+        description=(
+            "If true, the identity that triggered the workflow execution "
+            "(the requester) may not also cast an approval vote on this "
+            "interaction. Enforced server-side in the vote service, not the "
+            "frontend."
+        ),
+    )
 
 
 ActionInteraction = Annotated[
