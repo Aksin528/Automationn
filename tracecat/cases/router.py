@@ -47,6 +47,7 @@ from tracecat.cases.schemas import (
     CaseTaskRead,
     CaseTaskUpdate,
     CaseUpdate,
+    IncidentReportDownloadResponse,
     TaskAssigneeChangedEventRead,
 )
 from tracecat.cases.service import (
@@ -892,6 +893,64 @@ async def upload_incident_report_pdf(
             status_code=HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to store incident report PDF",
         ) from exc
+
+
+@cases_router.get("/{case_id}/report/pdf")
+@require_scope("case:read")
+async def download_incident_report_pdf(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    case_id: uuid.UUID,
+) -> IncidentReportDownloadResponse:
+    """Return a pre-signed download URL for the case's rendered incident report PDF.
+
+    Reads the PDF already rendered and stored by `upload_incident_report_pdf`
+    (on save) rather than re-rendering -- the same file the "Save" flow
+    produces server-side, so downloading never re-triggers a browser-side
+    html2canvas render.
+    """
+    from tracecat.storage import blob
+
+    cases_svc = CasesService(session, role)
+    case = await cases_svc.get_case(case_id)
+    if case is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail=f"Case with ID {case_id} not found",
+        )
+
+    bucket = config.TRACECAT__BLOB_STORAGE_BUCKET_REPORTS
+    key = f"reports/{case.short_id}.pdf"
+    if not await blob.file_exists(key, bucket):
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail="No report PDF has been generated for this case yet",
+        )
+
+    try:
+        download_url = await blob.generate_presigned_download_url(
+            key=key,
+            bucket=bucket,
+            override_content_type="application/pdf",
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to generate incident report download URL",
+            case_id=case_id,
+            bucket=bucket,
+            key=key,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate incident report download URL",
+        ) from exc
+
+    return IncidentReportDownloadResponse(
+        download_url=download_url,
+        file_name=f"{case.short_id}.pdf",
+    )
 
 
 @cases_router.patch(

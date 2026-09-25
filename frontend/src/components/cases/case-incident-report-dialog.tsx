@@ -1,16 +1,12 @@
 "use client"
 
-import html2canvas from "html2canvas"
-import jsPDF from "jspdf"
 import { useEffect, useState } from "react"
 import type { CaseRead } from "@/client"
 import {
-  buildPrintElement,
   EMPTY_REPORT,
   INCIDENT_TYPES,
   type IncidentReportPayload,
   NOTIFIED_TO,
-  shouldKeepWithNext,
 } from "@/components/cases/case-incident-report-print"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -35,133 +31,36 @@ import { useUpdateCase } from "@/lib/hooks"
 export { INCIDENT_TYPES, NOTIFIED_TO }
 export type { IncidentReportPayload }
 
-interface RenderedBlock {
-  /** True when this block must not be the last one on its page -- a
-   * section heading or a field label whose value follows separately. */
-  keepWithNext: boolean
-  dataUrl: string
-  heightMm: number
-}
-
-/** Captures one direct child of the printed report (title, section
- * heading, field row, or one paragraph of the description) as its own
- * PNG, sized to `contentWidthMm` while preserving its aspect ratio.
+/** Asks the backend for a pre-signed download URL to the incident report PDF
+ * already rendered and stored server-side by `upload_incident_report_pdf`
+ * (see that function's docstring for why rendering moved out of the
+ * browser). Downloading therefore never re-triggers an html2canvas/jsPDF
+ * render -- it just fetches the same file the "Save" flow already
+ * produced, via `GET /cases/{caseId}/report/pdf`.
  *
- * Capturing each block separately -- instead of one tall screenshot of
- * the whole report -- is what guarantees a page break can never fall
- * inside a block's own text: there is no single giant image left to slice
- * at an arbitrary height in the first place. `windowWidth`/`windowHeight`
- * pin the cloned document to the real one's size so the capture doesn't
- * shift (and clip its last line) depending on how the page behind it
- * happens to be scrolled or sized. */
-async function renderBlock(
-  child: HTMLElement,
-  contentWidthMm: number
-): Promise<RenderedBlock> {
-  const canvas = await html2canvas(child, {
-    // scale:2 (the previous value) roughly quadruples the pixels
-    // html2canvas has to paint per block versus scale:1, which is the
-    // dominant cost for a long, fully-filled report -- it's what turned a
-    // save into a ~60s main-thread freeze. 1x stays sharp for rendered DOM
-    // text (unlike a photo, there's no source detail scale:2 recovers).
-    scale: 1,
-    backgroundColor: "#ffffff",
-    useCORS: true,
-    scrollX: 0,
-    scrollY: 0,
-    windowWidth: document.documentElement.scrollWidth,
-    windowHeight: document.documentElement.scrollHeight,
-  })
-  return {
-    keepWithNext: shouldKeepWithNext(child),
-    dataUrl: canvas.toDataURL("image/png"),
-    heightMm: (canvas.height * contentWidthMm) / canvas.width,
-  }
-}
-
-/** Renders the saved report to an off-screen DOM node, captures each of
- * its top-level blocks (title, section headings, field rows) as its own
- * image via `renderBlock`, then lays them out down the page -- starting a
- * new PDF page whenever the next block wouldn't fit in what's left of the
- * current one -- and returns the assembled `jsPDF` document (not yet saved
- * or uploaded; callers decide what to do with it).
- *
- * Laying out whole blocks this way (rather than slicing one tall
- * screenshot at fixed page-height intervals) is what guarantees a page
- * break never falls inside a field's label/value or mid-word: the
- * smallest unit ever placed is one whole block. A block flagged
- * `keepWithNext` (section heading, or a label whose value is a separate
- * block) is additionally never left alone at the bottom of a page --
- * placing it requires room for the block right after it too, otherwise
- * both move to the next page together. */
-async function buildIncidentReportPdf(
-  report: Partial<IncidentReportPayload>,
-  caseShortId: string
-): Promise<jsPDF> {
-  // Merge with defaults, matching `buildInitialReport`'s own leniency --
-  // a report saved by an earlier version of this form may be missing
-  // fields added since, and `.join` on a missing array field would
-  // otherwise throw instead of just rendering as empty.
-  const complete: IncidentReportPayload = { ...EMPTY_REPORT, ...report }
-  const element = buildPrintElement(complete, caseShortId)
-  document.body.appendChild(element)
-
-  try {
-    const pdf = new jsPDF({ orientation: "p", unit: "mm", format: "a4" })
-    const pageWidthMm = pdf.internal.pageSize.getWidth()
-    const pageHeightMm = pdf.internal.pageSize.getHeight()
-    const marginMm = 12
-    const contentWidthMm = pageWidthMm - marginMm * 2
-    const usableHeightMm = pageHeightMm - marginMm * 2
-
-    const children = Array.from(element.children) as HTMLElement[]
-    const blocks = await Promise.all(
-      children.map((child) => renderBlock(child, contentWidthMm))
-    )
-
-    let cursorMm = 0
-    let placedAnything = false
-
-    for (let i = 0; i < blocks.length; i++) {
-      const block = blocks[i]
-      const nextBlock = i + 1 < blocks.length ? blocks[i + 1] : null
-      const neededMm =
-        block.keepWithNext && nextBlock
-          ? block.heightMm + nextBlock.heightMm
-          : block.heightMm
-      const remainingMm = usableHeightMm - cursorMm
-
-      if (placedAnything && neededMm > remainingMm) {
-        pdf.addPage()
-        cursorMm = 0
-      }
-
-      pdf.addImage(
-        block.dataUrl,
-        "PNG",
-        marginMm,
-        marginMm + cursorMm,
-        contentWidthMm,
-        block.heightMm
-      )
-      cursorMm += block.heightMm
-      placedAnything = true
+ * Plain `fetch` for the same reason as `persistIncidentReportPdf` below:
+ * no generated `@/client` binding for this route yet. */
+export async function getIncidentReportDownloadUrl(
+  caseId: string,
+  workspaceId: string
+): Promise<{ downloadUrl: string; fileName: string }> {
+  const response = await fetch(
+    `/api/workspaces/${workspaceId}/cases/${caseId}/report/pdf`,
+    {
+      method: "GET",
+      credentials: "include",
     }
-
-    return pdf
-  } finally {
-    document.body.removeChild(element)
+  )
+  if (!response.ok) {
+    throw new Error(
+      `Failed to get report PDF download link (${response.status} ${response.statusText})`
+    )
   }
-}
-
-/** Builds the report PDF and triggers a browser download -- the existing
- * "Download" button behavior, unchanged. */
-export async function downloadIncidentReportPdf(
-  report: Partial<IncidentReportPayload>,
-  caseShortId: string
-): Promise<void> {
-  const pdf = await buildIncidentReportPdf(report, caseShortId)
-  pdf.save(`incident-report-${caseShortId}.pdf`)
+  const data = (await response.json()) as {
+    download_url: string
+    file_name: string
+  }
+  return { downloadUrl: data.download_url, fileName: data.file_name }
 }
 
 /** Asks the backend to render the just-saved report to PDF and persist it to
@@ -169,10 +68,10 @@ export async function downloadIncidentReportPdf(
  * `POST /cases/{caseId}/report/pdf`. No body: the endpoint re-renders
  * `Case.payload["incident_report"]` itself (see `tracecat/cases/
  * incident_report_pdf.py`), which the caller's `updateCase` call already
- * saved moments before. Deliberately NOT client-side (no `buildIncidentReportPdf`
- * call here) -- that used html2canvas/jsPDF and could block the tab's main
- * thread for up to a minute on a fully-filled report; this is a cheap POST
- * with no rendering work in the browser at all.
+ * saved moments before. Deliberately not client-side rendering -- the old
+ * html2canvas/jsPDF path could block the tab's main thread for up to a
+ * minute on a fully-filled report; this is a cheap POST with no rendering
+ * work in the browser at all.
  *
  * This is a plain `fetch` rather than the generated `@/client` because it
  * has no generated binding (see `tracecat/cases/router.py`'s

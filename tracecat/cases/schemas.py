@@ -865,6 +865,13 @@ class InternalCaseData(Schema):
     updated_at: datetime
 
 
+class IncidentReportDownloadResponse(Schema):
+    """Pre-signed download URL for a case's rendered incident report PDF."""
+
+    download_url: str = Field(..., description="Pre-signed download URL")
+    file_name: str = Field(..., description="Report file name")
+
+
 class InternalCaseCommentData(Schema):
     """Comment data matching the CaseComment SQLAlchemy model's to_dict() output.
 

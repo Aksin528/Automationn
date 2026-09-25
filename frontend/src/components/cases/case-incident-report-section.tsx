@@ -5,8 +5,7 @@ import { useState } from "react"
 import type { CaseRead } from "@/client"
 import {
   CaseIncidentReportDialog,
-  downloadIncidentReportPdf,
-  type IncidentReportPayload,
+  getIncidentReportDownloadUrl,
 } from "@/components/cases/case-incident-report-dialog"
 import { Button } from "@/components/ui/button"
 import {
@@ -53,15 +52,23 @@ export function CaseIncidentReportSection({
     }
     setDownloadPending(true)
     try {
-      await downloadIncidentReportPdf(
-        savedReport as Partial<IncidentReportPayload>,
-        caseData?.short_id ?? caseId
+      const { downloadUrl, fileName } = await getIncidentReportDownloadUrl(
+        caseId,
+        workspaceId
       )
+      const link = document.createElement("a")
+      link.href = downloadUrl
+      link.download = fileName
+      link.rel = "noopener"
+      link.style.display = "none"
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
     } catch (error) {
-      console.error("Error generating incident report PDF", error)
+      console.error("Error downloading incident report PDF", error)
       toast({
         title: "Download failed",
-        description: "Failed to generate the report PDF.",
+        description: "Failed to download the report PDF.",
       })
     } finally {
       setDownloadPending(false)
