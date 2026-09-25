@@ -637,6 +637,7 @@ services:
     restart: unless-stopped
     networks:
       - core
+      - core-db
     ports:
       - "3001:3000"
     volumes:
