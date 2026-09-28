@@ -19,20 +19,21 @@ def register_pmg_action_tools(mcp):
 
     @mcp.tool()
     async def pmg_add_to_blacklist(scope: str, value: str) -> dict:
-        """Add a sender email address or domain to Proxmox Mail Gateway's
-        global Blacklist. All future mail from that sender/domain will be
-        blocked automatically by PMG's existing Blacklist rule.
+        """Add a sender email address, domain, or client IP to Proxmox Mail
+        Gateway's global Blacklist. All future mail from that sender/domain/IP
+        will be blocked automatically by PMG's existing Blacklist rule.
 
-        scope: "email" to block a single sender address, or "domain" to
-        block every address at that domain.
-        value: the email address (for scope="email") or bare domain (for
-        scope="domain"), e.g. "attacker@bad.com" or "bad.com".
+        scope: "email" to block a single sender address, "domain" to block
+        every address at that domain, or "ip" to block a single client IP.
+        value: the email address (for scope="email"), bare domain (for
+        scope="domain"), or IP address (for scope="ip"), e.g.
+        "attacker@bad.com", "bad.com", or "203.0.113.5".
 
         Only call this after explicit human approval — this is a real,
         state-changing, org-wide action on the live mail gateway.
         """
-        if scope not in ("email", "domain"):
-            return {"error": f"invalid scope {scope!r}, must be 'email' or 'domain'"}
+        if scope not in ("email", "domain", "ip"):
+            return {"error": f"invalid scope {scope!r}, must be 'email', 'domain', or 'ip'"}
 
         async with _client() as client:
             ticket, csrf = await _login_full(client)
