@@ -27,4 +27,5 @@ if __name__ == "__main__":
     import os
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_ACTIONS_PORT", "8101"))
-    mcp.run(transport="http", host=host, port=port)
+    # Stateless: see server.py's identical mcp.run() call for why.
+    mcp.run(transport="http", host=host, port=port, stateless_http=True)

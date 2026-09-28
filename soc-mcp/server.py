@@ -55,4 +55,10 @@ if __name__ == "__main__":
     import os
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8100"))
-    mcp.run(transport="http", host=host, port=port)
+    # Stateless: no server-side session is created or tracked per client, so
+    # a client that never closes its session (initialize -> tool call, no
+    # DELETE -- e.g. every core.script.run_python-based MCP caller in this
+    # repo) can't leak sessions toward the underlying MCP library's open-
+    # session cap ("Refusing to open a new session: N sessions are already
+    # open"), which is what happened here after repeated workflow runs.
+    mcp.run(transport="http", host=host, port=port, stateless_http=True)
