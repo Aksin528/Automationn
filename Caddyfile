@@ -8,9 +8,12 @@
 
 	# MinIO S3 API proxy for presigned URLs
 	handle_path /s3/* {
-		reverse_proxy http://minio:9000 {
+		reverse_proxy https://minio:9000 {
 			header_up Host {host}
 			header_up -Server
+			transport http {
+				tls_insecure_skip_verify
+			}
 		}
 	}
 

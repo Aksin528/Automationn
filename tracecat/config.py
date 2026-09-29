@@ -479,9 +479,9 @@ TRACECAT__BLOB_STORAGE_PRESIGNED_URL_ENDPOINT = os.environ.get(
 """Public endpoint URL to use for presigned URLs."""
 
 TRACECAT__BLOB_STORAGE_PRESIGNED_URL_EXPIRY = int(
-    os.environ.get("TRACECAT__BLOB_STORAGE_PRESIGNED_URL_EXPIRY") or 10
+    os.environ.get("TRACECAT__BLOB_STORAGE_PRESIGNED_URL_EXPIRY") or 60
 )
-"""Default expiry time for presigned URLs in seconds (default: 10 seconds for immediate use)."""
+"""Default expiry time for presigned URLs in seconds (default: 60 seconds for immediate use)."""
 
 TRACECAT__DISABLE_PRESIGNED_URL_IP_CHECKING = env_bool(
     "TRACECAT__DISABLE_PRESIGNED_URL_IP_CHECKING", default=True
