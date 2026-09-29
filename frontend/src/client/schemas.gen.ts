@@ -4674,6 +4674,17 @@ export const $ApprovalListItem = {
       title: "Is Expired",
       default: false,
     },
+    approved_by_email: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Approved By Email",
+    },
   },
   type: "object",
   required: [
@@ -4687,11 +4698,11 @@ export const $ApprovalListItem = {
   title: "ApprovalListItem",
   description: `Lightweight approval record for polling/listing purposes.
 
-Deliberately does not resolve \`approved_by\` into a full user object (see
-\`ApprovalRead\` for that) -- this endpoint exists for external pollers
-(e.g. a scheduled workflow that forwards newly-pending tool-call
-approvals to Telegram) that only need the tool call identity, not
-reviewer identity.`,
+Does not resolve \`approved_by\` into a full user object (see
+\`ApprovalRead\` for that) -- only its email, via \`approved_by_email\`
+below, since external pollers (e.g. the Telegram sync workflow, so it
+can show who decided a card that wasn't decided through Telegram
+itself) need just enough to display who acted, not a full user object.`,
 } as const
 
 export const $ApprovalMap = {
@@ -8784,6 +8795,31 @@ export const $CaseStatusGroupCounts = {
   },
   type: "object",
   title: "CaseStatusGroupCounts",
+} as const
+
+export const $CaseSummary = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+      description: "Case ID",
+    },
+    short_id: {
+      type: "string",
+      title: "Short Id",
+      description: "Human-readable case ID, e.g. CASE-0123",
+    },
+    summary: {
+      type: "string",
+      title: "Summary",
+      description: "Case summary/title",
+    },
+  },
+  type: "object",
+  required: ["id", "short_id", "summary"],
+  title: "CaseSummary",
+  description: "Summary of a case for inbox item context.",
 } as const
 
 export const $CaseTableRowInsertCreate = {
@@ -14479,6 +14515,17 @@ export const $InboxItemRead = {
       ],
       description: "Associated workflow",
     },
+    case: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/CaseSummary",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description: "Associated case, when entity_type is 'case'",
+    },
     source_id: {
       type: "string",
       format: "uuid",
@@ -14548,6 +14595,26 @@ export const $InboxPendingCount = {
   required: ["count"],
   title: "InboxPendingCount",
   description: "Count of pending inbox items that require attention.",
+} as const
+
+export const $IncidentReportDownloadResponse = {
+  properties: {
+    download_url: {
+      type: "string",
+      title: "Download Url",
+      description: "Pre-signed download URL",
+    },
+    file_name: {
+      type: "string",
+      title: "File Name",
+      description: "Report file name",
+    },
+  },
+  type: "object",
+  required: ["download_url", "file_name"],
+  title: "IncidentReportDownloadResponse",
+  description:
+    "Pre-signed download URL for a case's rendered incident report PDF.",
 } as const
 
 export const $InferredColumn = {

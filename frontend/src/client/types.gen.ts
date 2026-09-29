@@ -1138,11 +1138,11 @@ export type ApprovalInteraction = {
 /**
  * Lightweight approval record for polling/listing purposes.
  *
- * Deliberately does not resolve `approved_by` into a full user object (see
- * `ApprovalRead` for that) -- this endpoint exists for external pollers
- * (e.g. a scheduled workflow that forwards newly-pending tool-call
- * approvals to Telegram) that only need the tool call identity, not
- * reviewer identity.
+ * Does not resolve `approved_by` into a full user object (see
+ * `ApprovalRead` for that) -- only its email, via `approved_by_email`
+ * below, since external pollers (e.g. the Telegram sync workflow, so it
+ * can show who decided a card that wasn't decided through Telegram
+ * itself) need just enough to display who acted, not a full user object.
  */
 export type ApprovalListItem = {
   id: string
@@ -1156,6 +1156,7 @@ export type ApprovalListItem = {
   } | null
   created_at: string
   is_expired?: boolean
+  approved_by_email?: string | null
 }
 
 export type ApprovalMap = {
@@ -2384,6 +2385,24 @@ export type CaseStatusGroupCounts = {
   closed?: number
   unknown?: number
   other?: number
+}
+
+/**
+ * Summary of a case for inbox item context.
+ */
+export type CaseSummary = {
+  /**
+   * Case ID
+   */
+  id: string
+  /**
+   * Human-readable case ID, e.g. CASE-0123
+   */
+  short_id: string
+  /**
+   * Case summary/title
+   */
+  summary: string
 }
 
 export type CaseTableRowInsertCreate = {
@@ -4426,6 +4445,10 @@ export type InboxItemRead = {
    */
   workflow?: WorkflowSummary | null
   /**
+   * Associated case, when entity_type is 'case'
+   */
+  case?: CaseSummary | null
+  /**
    * ID of the source entity
    */
   source_id: string
@@ -4459,6 +4482,20 @@ export type InboxPendingCount = {
    * Number of pending inbox items
    */
   count: number
+}
+
+/**
+ * Pre-signed download URL for a case's rendered incident report PDF.
+ */
+export type IncidentReportDownloadResponse = {
+  /**
+   * Pre-signed download URL
+   */
+  download_url: string
+  /**
+   * Report file name
+   */
+  file_name: string
 }
 
 /**
@@ -11289,6 +11326,7 @@ export type AgentSessionsForkSessionResponse = AgentSessionRead
 export type ApprovalsListApprovalsData = {
   caseId?: string | null
   status?: ApprovalStatus | null
+  toolCallId?: Array<string> | null
   workspaceId: string
 }
 
@@ -12276,6 +12314,21 @@ export type CasesListCommentThreadsData = {
 }
 
 export type CasesListCommentThreadsResponse = Array<CaseCommentThreadRead>
+
+export type CasesUploadIncidentReportPdfData = {
+  caseId: string
+  workspaceId: string
+}
+
+export type CasesUploadIncidentReportPdfResponse = void
+
+export type CasesDownloadIncidentReportPdfData = {
+  caseId: string
+  workspaceId: string
+}
+
+export type CasesDownloadIncidentReportPdfResponse =
+  IncidentReportDownloadResponse
 
 export type CasesUpdateCommentData = {
   caseId: string
@@ -17994,6 +18047,34 @@ export type $OpenApiTs = {
          * Successful Response
          */
         200: Array<CaseCommentThreadRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/workspaces/{workspace_id}/cases/{case_id}/report/pdf": {
+    post: {
+      req: CasesUploadIncidentReportPdfData
+      res: {
+        /**
+         * Successful Response
+         */
+        204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    get: {
+      req: CasesDownloadIncidentReportPdfData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: IncidentReportDownloadResponse
         /**
          * Validation Error
          */

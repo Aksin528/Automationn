@@ -319,6 +319,8 @@ import type {
   CasesDeleteFieldResponse,
   CasesDeleteTaskData,
   CasesDeleteTaskResponse,
+  CasesDownloadIncidentReportPdfData,
+  CasesDownloadIncidentReportPdfResponse,
   CasesGetCaseData,
   CasesGetCaseResponse,
   CasesInsertCaseRowData,
@@ -363,6 +365,8 @@ import type {
   CasesUpdateFieldResponse,
   CasesUpdateTaskData,
   CasesUpdateTaskResponse,
+  CasesUploadIncidentReportPdfData,
+  CasesUploadIncidentReportPdfResponse,
   CaseTagsCreateCaseTagData,
   CaseTagsCreateCaseTagResponse,
   CaseTagsDeleteCaseTagData,
@@ -6790,17 +6794,30 @@ export const agentSessionsForkSession = (
 
 /**
  * List Approvals
- * List approvals in the workspace, optionally filtered by status and/or case.
+ * List approvals in the workspace, optionally filtered by status,
+ * case, and/or an explicit set of tool_call_ids.
  *
  * Used by external notification pollers to discover approvals without
  * already knowing a specific session_id -- e.g. a scheduled workflow that
  * checks for newly-created pending tool-call approvals and forwards them
  * to Telegram. Also used by the case detail page's Approvals tab
  * (case_id filter) to show pending approvals for that case directly.
+ *
+ * `tool_call_id` (repeatable) is for the same Telegram-sync poller's
+ * reconciliation pass: after `?status=pending` gets a card in front of a
+ * reviewer, this endpoint has no way to tell it that a *specific*
+ * previously-seen tool_call_id has since been decided somewhere else
+ * (Telegram, the case panel) without asking for status/case-unfiltered,
+ * which means every approval ever created in the workspace -- that scan
+ * only gets slower as the workspace's history grows, and it did: this is
+ * exactly what caused the poller's ReadTimeout in production. Passing the
+ * exact, already-known IDs keeps the query cheap regardless of history
+ * size.
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.status
  * @param data.caseId
+ * @param data.toolCallId
  * @returns ApprovalListItem Successful Response
  * @throws ApiError
  */
@@ -6816,6 +6833,7 @@ export const approvalsListApprovals = (
     query: {
       status: data.status,
       case_id: data.caseId,
+      tool_call_id: data.toolCallId,
     },
     errors: {
       422: "Validation Error",
@@ -6830,8 +6848,14 @@ export const approvalsListApprovals = (
  * This endpoint sends approval decisions back to an agent workflow
  * that is waiting for human-in-the-loop approval on tool calls.
  *
+ * Accepts both interactive user sessions (the case-panel UI) and
+ * scoped service-account API keys (e.g. an automation forwarding a
+ * Telegram button decision) -- the `agent:update` scope requirement
+ * above is the actual gate; this only controls which credential
+ * types are allowed to present it.
+ *
  * Args:
- * role: The authenticated user role.
+ * role: The authenticated user or service-account role.
  * session_id: The agent session ID (used to lookup the workflow).
  * payload: The approval decisions mapping tool_call_id to decision.
  * session: Database session for workspace-scoped lookups.
@@ -9740,6 +9764,75 @@ export const casesListCommentThreads = (
   return __request(OpenAPI, {
     method: "GET",
     url: "/workspaces/{workspace_id}/cases/{case_id}/comments/threads",
+    path: {
+      case_id: data.caseId,
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Upload Incident Report Pdf
+ * Render the saved incident report to PDF and persist it to blob storage.
+ *
+ * The report form itself (`Case.payload["incident_report"]`) stays in
+ * Postgres -- that's what the "Edit report" dialog reads back to repopulate
+ * its fields -- so this endpoint takes no body: it reads that same payload
+ * (already saved by the case-update call the frontend makes right before
+ * this one) and renders it server-side via `incident_report_pdf`.
+ *
+ * Rendering happens here rather than in the browser (html2canvas/jsPDF)
+ * specifically because that rasterized every block as a lossless PNG,
+ * which blocked the tab's main thread for up to a minute on a fully-filled
+ * report; reportlab paginates real PDF text and costs the browser nothing.
+ * Keyed by the case's short_id so each save overwrites the previous
+ * snapshot instead of accumulating duplicates, mirroring how
+ * `CaseAttachmentService` uploads to the attachments bucket.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.workspaceId
+ * @returns void Successful Response
+ * @throws ApiError
+ */
+export const casesUploadIncidentReportPdf = (
+  data: CasesUploadIncidentReportPdfData
+): CancelablePromise<CasesUploadIncidentReportPdfResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/report/pdf",
+    path: {
+      case_id: data.caseId,
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Download Incident Report Pdf
+ * Return a pre-signed download URL for the case's rendered incident report PDF.
+ *
+ * Reads the PDF already rendered and stored by `upload_incident_report_pdf`
+ * (on save) rather than re-rendering -- the same file the "Save" flow
+ * produces server-side, so downloading never re-triggers a browser-side
+ * html2canvas render.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.workspaceId
+ * @returns IncidentReportDownloadResponse Successful Response
+ * @throws ApiError
+ */
+export const casesDownloadIncidentReportPdf = (
+  data: CasesDownloadIncidentReportPdfData
+): CancelablePromise<CasesDownloadIncidentReportPdfResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/report/pdf",
     path: {
       case_id: data.caseId,
       workspace_id: data.workspaceId,

@@ -152,6 +152,15 @@ function inboxItemToSessionItem(item: InboxItemRead): InboxSessionItem {
         }
       : null,
 
+    // Case metadata from inbox item (present when entity_type is "case")
+    parent_case: item.case
+      ? {
+          id: item.case.id,
+          short_id: item.case.short_id,
+          summary: item.case.summary,
+        }
+      : null,
+
     // Status fields derived from inbox status
     ...statusInfo,
     pendingApprovalCount:

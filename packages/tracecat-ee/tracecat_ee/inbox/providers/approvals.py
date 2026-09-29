@@ -12,9 +12,9 @@ from temporalio.client import WorkflowExecutionStatus
 
 from tracecat.agent.approvals.enums import ApprovalStatus
 from tracecat.db.dependencies import AsyncDBSession
-from tracecat.db.models import AgentSession, Approval, Workflow
+from tracecat.db.models import AgentSession, Approval, Case, Workflow
 from tracecat.dsl.client import get_temporal_client
-from tracecat.inbox.schemas import InboxItemRead, WorkflowSummary
+from tracecat.inbox.schemas import CaseSummary, InboxItemRead, WorkflowSummary
 from tracecat.inbox.types import InboxItemStatus, InboxItemType
 from tracecat.logger import logger
 from tracecat.pagination import BaseCursorPaginator, CursorPaginatedResponse
@@ -314,9 +314,17 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                     approval
                 )
 
-        # Fetch workflow metadata for sessions with entity_id
-        workflow_ids = {s.entity_id for s in sessions if s.entity_id}
+        # Fetch workflow metadata for sessions with entity_id -- excludes
+        # "case" sessions, whose entity_id is a Case ID, not a Workflow ID
+        # (see the case_ids/cases_by_id lookup below for those).
+        workflow_ids = {
+            s.entity_id for s in sessions if s.entity_id and s.entity_type != "case"
+        }
         workflows_by_id: dict[uuid.UUID, Workflow] = {}
+        case_ids = {
+            s.entity_id for s in sessions if s.entity_id and s.entity_type == "case"
+        }
+        cases_by_id: dict[uuid.UUID, Case] = {}
         temporal_statuses = await self._resolve_temporal_statuses(sessions)
 
         # No proactive per-session Temporal liveness check here on purpose:
@@ -333,6 +341,12 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
             workflow_result = await self.session.execute(workflow_stmt)
             workflows = workflow_result.scalars().all()
             workflows_by_id = {w.id: w for w in workflows}
+
+        if case_ids:
+            case_stmt = select(Case).where(Case.id.in_(list(case_ids)))
+            case_result = await self.session.execute(case_stmt)
+            cases = case_result.scalars().all()
+            cases_by_id = {c.id: c for c in cases}
 
         # Transform to InboxItemRead
         items: list[InboxItemRead] = []
@@ -376,6 +390,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
 
             # Get workflow info
             workflow_summary: WorkflowSummary | None = None
+            case_summary: CaseSummary | None = None
             title = session.title or "Agent session"
 
             if session.entity_id and session.entity_id in workflows_by_id:
@@ -387,6 +402,16 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                 )
                 # Use workflow alias or title as the inbox item title
                 title = workflow.alias or workflow.title or title
+            elif session.entity_id and session.entity_id in cases_by_id:
+                case = cases_by_id[session.entity_id]
+                case_summary = CaseSummary(
+                    id=case.id,
+                    short_id=case.short_id,
+                    summary=case.summary,
+                )
+                # So the inbox card identifies which case this is without
+                # opening it -- e.g. "CASE-0234: Phishing alert from ..."
+                title = f"{case.short_id}: {case.summary}"
 
             # Build metadata
             metadata: dict[str, Any] = {
@@ -416,6 +441,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                     created_at=session.created_at,
                     updated_at=session.updated_at,
                     workflow=workflow_summary,
+                    case=case_summary,
                     source_id=session.id,  # Always use parent session ID
                     source_type="agent_session",
                     metadata=metadata,
