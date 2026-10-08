@@ -148,14 +148,19 @@ def register_cortex_action_tools(mcp):
     @mcp.tool()
     async def cortex_assign_case(case_id: int, assignee_mail: str = "") -> dict:
         """Assign a Cortex XDR case to a user, identified by the e-mail they
-        use in Cortex (the case's "assigned_user_mail" field), or un-assign
+        use in Cortex (shown as the case's "assigned_user_mail"), or un-assign
         the case when assignee_mail is empty. Used by the Tracecat -> Cortex
         sync workflow to mirror an assignee change; not meant to be called
         by an agent on its own judgement.
+
+        Cortex's case/update rejects "assigned_user_mail" as an update field
+        ("Invalid update fields"); the writable field is "assigned_user"
+        (confirmed by probing a real case), and the case's read-only
+        assigned_user_mail / assigned_user_pretty_name then follow from it.
         """
         url = f"{CORTEX_API_URL}/public_api/v1/case/update/{case_id}"
         payload = {
-            "request_data": {"update_data": {"assigned_user_mail": assignee_mail or None}}
+            "request_data": {"update_data": {"assigned_user": assignee_mail or None}}
         }
         async with _client() as client:
             resp = await client.post(url, headers=_headers(), json=payload)
