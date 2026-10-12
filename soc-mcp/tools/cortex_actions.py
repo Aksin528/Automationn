@@ -178,6 +178,31 @@ def register_cortex_action_tools(mcp):
         }
 
     @mcp.tool()
+    async def cortex_set_case_severity(case_id: int, severity: str) -> dict:
+        """Set a Cortex XDR case's severity to "low", "medium", "high" or
+        "critical". Used by the Tracecat -> Cortex sync workflow to mirror a
+        severity change; not meant to be called by an agent on its own
+        judgement.
+
+        The writable field is "user_severity" (the analyst's manual choice,
+        the same thing the Cortex UI severity dropdown sets); the case's
+        "severity" then follows it. Confirmed on a test case: update_data
+        {"user_severity": "critical"} returns HTTP 204, "severity" becomes
+        "critical" and modification_time is bumped. The values are the
+        lowercase words, exactly as case/search returns them.
+        """
+        severity = (severity or "").strip().lower()
+        if severity not in ("low", "medium", "high", "critical"):
+            return {"error": "invalid_severity", "severity": severity}
+        url = f"{CORTEX_API_URL}/public_api/v1/case/update/{case_id}"
+        payload = {"request_data": {"update_data": {"user_severity": severity}}}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "severity_requested", "case_id": case_id, "severity": severity}
+
+    @mcp.tool()
     async def cortex_list_modified_cases(since_ms: int, limit: int = 50) -> dict:
         """List Cortex XDR cases modified at or after since_ms (epoch
         milliseconds), oldest modification first, trimmed to the fields the
@@ -210,7 +235,7 @@ def register_cortex_action_tools(mcp):
         rows = resp.json().get("reply", {}).get("DATA", []) or []
         keep = (
             "case_id", "modification_time", "status_progress", "assigned_user_mail",
-            "notes", "resolve_reason", "resolve_comment", "severity",
+            "notes", "resolve_reason", "resolve_comment", "severity", "user_severity",
         )
         cases = [{k: r.get(k) for k in keep} for r in rows]
         return {"count": len(cases), "cases": cases}
