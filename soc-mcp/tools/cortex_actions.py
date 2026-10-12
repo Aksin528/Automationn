@@ -173,6 +173,44 @@ def register_cortex_action_tools(mcp):
         }
 
     @mcp.tool()
+    async def cortex_list_modified_cases(since_ms: int, limit: int = 50) -> dict:
+        """List Cortex XDR cases modified at or after since_ms (epoch
+        milliseconds), oldest modification first, trimmed to the fields the
+        Cortex -> Tracecat sync workflow compares (status, assignee, notes,
+        resolution). Read-only; it lives here, next to cortex_assign_case /
+        cortex_append_case_note, because the sync workflow already talks to
+        this MCP server without auth headers. Not meant for agents.
+
+        "modification_time" is the field that works for both the filter and
+        the sort on case/search (verified against this tenant: the schema
+        calls it "Last Updated"; "last_update_time" is rejected as a sort
+        field). The API returns no total_count, so callers use len(cases).
+        """
+        limit = max(1, min(int(limit), 100))
+        url = f"{CORTEX_API_URL}/public_api/v1/case/search"
+        payload = {
+            "request_data": {
+                "filters": [
+                    {"field": "modification_time", "operator": "gte", "value": int(since_ms)}
+                ],
+                "search_from": 0,
+                "search_to": limit,
+                "sort": {"field": "modification_time", "keyword": "asc"},
+            }
+        }
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        rows = resp.json().get("reply", {}).get("DATA", []) or []
+        keep = (
+            "case_id", "modification_time", "status_progress", "assigned_user_mail",
+            "notes", "resolve_reason", "resolve_comment", "severity",
+        )
+        cases = [{k: r.get(k) for k in keep} for r in rows]
+        return {"count": len(cases), "cases": cases}
+
+    @mcp.tool()
     async def cortex_blocklist_hash(file_hash: str, comment: str = "") -> dict:
         """Add a SHA256 file hash to the Cortex XDR global blocklist, so it's
         blocked from executing across all endpoints. This is a tenant-wide
