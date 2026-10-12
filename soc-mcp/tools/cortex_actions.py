@@ -86,16 +86,21 @@ def register_cortex_action_tools(mcp):
         case_id: int,
         status_progress: str,
         resolve_reason: str = "",
+        resolve_comment: str = "",
     ) -> dict:
         """Update a Cortex XDR case's status (the new Cases & Issues API,
         not the legacy Incidents API). status_progress must be one of "New",
         "In Progress", "Resolved". resolve_reason is only used when setting
         status to "Resolved" (e.g. "Resolved - Other", "Resolved - False
-        Positive"). Only call after explicit human approval.
+        Positive"); resolve_comment is the free-text "Resolve comment" that
+        goes with it and is likewise only meaningful on "Resolved". Only call
+        after explicit human approval.
         """
         update_data: dict = {"status_progress": status_progress}
         if resolve_reason:
             update_data["resolve_reason"] = resolve_reason
+        if resolve_comment:
+            update_data["resolve_comment"] = resolve_comment
         url = f"{CORTEX_API_URL}/public_api/v1/case/update/{case_id}"
         payload = {"request_data": {"update_data": update_data}}
         async with _client() as client:
