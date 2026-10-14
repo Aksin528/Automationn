@@ -13,6 +13,8 @@ https://help.splunk.com/en/splunk-enterprise-security-7/api-reference/7.3/notabl
 
 import json
 
+import httpx
+
 from .splunk import SPLUNK_BASE_URL, _client, _headers
 
 # The review state of every notable (status, owner, urgency, disposition,
@@ -25,6 +27,9 @@ _REVIEW_KV_URL_TMPL = (
     "/storage/collections/data/incident_review"
 )
 _MAX_FETCH = 20000  # the KV store's own default row cap is 50000
+# httpx's default is 5 s; notable_update and the big KV read are slower than
+# that on this tenant, which surfaced as "Upstream request timed out".
+_HTTP_TIMEOUT = 60.0
 
 
 def _kv_rows(resp):
@@ -56,7 +61,6 @@ def _normalize_disposition(value: str) -> str:
 
 
 def register_splunk_action_tools(mcp):
-
     @mcp.tool()
     async def splunk_update_notable_event(
         event_id: str,
@@ -119,13 +123,23 @@ def register_splunk_action_tools(mcp):
         if disposition:
             data["disposition"] = _normalize_disposition(disposition)
 
-        async with _client() as client:
-            resp = await client.post(
-                url,
-                headers=_headers(),
-                data=data,
-                params={"output_mode": "json"},
-            )
+        try:
+            async with _client() as client:
+                resp = await client.post(
+                    url,
+                    headers=_headers(),
+                    data=data,
+                    params={"output_mode": "json"},
+                    timeout=_HTTP_TIMEOUT,
+                )
+        except httpx.TimeoutException:
+            # Splunk may still finish the update after we stopped waiting.
+            return {
+                "error": "timeout",
+                "outcome_unknown": True,
+                "detail": f"Splunk did not answer within {int(_HTTP_TIMEOUT)} s; "
+                "the update may or may not have been applied",
+            }
         if resp.status_code >= 400:
             return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
         try:
@@ -173,8 +187,16 @@ def register_splunk_action_tools(mcp):
             "query": json.dumps({"time": {"$gte": since}}),
             "limit": _MAX_FETCH,
         }
-        async with _client() as client:
-            resp = await client.get(url, headers=_headers(), params=params)
+        try:
+            async with _client() as client:
+                resp = await client.get(
+                    url, headers=_headers(), params=params, timeout=_HTTP_TIMEOUT
+                )
+        except httpx.TimeoutException:
+            return {
+                "error": "timeout",
+                "detail": f"Splunk did not answer within {int(_HTTP_TIMEOUT)} s",
+            }
         rows = _kv_rows(resp)
         if rows is None:
             return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:500]}
