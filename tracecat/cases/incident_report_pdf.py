@@ -52,6 +52,27 @@ def _fallback_dash(value: str | None) -> str:
     return value if value else "—"
 
 
+_REPORT_DATE_TIME = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?$")
+
+
+def _format_report_datetime(value: str | None) -> str:
+    """Display form of a stored report date/time (Baku wall-clock time).
+
+    `2026-10-15T14:32` -> `15.10.2026 14:32`. An old date-only value
+    (`2026-10-15`) -> `15.10.2026`, with no invented time. Anything else is
+    returned unchanged. Mirrors `formatReportDateTime` in
+    `case-incident-report-print.ts`.
+    """
+    raw = (value or "").strip()
+    match = _REPORT_DATE_TIME.match(raw)
+    if match is None:
+        return raw
+    year, month, day, hour, minute = match.groups()
+    if hour is None:
+        return f"{day}.{month}.{year}"
+    return f"{day}.{month}.{year} {hour}:{minute}"
+
+
 def _bold_inline(text: str) -> str:
     """Escapes `text` for reportlab's mini-XML, then turns `**x**` into `<b>x</b>`.
 
@@ -162,6 +183,14 @@ def _text(label: str, report: dict[str, Any], key: str) -> PrintField:
     return PrintField(label, "text", value=_fallback_dash(report.get(key)))
 
 
+def _datetime_text(label: str, report: dict[str, Any], key: str) -> PrintField:
+    return PrintField(
+        label,
+        "text",
+        value=_fallback_dash(_format_report_datetime(report.get(key))),
+    )
+
+
 def _list(label: str, report: dict[str, Any], key: str) -> PrintField:
     items = report.get(key)
     return PrintField(
@@ -182,9 +211,9 @@ def _build_sections(report: dict[str, Any]) -> list[PrintSection]:
                 _text("Telefon", report, "reporterPhone"),
                 _text("İş ünvanı", report, "reporterWorkAddress"),
                 _text("Aşkarlandığı sistem və ya tətbiq", report, "detectedSystem"),
-                _text("Aşkarlanma tarixi", report, "detectedAt"),
-                _text("İlk cavabın verilmə tarixi", report, "firstResponseAt"),
-                _text("Bağlanma tarixi", report, "closedAt"),
+                _datetime_text("Aşkarlanma tarixi", report, "detectedAt"),
+                _datetime_text("İlk cavabın verilmə tarixi", report, "firstResponseAt"),
+                _datetime_text("Bağlanma tarixi", report, "closedAt"),
             ],
         ),
         PrintSection(

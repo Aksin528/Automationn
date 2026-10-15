@@ -107,6 +107,57 @@ export const EMPTY_REPORT: IncidentReportPayload = {
   reviewer: "",
 }
 
+const BAKU_TIME_ZONE = "Asia/Baku"
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/
+const LOCAL_DATE_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/
+
+/** Formats an instant as Baku wall-clock time in the `YYYY-MM-DDTHH:MM` shape
+ * a `datetime-local` input uses (and the report stores). Baku has no daylight
+ * saving time, so the value is unambiguous without a UTC offset. Returns ""
+ * for empty or unparsable input. */
+export function toBakuDateTimeLocal(iso: string | null | undefined): string {
+  if (!iso) return ""
+  const parsed = new Date(iso)
+  if (Number.isNaN(parsed.getTime())) return ""
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BAKU_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(parsed)
+  const part = (type: string) => parts.find((p) => p.type === type)?.value ?? ""
+  return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}`
+}
+
+/** Brings a stored report date/time to the `datetime-local` shape. Old
+ * reports hold a date only (`2026-10-15`): it becomes midnight of that day so
+ * the input can show it. Anything else that parses is converted to Baku time. */
+export function normalizeReportDateTime(
+  value: string | null | undefined
+): string {
+  const raw = (value ?? "").trim()
+  if (!raw) return ""
+  if (LOCAL_DATE_TIME_PATTERN.test(raw)) return raw
+  if (DATE_ONLY_PATTERN.test(raw)) return `${raw}T00:00`
+  return toBakuDateTimeLocal(raw)
+}
+
+/** Display form of a stored report date/time: `15.10.2026 14:32`, or just
+ * `15.10.2026` for an old date-only value (no invented time). Unrecognised
+ * text is returned unchanged. */
+export function formatReportDateTime(value: string | null | undefined): string {
+  const raw = (value ?? "").trim()
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?$/)
+  if (!match) return raw
+  const [, year, month, day, hour, minute] = match
+  return hour
+    ? `${day}.${month}.${year} ${hour}:${minute}`
+    : `${day}.${month}.${year}`
+}
+
 /** One printable field. "text" renders `value` as-is; "list" renders
  * `items` as a bulleted list (used for the checkbox-group fields, instead
  * of joining them into one comma-separated line); "markdown" runs `value`
@@ -147,9 +198,12 @@ function buildPrintSections(report: IncidentReportPayload): PrintSection[] {
         textField("Telefon", report.reporterPhone),
         textField("İş ünvanı", report.reporterWorkAddress),
         textField("Aşkarlandığı sistem və ya tətbiq", report.detectedSystem),
-        textField("Aşkarlanma tarixi", report.detectedAt),
-        textField("İlk cavabın verilmə tarixi", report.firstResponseAt),
-        textField("Bağlanma tarixi", report.closedAt),
+        textField("Aşkarlanma tarixi", formatReportDateTime(report.detectedAt)),
+        textField(
+          "İlk cavabın verilmə tarixi",
+          formatReportDateTime(report.firstResponseAt)
+        ),
+        textField("Bağlanma tarixi", formatReportDateTime(report.closedAt)),
       ],
     },
     {

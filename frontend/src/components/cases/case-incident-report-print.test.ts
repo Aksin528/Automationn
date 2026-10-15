@@ -1,4 +1,42 @@
-import { renderSimpleMarkdown } from "@/components/cases/case-incident-report-print"
+import {
+  formatReportDateTime,
+  normalizeReportDateTime,
+  renderSimpleMarkdown,
+  toBakuDateTimeLocal,
+} from "@/components/cases/case-incident-report-print"
+
+describe("report date/time helpers", () => {
+  it("converts an instant to Baku wall-clock time (UTC+4)", () => {
+    expect(toBakuDateTimeLocal("2026-10-15T21:30:00Z")).toBe("2026-10-16T01:30")
+    expect(toBakuDateTimeLocal("2026-10-15T08:05:00+00:00")).toBe(
+      "2026-10-15T12:05"
+    )
+  })
+
+  it("never renders midnight as 24:00", () => {
+    expect(toBakuDateTimeLocal("2026-10-15T20:00:00Z")).toBe("2026-10-16T00:00")
+  })
+
+  it("returns an empty string for empty or unparsable input", () => {
+    expect(toBakuDateTimeLocal("")).toBe("")
+    expect(toBakuDateTimeLocal(null)).toBe("")
+    expect(toBakuDateTimeLocal("not a date")).toBe("")
+  })
+
+  it("keeps a datetime-local value and turns an old date into midnight", () => {
+    expect(normalizeReportDateTime("2026-10-15T14:32")).toBe("2026-10-15T14:32")
+    expect(normalizeReportDateTime("2026-10-15")).toBe("2026-10-15T00:00")
+    expect(normalizeReportDateTime("")).toBe("")
+    expect(normalizeReportDateTime(undefined)).toBe("")
+  })
+
+  it("formats stored values for display without inventing a time", () => {
+    expect(formatReportDateTime("2026-10-15T14:32")).toBe("15.10.2026 14:32")
+    expect(formatReportDateTime("2026-10-15")).toBe("15.10.2026")
+    expect(formatReportDateTime("")).toBe("")
+    expect(formatReportDateTime("some text")).toBe("some text")
+  })
+})
 
 describe("renderSimpleMarkdown", () => {
   it("renders an empty/blank value as a dash", () => {

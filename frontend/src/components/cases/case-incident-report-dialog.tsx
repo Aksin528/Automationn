@@ -7,6 +7,8 @@ import {
   INCIDENT_TYPES,
   type IncidentReportPayload,
   NOTIFIED_TO,
+  normalizeReportDateTime,
+  toBakuDateTimeLocal,
 } from "@/components/cases/case-incident-report-print"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -99,31 +101,62 @@ async function persistIncidentReportPdf(
   }
 }
 
-function toDateInputValue(iso: string | null | undefined): string {
-  if (!iso) return ""
-  const parsed = new Date(iso)
-  if (Number.isNaN(parsed.getTime())) return ""
-  return parsed.toISOString().slice(0, 10)
-}
+/** Report fields that hold a date and time (`YYYY-MM-DDTHH:MM`, Baku time). */
+const REPORT_DATE_TIME_KEYS = [
+  "detectedAt",
+  "firstResponseAt",
+  "closedAt",
+] as const
+
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/
 
 /** Builds the starting draft: saved report if one exists, otherwise a fresh
- * one pre-filled from whatever the case already has (detection date,
+ * one pre-filled from whatever the case already has (detection time,
  * description, tagged system). Everything else — reporter details, incident
  * type checkboxes, notified-to checkboxes, activities taken, evaluation,
- * monitoring — has no case-level source and starts blank. */
+ * monitoring — has no case-level source and starts blank. Old reports that
+ * stored a date only are shown as midnight of that day. */
 function buildInitialReport(
   caseData: CaseRead | undefined
 ): IncidentReportPayload {
   const saved = caseData?.payload?.incident_report
   if (saved && typeof saved === "object") {
-    return { ...EMPTY_REPORT, ...(saved as Partial<IncidentReportPayload>) }
+    const merged = {
+      ...EMPTY_REPORT,
+      ...(saved as Partial<IncidentReportPayload>),
+    }
+    return {
+      ...merged,
+      detectedAt: normalizeReportDateTime(merged.detectedAt),
+      firstResponseAt: normalizeReportDateTime(merged.firstResponseAt),
+      closedAt: normalizeReportDateTime(merged.closedAt),
+    }
   }
   return {
     ...EMPTY_REPORT,
-    detectedAt: toDateInputValue(caseData?.created_at),
+    detectedAt: toBakuDateTimeLocal(caseData?.created_at),
     description: caseData?.description ?? "",
     detectedSystem: (caseData?.tags ?? []).map((tag) => tag.name).join(", "),
   }
+}
+
+/** The `datetime-local` inputs show an old date-only value as midnight. When
+ * the analyst did not change it, write the original date back instead of
+ * inventing a `00:00` time. */
+function withOriginalDateOnlyValues(
+  report: IncidentReportPayload,
+  saved: unknown
+): IncidentReportPayload {
+  if (!saved || typeof saved !== "object") return report
+  const original = saved as Partial<IncidentReportPayload>
+  const result = { ...report }
+  for (const key of REPORT_DATE_TIME_KEYS) {
+    const before = (original[key] ?? "").trim()
+    if (DATE_ONLY_PATTERN.test(before) && result[key] === `${before}T00:00`) {
+      result[key] = before
+    }
+  }
+  return result
 }
 
 function CheckboxGroup({
@@ -233,7 +266,13 @@ export function CaseIncidentReportDialog({
   const handleSave = async () => {
     try {
       await updateCase({
-        payload: { ...(caseData?.payload ?? {}), incident_report: report },
+        payload: {
+          ...(caseData?.payload ?? {}),
+          incident_report: withOriginalDateOnlyValues(
+            report,
+            caseData?.payload?.incident_report
+          ),
+        },
       })
     } catch (error) {
       console.error("Error saving incident report", error)
@@ -316,21 +355,21 @@ export function CaseIncidentReportDialog({
                 </Field>
                 <Field label="Aşkarlanma tarixi">
                   <Input
-                    type="date"
+                    type="datetime-local"
                     value={report.detectedAt}
                     onChange={(e) => set("detectedAt", e.target.value)}
                   />
                 </Field>
                 <Field label="İlk cavabın verilmə tarixi">
                   <Input
-                    type="date"
+                    type="datetime-local"
                     value={report.firstResponseAt}
                     onChange={(e) => set("firstResponseAt", e.target.value)}
                   />
                 </Field>
                 <Field label="Bağlanma tarixi">
                   <Input
-                    type="date"
+                    type="datetime-local"
                     value={report.closedAt}
                     onChange={(e) => set("closedAt", e.target.value)}
                   />
