@@ -4,7 +4,6 @@ import { ListIcon } from "lucide-react"
 import { DropdownsTable } from "@/components/cases/dropdowns-table"
 import { CenteredSpinner } from "@/components/loading/spinner"
 import { AlertNotification } from "@/components/notifications"
-import { Button } from "@/components/ui/button"
 import {
   Empty,
   EmptyDescription,
