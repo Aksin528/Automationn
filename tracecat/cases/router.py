@@ -79,6 +79,14 @@ from tracecat.tiers.enums import Entitlement
 cases_router = APIRouter(prefix="/cases", tags=["cases"])
 case_fields_router = APIRouter(prefix="/case-fields", tags=["cases"])
 
+# fork-local: browser-friendly report download link (the logic lives in report_redirect.py)
+try:
+    from tracecat.cases.report_redirect import router as _report_redirect_router
+
+    cases_router.include_router(_report_redirect_router)
+except ImportError as exc:  # keep the API bootable if the fork-local file is missing
+    logger.warning("fork-local report redirect route not loaded", error=str(exc))
+
 
 class ParsedCaseSearchFilters(TypedDict):
     assignee_ids: list[uuid.UUID] | None
