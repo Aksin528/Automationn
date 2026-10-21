@@ -5649,6 +5649,94 @@ export const $ApprovalDecision = {
   description: "Operator decision for a pending approval.",
 } as const
 
+export const $ApprovalListItem = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    session_id: {
+      type: "string",
+      format: "uuid",
+      title: "Session Id",
+    },
+    case_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Case Id",
+    },
+    tool_call_id: {
+      type: "string",
+      title: "Tool Call Id",
+    },
+    tool_name: {
+      type: "string",
+      title: "Tool Name",
+    },
+    status: {
+      $ref: "#/components/schemas/ApprovalStatus",
+    },
+    tool_call_args: {
+      anyOf: [
+        {
+          additionalProperties: true,
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tool Call Args",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+    is_expired: {
+      type: "boolean",
+      title: "Is Expired",
+      default: false,
+    },
+    approved_by_email: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Approved By Email",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "session_id",
+    "tool_call_id",
+    "tool_name",
+    "status",
+    "created_at",
+  ],
+  title: "ApprovalListItem",
+  description: `Lightweight approval record for polling/listing purposes.
+
+Does not resolve \`approved_by\` into a full user object (see
+\`ApprovalRead\` for that) -- only its email, via \`approved_by_email\`
+below, since external pollers (e.g. the Telegram sync workflow, so it
+can show who decided a card that wasn't decided through Telegram
+itself) need just enough to display who acted, not a full user object.`,
+} as const
+
 export const $ApprovalMap = {
   additionalProperties: {
     $ref: "#/components/schemas/ApprovalResult",
@@ -9619,6 +9707,9 @@ export const $CaseEventType = {
     "comment_reply_created",
     "comment_reply_updated",
     "comment_reply_deleted",
+    "approval_requested",
+    "approval_resolved",
+    "approval_timed_out",
     "parent_changed",
     "sub_cases_added",
     "sub_cases_removed",
@@ -19830,7 +19921,7 @@ export const $InboxItemRead = {
 
 export const $InboxItemStatus = {
   type: "string",
-  enum: ["pending", "completed", "failed"],
+  enum: ["pending", "completed", "failed", "expired"],
   title: "InboxItemStatus",
   description: "Status of inbox items.",
 } as const
@@ -19855,6 +19946,26 @@ export const $InboxPendingCount = {
   required: ["count"],
   title: "InboxPendingCount",
   description: "Count of pending inbox items that require attention.",
+} as const
+
+export const $IncidentReportDownloadResponse = {
+  properties: {
+    download_url: {
+      type: "string",
+      title: "Download Url",
+      description: "Pre-signed download URL",
+    },
+    file_name: {
+      type: "string",
+      title: "File Name",
+      description: "Report file name",
+    },
+  },
+  type: "object",
+  required: ["download_url", "file_name"],
+  title: "IncidentReportDownloadResponse",
+  description:
+    "Pre-signed download URL for a case's rendered incident report PDF.",
 } as const
 
 export const $InferredColumn = {

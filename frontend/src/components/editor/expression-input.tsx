@@ -117,7 +117,6 @@ function ExpressionInputCore({
   const codeMirrorTheme = resolvedTheme === "dark" ? "dark" : "light"
   const workspaceId = useWorkspaceId()
   const { workflow } = useWorkflow()
-  const { resolvedTheme } = useTheme()
   const methods = useFormContext()
   const actions = workflow?.actions || ({} as Record<string, ActionRead>)
   const forEach = useMemo(() => methods.watch("for_each"), [methods])
@@ -283,7 +282,6 @@ function ExpressionInputCore({
           onChange={handleChange}
           editable={!disabled}
           basicSetup={false} // We're handling setup manually
-          theme={resolvedTheme === "dark" ? "dark" : "light"}
           className={EDITOR_STYLE}
         />
       </div>

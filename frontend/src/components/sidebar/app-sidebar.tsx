@@ -25,7 +25,7 @@ import {
   WorkflowIcon,
 } from "lucide-react"
 import Link from "next/link"
-import { useParams, usePathname } from "next/navigation"
+import { usePathname } from "next/navigation"
 import { env } from "next-runtime-env"
 import type * as React from "react"
 import { useMemo, useState } from "react"

@@ -1446,6 +1446,30 @@ export type ApprovalDecision = {
 
 export type action = "approve" | "override" | "deny"
 
+/**
+ * Lightweight approval record for polling/listing purposes.
+ *
+ * Does not resolve `approved_by` into a full user object (see
+ * `ApprovalRead` for that) -- only its email, via `approved_by_email`
+ * below, since external pollers (e.g. the Telegram sync workflow, so it
+ * can show who decided a card that wasn't decided through Telegram
+ * itself) need just enough to display who acted, not a full user object.
+ */
+export type ApprovalListItem = {
+  id: string
+  session_id: string
+  case_id?: string | null
+  tool_call_id: string
+  tool_name: string
+  status: ApprovalStatus
+  tool_call_args?: {
+    [key: string]: unknown
+  } | null
+  created_at: string
+  is_expired?: boolean
+  approved_by_email?: string | null
+}
+
 export type ApprovalMap = {
   [key: string]: ApprovalResult
 }
@@ -2607,6 +2631,9 @@ export type CaseEventType =
   | "comment_reply_created"
   | "comment_reply_updated"
   | "comment_reply_deleted"
+  | "approval_requested"
+  | "approval_resolved"
+  | "approval_timed_out"
   | "parent_changed"
   | "sub_cases_added"
   | "sub_cases_removed"
@@ -6161,7 +6188,7 @@ export type InboxItemRead = {
 /**
  * Status of inbox items.
  */
-export type InboxItemStatus = "pending" | "completed" | "failed"
+export type InboxItemStatus = "pending" | "completed" | "failed" | "expired"
 
 /**
  * Types of inbox items.
@@ -6176,6 +6203,20 @@ export type InboxPendingCount = {
    * Number of pending inbox items
    */
   count: number
+}
+
+/**
+ * Pre-signed download URL for a case's rendered incident report PDF.
+ */
+export type IncidentReportDownloadResponse = {
+  /**
+   * Pre-signed download URL
+   */
+  download_url: string
+  /**
+   * Report file name
+   */
+  file_name: string
 }
 
 /**
@@ -15156,6 +15197,15 @@ export type AgentSessionsCancelSessionData = {
 
 export type AgentSessionsCancelSessionResponse = AgentSessionCancelResponse
 
+export type ApprovalsListApprovalsData = {
+  caseId?: string | null
+  status?: ApprovalStatus | null
+  toolCallId?: Array<string> | null
+  workspaceId: string
+}
+
+export type ApprovalsListApprovalsResponse = Array<ApprovalListItem>
+
 export type ApprovalsSubmitApprovalsData = {
   requestBody: ApprovalSubmission
   sessionId: string
@@ -16528,6 +16578,21 @@ export type CasesListCommentThreadsData = {
 }
 
 export type CasesListCommentThreadsResponse = Array<CaseCommentThreadRead>
+
+export type CasesUploadIncidentReportPdfData = {
+  caseId: string
+  workspaceId: string
+}
+
+export type CasesUploadIncidentReportPdfResponse = void
+
+export type CasesDownloadIncidentReportPdfData = {
+  caseId: string
+  workspaceId: string
+}
+
+export type CasesDownloadIncidentReportPdfResponse =
+  IncidentReportDownloadResponse
 
 export type CasesUpdateCommentData = {
   caseId: string
@@ -21763,6 +21828,21 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/workspaces/{workspace_id}/approvals": {
+    get: {
+      req: ApprovalsListApprovalsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<ApprovalListItem>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/workspaces/{workspace_id}/approvals/{session_id}": {
     post: {
       req: ApprovalsSubmitApprovalsData
@@ -24055,6 +24135,34 @@ export type $OpenApiTs = {
          * Successful Response
          */
         200: Array<CaseCommentThreadRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/workspaces/{workspace_id}/cases/{case_id}/report/pdf": {
+    post: {
+      req: CasesUploadIncidentReportPdfData
+      res: {
+        /**
+         * Successful Response
+         */
+        204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    get: {
+      req: CasesDownloadIncidentReportPdfData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: IncidentReportDownloadResponse
         /**
          * Validation Error
          */

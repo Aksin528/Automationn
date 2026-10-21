@@ -32,6 +32,7 @@ from tracecat.cases.event_schemas import (
     AssigneeChangedEventRead,
     CaseEventRead,
     CaseEventsWithUsers,
+    TaskAssigneeChangedEventRead,
 )
 from tracecat.cases.filters import parse_assignee_filter, resolve_tag_ids
 from tracecat.cases.hierarchy import TOP_LEVEL, CaseHierarchyService
@@ -60,7 +61,6 @@ from tracecat.cases.schemas import (
     CaseTaskUpdate,
     CaseUpdate,
     IncidentReportDownloadResponse,
-    TaskAssigneeChangedEventRead,
 )
 from tracecat.cases.service import (
     CaseCommentsService,
