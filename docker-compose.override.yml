@@ -85,6 +85,10 @@ services:
     entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
 
   minio:
+    # Upstream 1.2.1 switched minio to a Chainguard image that runs as UID 65532, while the TLS
+    # certificate below is mounted into root's home. Keep the image this stack was running on so
+    # the storage engine and TLS do not change together with the Tracecat update.
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     volumes:
       - ./caddy_certs/server.crt:/root/.minio/certs/public.crt:ro
       - ./caddy_certs/server.key:/root/.minio/certs/private.key:ro
