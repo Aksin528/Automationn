@@ -2335,6 +2335,31 @@ class CaseCommentsService(BaseWorkspaceService):
         )
 
 
+async def get_case_ids_for_execution(
+    session: AsyncSession, workspace_id: uuid.UUID, wf_exec_id: str
+) -> list[uuid.UUID]:
+    """Find every case a workflow execution is linked to.
+
+    The reverse of the linkage `tracecat/cases/router.py::list_pending_approvals`
+    already queries (case -> its executions' wf_exec_ids, via any `CaseEvent`
+    whose `data` blob carries one): here it's wf_exec_id -> the case(s) that
+    recorded an event carrying it. Used to mirror approval-gate lifecycle
+    events (`tracecat_ee.interactions.service`) onto every linked case's
+    Activity tab. Usually one case, but not assumed to be exactly one — a
+    single execution can in principle touch more than one case.
+    """
+    wf_exec_id_col = CaseEvent.data["wf_exec_id"].astext
+    result = await session.execute(
+        select(CaseEvent.case_id)
+        .where(
+            CaseEvent.workspace_id == workspace_id,
+            wf_exec_id_col == wf_exec_id,
+        )
+        .distinct()
+    )
+    return list(result.scalars().all())
+
+
 class CaseEventsService(BaseWorkspaceService):
     """Service for managing case events."""
 

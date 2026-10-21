@@ -12,9 +12,9 @@ from temporalio.client import WorkflowExecutionStatus
 
 from tracecat.agent.approvals.enums import ApprovalStatus
 from tracecat.db.dependencies import AsyncDBSession
-from tracecat.db.models import AgentSession, Approval, Workflow
+from tracecat.db.models import AgentSession, Approval, Case, Workflow
 from tracecat.dsl.client import get_temporal_client
-from tracecat.inbox.schemas import InboxItemRead, WorkflowSummary
+from tracecat.inbox.schemas import CaseSummary, InboxItemRead, WorkflowSummary
 from tracecat.inbox.types import InboxItemStatus, InboxItemType
 from tracecat.logger import logger
 from tracecat.pagination import BaseCursorPaginator, CursorPaginatedResponse
@@ -37,7 +37,9 @@ if TYPE_CHECKING:
 class ApprovalsInboxProvider(BaseCursorPaginator):
     """Provides approval items for the inbox.
 
-    Filters to workflow-initiated sessions only and enriches with workflow metadata.
+    Filters to workflow-initiated ("workflow"/"external_channel") and
+    case-linked ("case") sessions -- not preset-builder or plain chat
+    sessions -- and enriches with workflow metadata where available.
     """
 
     def __init__(self, session: AsyncDBSession, role: Role):
@@ -113,7 +115,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
             .where(
                 AgentSession.workspace_id == self.workspace_id,
                 AgentSession.parent_session_id.is_(None),
-                AgentSession.entity_type.in_(["workflow", "external_channel"]),
+                AgentSession.entity_type.in_(["workflow", "external_channel", "case"]),
             )
             .distinct()
         )
@@ -280,7 +282,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                 Approval.status == ApprovalStatus.PENDING,
                 AgentSession.workspace_id == self.workspace_id,
                 AgentSession.parent_session_id.is_(None),
-                AgentSession.entity_type.in_(["workflow", "external_channel"]),
+                AgentSession.entity_type.in_(["workflow", "external_channel", "case"]),
             )
         )
         count = await self.session.scalar(stmt)
@@ -312,16 +314,39 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                     approval
                 )
 
-        # Fetch workflow metadata for sessions with entity_id
-        workflow_ids = {s.entity_id for s in sessions if s.entity_id}
+        # Fetch workflow metadata for sessions with entity_id -- excludes
+        # "case" sessions, whose entity_id is a Case ID, not a Workflow ID
+        # (see the case_ids/cases_by_id lookup below for those).
+        workflow_ids = {
+            s.entity_id for s in sessions if s.entity_id and s.entity_type != "case"
+        }
         workflows_by_id: dict[uuid.UUID, Workflow] = {}
+        case_ids = {
+            s.entity_id for s in sessions if s.entity_id and s.entity_type == "case"
+        }
+        cases_by_id: dict[uuid.UUID, Case] = {}
         temporal_statuses = await self._resolve_temporal_statuses(sessions)
+
+        # No proactive per-session Temporal liveness check here on purpose:
+        # with unlimited workflow timeouts enabled for this workspace,
+        # checking every pending session on every inbox list/poll call would
+        # be pure overhead in the common case (expiry only happens from an
+        # external disruption like a deploy/restart, not routine aging).
+        # Expiry is surfaced reactively instead, at the moment an
+        # approve/reject actually fails (see the case-panel's
+        # submit_approvals endpoint), not shown speculatively here.
 
         if workflow_ids:
             workflow_stmt = select(Workflow).where(Workflow.id.in_(list(workflow_ids)))
             workflow_result = await self.session.execute(workflow_stmt)
             workflows = workflow_result.scalars().all()
             workflows_by_id = {w.id: w for w in workflows}
+
+        if case_ids:
+            case_stmt = select(Case).where(Case.id.in_(list(case_ids)))
+            case_result = await self.session.execute(case_stmt)
+            cases = case_result.scalars().all()
+            cases_by_id = {c.id: c for c in cases}
 
         # Transform to InboxItemRead
         items: list[InboxItemRead] = []
@@ -342,9 +367,13 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                 status = InboxItemStatus.PENDING
             elif temporal_status in FAILED_STATUSES:
                 status = InboxItemStatus.FAILED
-            elif failed_count > 0:
-                status = InboxItemStatus.FAILED
             else:
+                # A human rejecting one or more proposed tool calls
+                # (failed_count > 0) is a normal, deliberate outcome, not a
+                # technical failure -- the session still completed. Only a
+                # real Temporal-level failure (above) should mark the whole
+                # session FAILED. The rejected count is still surfaced
+                # separately in the preview text below.
                 status = InboxItemStatus.COMPLETED
 
             # Build preview text
@@ -361,6 +390,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
 
             # Get workflow info
             workflow_summary: WorkflowSummary | None = None
+            case_summary: CaseSummary | None = None
             title = session.title or "Agent session"
 
             if session.entity_id and session.entity_id in workflows_by_id:
@@ -372,6 +402,16 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                 )
                 # Use workflow alias or title as the inbox item title
                 title = workflow.alias or workflow.title or title
+            elif session.entity_id and session.entity_id in cases_by_id:
+                case = cases_by_id[session.entity_id]
+                case_summary = CaseSummary(
+                    id=case.id,
+                    short_id=case.short_id,
+                    summary=case.summary,
+                )
+                # So the inbox card identifies which case this is without
+                # opening it -- e.g. "CASE-0234: Phishing alert from ..."
+                title = f"{case.short_id}: {case.summary}"
 
             # Build metadata
             metadata: dict[str, Any] = {
@@ -401,6 +441,7 @@ class ApprovalsInboxProvider(BaseCursorPaginator):
                     created_at=session.created_at,
                     updated_at=session.updated_at,
                     workflow=workflow_summary,
+                    case=case_summary,
                     source_id=session.id,  # Always use parent session ID
                     source_type="agent_session",
                     metadata=metadata,

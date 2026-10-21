@@ -19,6 +19,14 @@ class WorkflowSummary(BaseModel):
     alias: str | None = Field(default=None, description="Workflow alias")
 
 
+class CaseSummary(BaseModel):
+    """Summary of a case for inbox item context."""
+
+    id: uuid.UUID = Field(..., description="Case ID")
+    short_id: str = Field(..., description="Human-readable case ID, e.g. CASE-0123")
+    summary: str = Field(..., description="Case summary/title")
+
+
 class InboxItemRead(BaseModel):
     """Read model for inbox items."""
 
@@ -32,6 +40,9 @@ class InboxItemRead(BaseModel):
     updated_at: datetime = Field(..., description="Last update timestamp")
     workflow: WorkflowSummary | None = Field(
         default=None, description="Associated workflow"
+    )
+    case: CaseSummary | None = Field(
+        default=None, description="Associated case, when entity_type is 'case'"
     )
     source_id: uuid.UUID = Field(..., description="ID of the source entity")
     source_type: str = Field(

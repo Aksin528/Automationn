@@ -85,6 +85,16 @@ class PresetAgentActionArgs(BaseModel):
     actions: list[str] | None = None
     instructions: str | None = None
     session_id: uuid.UUID | None = None
+    trigger_case_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Best-effort case ID derived from this workflow's own trigger "
+            "inputs (if it has a `case_id` field), used to link the "
+            "resulting agent session to that case. Not a user-facing "
+            "action argument -- populated internally by "
+            "build_preset_agent_args_activity."
+        ),
+    )
     max_tool_calls: int = Field(
         default=15,
         ge=1,

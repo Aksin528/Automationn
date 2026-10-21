@@ -468,6 +468,8 @@ class AgentCustomProviderService(BaseOrgService):
                 custom_headers=custom_headers,
                 timeout=30.0,
             )
+            if response.status_code == 404:
+                return []
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPError as err:

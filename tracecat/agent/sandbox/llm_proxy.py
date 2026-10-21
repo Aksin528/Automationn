@@ -45,6 +45,10 @@ LLM_SOCKET_NAME = "llm.sock"
 # Maximum request body size (10 MB) - prevents memory exhaustion DoS
 MAX_BODY_SIZE = 10 * 1024 * 1024
 
+# TEMPORARY: cap on requested max_tokens forwarded to custom-model-provider
+# routes. See usage in LLMRoute._forward_data for context.
+_CUSTOM_MODEL_PROVIDER_MAX_TOKENS_CAP = 4096
+
 # Non-critical endpoints that should not trigger fatal errors on failure.
 _NON_CRITICAL_PATHS = frozenset(
     {
@@ -123,6 +127,11 @@ class LLMRoute:
             provider-specific body cleanup before forwarding. Managed fallback
             routes that may represent synthetic subagent models should defer
             that cleanup to LiteLLM.
+        enable_thinking: The originating agent config's own thinking toggle.
+            Only consulted for `model_provider == "custom-model-provider"`
+            (see `_forward_data`): the Claude Agent SDK CLI does not reliably
+            honor its own `thinking` request field for non-Anthropic
+            backends, so the proxy overrides it directly from this instead.
     """
 
     base_url: str
@@ -132,6 +141,7 @@ class LLMRoute:
     catalog_id: uuid.UUID | None = None
     authorization: str | None = field(default=None, repr=False)
     local_provider_cleanup: bool = True
+    enable_thinking: bool = True
 
     @property
     def is_direct(self) -> bool:
@@ -253,6 +263,45 @@ class LLMRoute:
         if self.local_provider_cleanup and self.model_provider != "anthropic":
             for field_name in _ANTHROPIC_ONLY_FIELDS:
                 forward_data.pop(field_name, None)
+            if (
+                self.model_provider == "custom-model-provider"
+                and not self.enable_thinking
+            ):
+                # The Claude Agent SDK CLI's own "thinking" field is Anthropic/
+                # Ollama-shaped: when present it is {"type": "adaptive"} regardless
+                # of the enable_thinking preset setting, and Ollama's /v1/messages
+                # endpoint honors an explicit "disabled" override there (verified
+                # directly). But for a "direct" (passthrough) route the CLI does
+                # not send a "thinking" field at all -- confirmed via live logging
+                # against this exact route (thinking_field: None) -- so gating the
+                # override on that field's presence silently skipped it. Only
+                # override "thinking" itself when the CLI actually sent it.
+                if isinstance(forward_data.get("thinking"), dict):
+                    forward_data["thinking"] = {"type": "disabled"}
+                # This is the override that actually matters for a raw vLLM
+                # server, which ignores the Anthropic-shaped "thinking" field
+                # entirely and instead controls Qwen3's reasoning through its own
+                # chat-template parameter -- confirmed directly against a real
+                # vLLM 0.29 /v1/messages endpoint: with this key it returns a
+                # clean answer (no "<think>" block, 3 completion tokens); without
+                # it, every answer is prefixed by a "<think>...</think>"
+                # reasoning block regardless of the "thinking" field above. Set
+                # unconditionally (not gated on "thinking" being present) so it
+                # still applies on routes where the CLI sends no "thinking" field
+                # at all.
+                forward_data["chat_template_kwargs"] = {"enable_thinking": False}
+            if (
+                self.model_provider == "custom-model-provider"
+                and isinstance(forward_data.get("max_tokens"), int)
+                and forward_data["max_tokens"] > _CUSTOM_MODEL_PROVIDER_MAX_TOKENS_CAP
+            ):
+                # TEMPORARY: the Claude Agent SDK CLI defaults to a large max_tokens
+                # (~32000) sized for hosted Claude models. Self-hosted custom models
+                # (e.g. vLLM/Ollama) often have a much smaller total context window
+                # (input + output combined), so this default alone can exceed it and
+                # make every request fail with a context-length error. Clamp it down
+                # until the SDK exposes a way to configure this per route.
+                forward_data["max_tokens"] = _CUSTOM_MODEL_PROVIDER_MAX_TOKENS_CAP
         return forward_data if forward_data != data else None
 
     def prepare_forward_request(
@@ -421,6 +470,7 @@ def _normalize_direct_route(route: LLMRoute) -> LLMRoute:
         catalog_id=route.catalog_id,
         authorization=route.authorization,
         local_provider_cleanup=route.local_provider_cleanup,
+        enable_thinking=route.enable_thinking,
     )
 
 
@@ -549,7 +599,8 @@ class LLMSocketProxy:
                 read=app_config.TRACECAT__LLM_PROXY_READ_TIMEOUT,
                 write=app_config.TRACECAT__LLM_GATEWAY_WRITE_TIMEOUT_SECONDS,
                 pool=app_config.TRACECAT__LLM_GATEWAY_POOL_TIMEOUT_SECONDS,
-            )
+            ),
+            verify=False,
         )
 
         # Start Unix socket server

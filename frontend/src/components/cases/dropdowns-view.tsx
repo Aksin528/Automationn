@@ -1,11 +1,9 @@
 "use client"
 
-import { ArrowUpRight, ListIcon } from "lucide-react"
+import { ListIcon } from "lucide-react"
 import { DropdownsTable } from "@/components/cases/dropdowns-table"
-import { EntitlementRequiredEmptyState } from "@/components/entitlement-required-empty-state"
 import { CenteredSpinner } from "@/components/loading/spinner"
 import { AlertNotification } from "@/components/notifications"
-import { Button } from "@/components/ui/button"
 import {
   Empty,
   EmptyDescription,
@@ -13,7 +11,6 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
-import { useEntitlements } from "@/hooks/use-entitlements"
 import { useWorkspaceDetails } from "@/hooks/use-workspace"
 import { useCaseDropdownDefinitions } from "@/lib/hooks"
 import { useWorkspaceId } from "@/providers/workspace-id"
@@ -21,8 +18,6 @@ import { useWorkspaceId } from "@/providers/workspace-id"
 export function DropdownsView() {
   const workspaceId = useWorkspaceId()
   const { workspace, workspaceLoading, workspaceError } = useWorkspaceDetails()
-  const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
-  const caseAddonsEnabled = hasEntitlement("case_addons")
 
   const {
     dropdownDefinitions,
@@ -36,41 +31,7 @@ export function DropdownsView() {
     updateDropdownOption,
     deleteDropdownOption,
     reorderDropdownOptions,
-  } = useCaseDropdownDefinitions(workspaceId, caseAddonsEnabled)
-
-  // Check feature flag loading first
-  if (entitlementsLoading) {
-    return <CenteredSpinner />
-  }
-
-  // Show enterprise-only message if feature is not enabled
-  if (!caseAddonsEnabled) {
-    return (
-      <div className="size-full overflow-auto">
-        <div className="container flex h-full max-w-[1000px] items-center justify-center py-8">
-          <EntitlementRequiredEmptyState
-            title="Enterprise only"
-            description="Case dropdowns are only available on enterprise plans."
-          >
-            <Button
-              variant="link"
-              asChild
-              className="text-muted-foreground"
-              size="sm"
-            >
-              <a
-                href="https://tracecat.com"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Learn more <ArrowUpRight className="size-4" />
-              </a>
-            </Button>
-          </EntitlementRequiredEmptyState>
-        </div>
-      </div>
-    )
-  }
+  } = useCaseDropdownDefinitions(workspaceId, true)
 
   if (workspaceLoading || dropdownDefinitionsIsLoading) {
     return <CenteredSpinner />

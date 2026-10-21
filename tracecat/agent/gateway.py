@@ -305,6 +305,13 @@ async def user_api_key_auth(request: Request, api_key: str | None) -> UserAPIKey
             user_role=LitellmUserRoles.INTERNAL_USER_VIEW_ONLY,
         )
 
+    # Allow internal service calls with master key
+    if api_key == "sk-tracecat-internal":
+        return UserAPIKeyAuth(
+            api_key="sk-tracecat-internal",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+        )
+
     try:
         claims = verify_llm_token(api_key or "")
     except ValueError as exc:

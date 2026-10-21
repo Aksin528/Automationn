@@ -1,10 +1,11 @@
 import base64
+import uuid
 from datetime import datetime
 from typing import Any, Literal
 
 import temporalio.service
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import or_, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +29,7 @@ from tracecat.dsl.common import (
     get_trigger_type_from_search_attr,
 )
 from tracecat.ee.interactions.schemas import InteractionRead
-from tracecat.ee.interactions.service import InteractionService
+from tracecat.ee.interactions.service import ApprovalVoteResult, InteractionService
 from tracecat.exceptions import TracecatValidationError
 from tracecat.identifiers import UserID
 from tracecat.identifiers.workflow import (
@@ -289,6 +290,50 @@ async def _list_interactions(
     else:
         logger.debug("Interactions are disabled, skipping interaction states")
         return []
+
+
+class ApprovalVoteRequest(BaseModel):
+    decision: Literal["approve", "reject"]
+    comment: str | None = None
+
+
+@router.post("/{execution_id:path}/interactions/{interaction_id}/votes")
+@require_scope("workflow:execute")
+async def vote_on_interaction(
+    role: WorkspaceUserRouteRole,
+    session: AsyncDBSession,
+    execution_id: UnquotedExecutionID,
+    interaction_id: uuid.UUID,
+    params: ApprovalVoteRequest,
+) -> ApprovalVoteResult:
+    """Cast an authenticated in-app approve/reject vote on a pending approval interaction."""
+    if not await get_setting("app_interactions_enabled", default=False):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Interactions are disabled for this organization.",
+        )
+    svc = InteractionService(session=session, role=role)
+    interaction = await svc.get_interaction(interaction_id)
+    if interaction is None or interaction.wf_exec_id != execution_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Interaction not found"
+        )
+    if role.user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Voting requires an authenticated user.",
+        )
+    try:
+        return await svc.record_vote(
+            interaction,
+            user_id=role.user_id,
+            decision=params.decision,
+            comment=params.comment,
+        )
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
 
 
 def _normalize_search_term(search_term: str | None) -> str | None:

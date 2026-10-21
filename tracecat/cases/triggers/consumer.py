@@ -202,7 +202,25 @@ class CaseTriggerConsumer:
                 ):
                     continue
                 if trigger.tag_filters:
-                    if not case_tag_refs.intersection(trigger.tag_filters):
+                    if event_type in (
+                        CaseEventType.TAG_ADDED.value,
+                        CaseEventType.TAG_REMOVED.value,
+                    ):
+                        # For tag add/remove events, match on the specific tag
+                        # from this event, not the case's full current tag set --
+                        # otherwise a trigger filtered to tag A also fires when
+                        # tag B is added, as long as the case already carries
+                        # tag A (e.g. two tags added moments apart by the same
+                        # workflow), producing one dispatch per tag-add event
+                        # instead of one per matching tag.
+                        event_tag_ref = (
+                            event.data.get("tag_ref")
+                            if isinstance(event.data, dict)
+                            else None
+                        )
+                        if event_tag_ref not in trigger.tag_filters:
+                            continue
+                    elif not case_tag_refs.intersection(trigger.tag_filters):
                         continue
                 done_key = f"case-trigger:done:{event_id}:{trigger.workflow_id}"
                 lock_key = f"case-trigger:lock:{event_id}:{trigger.workflow_id}"

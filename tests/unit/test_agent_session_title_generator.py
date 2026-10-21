@@ -30,6 +30,21 @@ def test_sanitize_session_title_handles_quotes_newlines_and_empty() -> None:
     assert sanitize_session_title("   \n\t  ") is None
 
 
+def test_sanitize_session_title_strips_closed_think_block() -> None:
+    # Some models (e.g. Qwen3) prefix their answer with a reasoning block;
+    # the title is whatever comes after it, not the reasoning itself.
+    raw = "<think>\nOkay, let's see what the user wants.\n</think>\nInvestigate failed logins"
+    assert sanitize_session_title(raw) == "Investigate failed logins"
+
+
+def test_sanitize_session_title_strips_unclosed_think_block() -> None:
+    # A small max_tokens budget can cut the completion off mid-"thinking",
+    # before "</think>" or the real title ever appears -- this must not
+    # surface the truncated reasoning fragment as the title.
+    raw = "<think>\nOkay, let's see. The user provided a"
+    assert sanitize_session_title(raw) is None
+
+
 @pytest.mark.anyio
 async def test_generate_session_title_returns_sanitized_output() -> None:
     llm_complete = AsyncMock(return_value='  "Investigate API\nerrors in worker"  ')

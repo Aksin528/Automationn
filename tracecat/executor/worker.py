@@ -82,12 +82,31 @@ def new_sandbox_runner() -> SandboxedWorkflowRunner:
 
     Since RegistrySyncWorkflow is a simple activity wrapper with no complex
     determinism requirements, we use a permissive sandbox configuration.
+
+    ExecutorActivities (registered on this same Worker, alongside
+    RegistrySyncWorkflow) can transitively import beartype-decorated code
+    (e.g. via fastmcp, pulled in by tracecat.agent.mcp.user_client /
+    tracecat.agent.preset.service). Temporal's sandbox reimports a
+    workflow's module graph under restriction to validate it; beartype's
+    own import hook (beartype.claw) conflicts with that reimport and
+    raises a circular-import ImportError unless beartype is passed
+    through rather than reimported. dsl/worker.py and agent/worker.py hit
+    the same issue earlier and fixed it the same way -- keep this in
+    sync with those if new heavy/beartype-using dependencies show up
+    here again.
     """
     # Relax datetime restrictions (same as DSL worker)
     invalid_module_member_children = dict(
         SandboxRestrictions.invalid_module_members_default.children
     )
     del invalid_module_member_children["datetime"]
+
+    passthrough_modules = SandboxRestrictions.passthrough_modules_default | {
+        "tracecat",
+        "tracecat_ee",
+        "tracecat_registry",
+        "beartype",
+    }
 
     return SandboxedWorkflowRunner(
         restrictions=dataclasses.replace(
@@ -96,6 +115,7 @@ def new_sandbox_runner() -> SandboxedWorkflowRunner:
                 SandboxRestrictions.invalid_module_members_default,
                 children=invalid_module_member_children,
             ),
+            passthrough_modules=passthrough_modules,
         )
     )
 

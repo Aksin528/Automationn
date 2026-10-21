@@ -705,7 +705,7 @@ export function MCPIntegrationDialog({
           <Button
             size="sm"
             variant="outline"
-            className={cn("h-7 bg-white", triggerClassName)}
+            className={cn("h-7", triggerClassName)}
             {...restTriggerProps}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />

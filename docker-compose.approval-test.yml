@@ -1,0 +1,133 @@
+# ============================================================
+# TEST — approval mexanizmini sınamaq üçün minimal stack
+# (api + worker + executor). Data (postgres/redis/temporal/minio)
+# canlı stack-in öz şəbəkələrində işləyir; bu fayl ONLARA qoşulur.
+# NOT: canlı stack `tracecat_default`-dan `tracecat_core` /
+# `tracecat_core-db` / `tracecat_temporal*`-a bölündü — şəbəkə adları
+# ona uyğun yeniləndi (əvvəlki `tracecat_default: external` artıq
+# mövcud deyildi).
+# UI/Caddy/agent/mcp YOXDUR — YALNIZ backend, curl ilə test edəcəyik.
+# ============================================================
+
+networks:
+  tracecat_core:
+    external: true
+  tracecat_core-db:
+    external: true
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    networks:
+      - tracecat_core
+      - tracecat_core-db
+    container_name: approval-test-api
+    restart: unless-stopped
+    ports:
+      - "18000:8000"
+    environment:
+      LOG_LEVEL: INFO
+      TRACECAT__ALLOW_ORIGINS: http://localhost:18000
+      TRACECAT__API_ROOT_PATH: /api
+      TRACECAT__API_URL: http://approval-test-api:8000
+      TRACECAT__APP_ENV: development
+      TRACECAT__AUTH_ALLOWED_DOMAINS: ""
+      TRACECAT__AUTH_MIN_PASSWORD_LENGTH: 12
+      TRACECAT__AUTH_TYPES: basic
+      TRACECAT__AUTH_SUPERADMIN_EMAIL: test@test.local
+      TRACECAT__DB_ENCRYPTION_KEY: FAy2nzEuOMGyVRXwtvLsNo74Ph7ddLyR1uudNKnP998=
+      TRACECAT__DB_SSLMODE: disable
+      TRACECAT__DB_URI: postgresql+psycopg://postgres:postgres@postgres_db:5432/postgres
+      TRACECAT__PUBLIC_API_URL: http://localhost:18000/api
+      TRACECAT__PUBLIC_APP_URL: http://localhost:18000
+      TRACECAT__SERVICE_KEY: 30c8961480452b3d9263b5514e8bd96efbc151bfb375b367971f98e9e2ceb03f
+      TRACECAT__SIGNING_SECRET: 30ccf68870328df20be0c270833dc7f8e7364dfa86a032c1bf798a27676e3b8e
+      USER_AUTH_SECRET: 62233026c5b82988e561cb282a22b645b8f0fabf27d1019fc91dfa423050b541
+      TEMPORAL__CLUSTER_URL: temporal:7233
+      TEMPORAL__CLUSTER_QUEUE: approval-test-queue
+      TEMPORAL__CLUSTER_NAMESPACE: default
+      TRACECAT__BLOB_STORAGE_ENDPOINT: http://minio:9000
+      TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW: tracecat-workflow
+      TRACECAT__BLOB_STORAGE_BUCKET_ATTACHMENTS: tracecat-attachments
+      TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY: tracecat-registry
+      TRACECAT__BLOB_STORAGE_BUCKET_AGENT: tracecat-agent
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: password
+      REDIS_URL: redis://redis:6379
+      HOST: "0.0.0.0"
+      PORT: "8000"
+    command: ["python3", "-m", "uvicorn", "tracecat.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    networks:
+      - tracecat_core
+      - tracecat_core-db
+    container_name: approval-test-worker
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: INFO
+      TRACECAT__API_URL: http://approval-test-api:8000
+      TRACECAT__APP_ENV: development
+      TRACECAT__DB_ENCRYPTION_KEY: FAy2nzEuOMGyVRXwtvLsNo74Ph7ddLyR1uudNKnP998=
+      TRACECAT__DB_SSLMODE: disable
+      TRACECAT__DB_URI: postgresql+psycopg://postgres:postgres@postgres_db:5432/postgres
+      TRACECAT__SERVICE_KEY: 30c8961480452b3d9263b5514e8bd96efbc151bfb375b367971f98e9e2ceb03f
+      TRACECAT__SIGNING_SECRET: 30ccf68870328df20be0c270833dc7f8e7364dfa86a032c1bf798a27676e3b8e
+      TEMPORAL__CLUSTER_URL: temporal:7233
+      TEMPORAL__CLUSTER_QUEUE: approval-test-queue
+      TEMPORAL__CLUSTER_NAMESPACE: default
+      REDIS_URL: redis://redis:6379
+      TRACECAT__BLOB_STORAGE_ENDPOINT: http://minio:9000
+      TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW: tracecat-workflow
+      TRACECAT__BLOB_STORAGE_BUCKET_ATTACHMENTS: tracecat-attachments
+      TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY: tracecat-registry
+      TRACECAT__BLOB_STORAGE_BUCKET_AGENT: tracecat-agent
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: password
+    command: ["python", "-m", "tracecat.dsl.worker"]
+
+  executor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    networks:
+      - tracecat_core
+      - tracecat_core-db
+    container_name: approval-test-executor
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: INFO
+      TRACECAT__APP_ENV: development
+      TRACECAT__DB_ENCRYPTION_KEY: FAy2nzEuOMGyVRXwtvLsNo74Ph7ddLyR1uudNKnP998=
+      TRACECAT__DB_SSLMODE: disable
+      TRACECAT__DB_URI: postgresql+psycopg://postgres:postgres@postgres_db:5432/postgres
+      TRACECAT__SERVICE_KEY: 30c8961480452b3d9263b5514e8bd96efbc151bfb375b367971f98e9e2ceb03f
+      TRACECAT__SIGNING_SECRET: 30ccf68870328df20be0c270833dc7f8e7364dfa86a032c1bf798a27676e3b8e
+      TRACECAT__API_URL: http://approval-test-api:8000
+      TEMPORAL__CLUSTER_URL: temporal:7233
+      TEMPORAL__CLUSTER_NAMESPACE: default
+      TRACECAT__EXECUTOR_QUEUE: approval-test-action-queue
+      TRACECAT__EXECUTOR_BACKEND: direct
+      REDIS_URL: redis://redis:6379
+      TRACECAT__BLOB_STORAGE_ENDPOINT: http://minio:9000
+      TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW: tracecat-workflow
+      TRACECAT__BLOB_STORAGE_BUCKET_ATTACHMENTS: tracecat-attachments
+      TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY: tracecat-registry
+      TRACECAT__BLOB_STORAGE_BUCKET_AGENT: tracecat-agent
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: password
+    command: ["python", "-m", "tracecat.executor.worker"]

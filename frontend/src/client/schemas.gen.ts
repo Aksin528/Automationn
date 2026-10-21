@@ -4603,11 +4603,106 @@ export const $ApprovalInteraction = {
       title: "Approve If",
       description: "Condition to approve the action.",
     },
+    separation_of_duties: {
+      type: "boolean",
+      title: "Separation Of Duties",
+      description:
+        "If true, the identity that triggered the workflow execution (the requester) may not also cast an approval vote on this interaction. Enforced server-side in the vote service, not the frontend.",
+      default: false,
+    },
   },
   type: "object",
   required: ["type"],
   title: "ApprovalInteraction",
   description: "Configuration for an approval interaction.",
+} as const
+
+export const $ApprovalListItem = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    session_id: {
+      type: "string",
+      format: "uuid",
+      title: "Session Id",
+    },
+    case_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Case Id",
+    },
+    tool_call_id: {
+      type: "string",
+      title: "Tool Call Id",
+    },
+    tool_name: {
+      type: "string",
+      title: "Tool Name",
+    },
+    status: {
+      $ref: "#/components/schemas/ApprovalStatus",
+    },
+    tool_call_args: {
+      anyOf: [
+        {
+          additionalProperties: true,
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tool Call Args",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+    is_expired: {
+      type: "boolean",
+      title: "Is Expired",
+      default: false,
+    },
+    approved_by_email: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Approved By Email",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "session_id",
+    "tool_call_id",
+    "tool_name",
+    "status",
+    "created_at",
+  ],
+  title: "ApprovalListItem",
+  description: `Lightweight approval record for polling/listing purposes.
+
+Does not resolve \`approved_by\` into a full user object (see
+\`ApprovalRead\` for that) -- only its email, via \`approved_by_email\`
+below, since external pollers (e.g. the Telegram sync workflow, so it
+can show who decided a card that wasn't decided through Telegram
+itself) need just enough to display who acted, not a full user object.`,
 } as const
 
 export const $ApprovalMap = {
@@ -4730,6 +4825,116 @@ export const $ApprovalRead = {
   description: "Response schema for approval data in chat timeline.",
 } as const
 
+export const $ApprovalRequestedEventRead = {
+  properties: {
+    wf_exec_id: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Wf Exec Id",
+      description: "The execution ID of the workflow that triggered the event.",
+    },
+    type: {
+      type: "string",
+      const: "approval_requested",
+      title: "Type",
+      default: "approval_requested",
+    },
+    action_ref: {
+      type: "string",
+      title: "Action Ref",
+    },
+    required_approvers: {
+      type: "integer",
+      title: "Required Approvers",
+    },
+    user_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "User Id",
+      description: "The user who performed the action.",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+      description: "The timestamp of the event.",
+    },
+  },
+  type: "object",
+  required: ["action_ref", "required_approvers", "created_at"],
+  title: "ApprovalRequestedEventRead",
+  description: "Event for when an approval-gated action requests approval.",
+} as const
+
+export const $ApprovalResolvedEventRead = {
+  properties: {
+    wf_exec_id: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Wf Exec Id",
+      description: "The execution ID of the workflow that triggered the event.",
+    },
+    type: {
+      type: "string",
+      const: "approval_resolved",
+      title: "Type",
+      default: "approval_resolved",
+    },
+    action_ref: {
+      type: "string",
+      title: "Action Ref",
+    },
+    resolution: {
+      type: "string",
+      enum: ["approved", "rejected"],
+      title: "Resolution",
+    },
+    user_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "User Id",
+      description: "The user who performed the action.",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+      description: "The timestamp of the event.",
+    },
+  },
+  type: "object",
+  required: ["action_ref", "resolution", "created_at"],
+  title: "ApprovalResolvedEventRead",
+  description:
+    "Event for when an approval-gated action is approved or rejected.",
+} as const
+
 export const $ApprovalStatus = {
   type: "string",
   enum: ["pending", "approved", "rejected"],
@@ -4747,6 +4952,109 @@ export const $ApprovalSubmission = {
   required: ["approvals"],
   title: "ApprovalSubmission",
   description: "Request model for submitting approval decisions.",
+} as const
+
+export const $ApprovalTimedOutEventRead = {
+  properties: {
+    wf_exec_id: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Wf Exec Id",
+      description: "The execution ID of the workflow that triggered the event.",
+    },
+    type: {
+      type: "string",
+      const: "approval_timed_out",
+      title: "Type",
+      default: "approval_timed_out",
+    },
+    action_ref: {
+      type: "string",
+      title: "Action Ref",
+    },
+    user_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "User Id",
+      description: "The user who performed the action.",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+      description: "The timestamp of the event.",
+    },
+  },
+  type: "object",
+  required: ["action_ref", "created_at"],
+  title: "ApprovalTimedOutEventRead",
+  description: `Event for when an approval-gated action's approval window expires
+unresolved.`,
+} as const
+
+export const $ApprovalVoteRequest = {
+  properties: {
+    decision: {
+      type: "string",
+      enum: ["approve", "reject"],
+      title: "Decision",
+    },
+    comment: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Comment",
+    },
+  },
+  type: "object",
+  required: ["decision"],
+  title: "ApprovalVoteRequest",
+} as const
+
+export const $ApprovalVoteResult = {
+  properties: {
+    resolution: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Resolution",
+    },
+    approve_count: {
+      type: "integer",
+      title: "Approve Count",
+    },
+    required_approvers: {
+      type: "integer",
+      title: "Required Approvers",
+    },
+  },
+  type: "object",
+  required: ["resolution", "approve_count", "required_approvers"],
+  title: "ApprovalVoteResult",
+  description: "Outcome of recording one vote on an approval interaction.",
 } as const
 
 export const $Artifact = {
@@ -7693,12 +8001,24 @@ export const $CaseEventRead = {
     {
       $ref: "#/components/schemas/TableRowUnlinkedEventRead",
     },
+    {
+      $ref: "#/components/schemas/ApprovalRequestedEventRead",
+    },
+    {
+      $ref: "#/components/schemas/ApprovalResolvedEventRead",
+    },
+    {
+      $ref: "#/components/schemas/ApprovalTimedOutEventRead",
+    },
   ],
   title: "CaseEventRead",
   description: "Base read model for all event types.",
   discriminator: {
     propertyName: "type",
     mapping: {
+      approval_requested: "#/components/schemas/ApprovalRequestedEventRead",
+      approval_resolved: "#/components/schemas/ApprovalResolvedEventRead",
+      approval_timed_out: "#/components/schemas/ApprovalTimedOutEventRead",
       assignee_changed: "#/components/schemas/AssigneeChangedEventRead",
       attachment_created: "#/components/schemas/AttachmentCreatedEventRead",
       attachment_deleted: "#/components/schemas/AttachmentDeletedEventRead",
@@ -7773,6 +8093,9 @@ export const $CaseEventType = {
     "comment_reply_created",
     "comment_reply_updated",
     "comment_reply_deleted",
+    "approval_requested",
+    "approval_resolved",
+    "approval_timed_out",
   ],
   title: "CaseEventType",
   description: "Case activity type values.",
@@ -8472,6 +8795,31 @@ export const $CaseStatusGroupCounts = {
   },
   type: "object",
   title: "CaseStatusGroupCounts",
+} as const
+
+export const $CaseSummary = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+      description: "Case ID",
+    },
+    short_id: {
+      type: "string",
+      title: "Short Id",
+      description: "Human-readable case ID, e.g. CASE-0123",
+    },
+    summary: {
+      type: "string",
+      title: "Summary",
+      description: "Case summary/title",
+    },
+  },
+  type: "object",
+  required: ["id", "short_id", "summary"],
+  title: "CaseSummary",
+  description: "Summary of a case for inbox item context.",
 } as const
 
 export const $CaseTableRowInsertCreate = {
@@ -14167,6 +14515,17 @@ export const $InboxItemRead = {
       ],
       description: "Associated workflow",
     },
+    case: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/CaseSummary",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description: "Associated case, when entity_type is 'case'",
+    },
     source_id: {
       type: "string",
       format: "uuid",
@@ -14211,7 +14570,7 @@ export const $InboxItemRead = {
 
 export const $InboxItemStatus = {
   type: "string",
-  enum: ["pending", "completed", "failed"],
+  enum: ["pending", "completed", "failed", "expired"],
   title: "InboxItemStatus",
   description: "Status of inbox items.",
 } as const
@@ -14236,6 +14595,26 @@ export const $InboxPendingCount = {
   required: ["count"],
   title: "InboxPendingCount",
   description: "Count of pending inbox items that require attention.",
+} as const
+
+export const $IncidentReportDownloadResponse = {
+  properties: {
+    download_url: {
+      type: "string",
+      title: "Download Url",
+      description: "Pre-signed download URL",
+    },
+    file_name: {
+      type: "string",
+      title: "File Name",
+      description: "Report file name",
+    },
+  },
+  type: "object",
+  required: ["download_url", "file_name"],
+  title: "IncidentReportDownloadResponse",
+  description:
+    "Pre-signed download URL for a case's rendered incident report PDF.",
 } as const
 
 export const $InferredColumn = {
@@ -14842,6 +15221,17 @@ export const $InteractionRead = {
     action_type: {
       type: "string",
       title: "Action Type",
+    },
+    current_approvals: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Current Approvals",
     },
   },
   type: "object",

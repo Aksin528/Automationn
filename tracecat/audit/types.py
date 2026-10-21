@@ -8,7 +8,17 @@ from pydantic import BaseModel, Field
 
 from tracecat.audit.enums import AuditEventActor, AuditEventStatus
 
-AuditAction = Literal["create", "update", "delete", "accept", "revoke"]
+AuditAction = Literal[
+    "create",
+    "update",
+    "delete",
+    "accept",
+    "revoke",
+    "approve",
+    "reject",
+    "timeout",
+    "deny",
+]
 AuditResourceType = Literal[
     "user",
     "organization",
@@ -24,6 +34,7 @@ AuditResourceType = Literal[
     "organization_secret",
     "case",
     "case_comment",
+    "approval_interaction",
     "agent_catalog",
     "agent_custom_provider",
     "agent_model_access",

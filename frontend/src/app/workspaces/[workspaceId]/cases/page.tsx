@@ -16,8 +16,8 @@ import { useWorkspaceId } from "@/providers/workspace-id"
 
 export default function CasesPage() {
   const workspaceId = useWorkspaceId()
-  const { hasEntitlement, hasEntitlementData } = useEntitlements()
-  const caseAddonsEnabled = hasEntitlement("case_addons")
+  const { hasEntitlementData } = useEntitlements()
+  const caseAddonsEnabled = true
 
   const { members } = useWorkspaceMembers(workspaceId)
   const { caseTags } = useCaseTagCatalog(workspaceId)

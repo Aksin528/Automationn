@@ -1,0 +1,131 @@
+# ============================================================
+# SERVER 1 — DATA
+# Servislər: postgres_db, migrations, temporal_postgres_db,
+#            temporal, minio, redis
+# NOT: postgres_db/redis/temporal-ın portları HOST-a açılıb
+# (əvvəl yalnız Docker-daxili idi) ki, digər 3 server görsün.
+# ============================================================
+
+services:
+  postgres_db:
+    image: postgres:16
+    container_name: postgres_db
+    restart: unless-stopped
+    shm_size: 128mb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${TRACECAT__POSTGRES_USER}
+      POSTGRES_PASSWORD: ${TRACECAT__POSTGRES_PASSWORD}
+    volumes:
+      - core-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  # Bir dəfəlik: DB cədvəllərini qurur. İşini bitirib dayanır (normaldır).
+  migrations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: migrations
+    restart: "no"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      TRACECAT__DB_URI: ${TRACECAT__DB_URI}
+      TRACECAT__DB_SSLMODE: ${TRACECAT__DB_SSLMODE}
+      TRACECAT__FEATURE_FLAGS: ${TRACECAT__FEATURE_FLAGS}
+    command: ["python3", "-m", "alembic", "upgrade", "head"]
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+
+  temporal_postgres_db:
+    image: postgres:13
+    container_name: temporal_postgres_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TEMPORAL__POSTGRES_USER}
+      POSTGRES_PASSWORD: ${TEMPORAL__POSTGRES_PASSWORD} # Sensitive
+    volumes:
+      - temporal-db:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:${TEMPORAL__VERSION:-1.27.1}
+    container_name: temporal
+    restart: unless-stopped
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=${TEMPORAL__POSTGRES_USER}
+      - POSTGRES_PWD=${TEMPORAL__POSTGRES_PASSWORD} # Sensitive
+      - POSTGRES_SEEDS=temporal_postgres_db
+      - LOG_LEVEL=warn
+      - BIND_ON_IP=0.0.0.0
+      - TEMPORAL_BROADCAST_ADDRESS=127.0.0.1
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    depends_on:
+      - temporal_postgres_db
+
+  # Temporal-ın öz idarəetmə UI-si (istəyə bağlı, sadəcə debug üçün faydalıdır)
+  temporal_ui:
+    image: temporalio/ui:${TEMPORAL__UI_VERSION}
+    container_name: temporal_ui
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8081
+    depends_on:
+      - temporal
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  core-db:
+  temporal-db:
+  minio-data:
+  redis-data:

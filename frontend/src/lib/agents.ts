@@ -13,6 +13,12 @@ export type WorkflowSummary = {
   alias?: string | null
 }
 
+export type CaseSummary = {
+  id: string
+  short_id: string
+  summary: string
+}
+
 /**
  * Base session type that can be either AgentSessionRead or ChatReadMinimal.
  * Used for backward compatibility with legacy Chat records.
@@ -151,6 +157,7 @@ export interface InboxSessionItem {
   created_at: string
   updated_at: string
   parent_workflow: WorkflowSummary | null
+  parent_case: CaseSummary | null
   derivedStatus: AgentDerivedStatus
   statusLabel: string
   statusPriority: number

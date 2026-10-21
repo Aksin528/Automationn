@@ -574,6 +574,24 @@ class AgentManagementService(BaseOrgService):
             runtime_credentials,
         )
 
+    async def resolve_catalog_id(
+        self, model_provider: str, model_name: str
+    ) -> uuid.UUID | None:
+        """Find catalog_id by model_provider + model_name when preset has no catalog_id."""
+        stmt = (
+            select(AgentCatalog.id)
+            .where(
+                AgentCatalog.model_provider == model_provider,
+                AgentCatalog.model_name == model_name,
+                sa.or_(
+                    AgentCatalog.organization_id.is_(None),
+                    AgentCatalog.organization_id == self.organization_id,
+                ),
+            )
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def get_catalog_credentials(
         self, catalog_id: uuid.UUID
     ) -> dict[str, str] | None:
@@ -1090,6 +1108,24 @@ class AgentManagementService(BaseOrgService):
 
         credentials: dict[str, str] | None = None
         workspace_credentials_checked = False
+
+        # Auto-resolve catalog_id for custom-model-provider when preset has NULL catalog_id
+        if (
+            preset_config.catalog_id is None
+            and preset_config.model_provider == "custom-model-provider"
+            and preset_config.model_name
+        ):
+            resolved_catalog_id = await self.resolve_catalog_id(
+                preset_config.model_provider, preset_config.model_name
+            )
+            if resolved_catalog_id is not None:
+                preset_config = replace(preset_config, catalog_id=resolved_catalog_id)
+            logger.info(
+                "with_preset_config: auto-resolved catalog_id for custom-model-provider",
+                model_name=preset_config.model_name,
+                resolved_catalog_id=str(resolved_catalog_id) if resolved_catalog_id else None,
+            )
+
         if catalog_id := preset_config.catalog_id:
             credentials = await self.get_catalog_credentials(catalog_id)
             logger.info(

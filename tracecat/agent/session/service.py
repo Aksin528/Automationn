@@ -1927,105 +1927,133 @@ class AgentSessionService(BaseWorkspaceService):
 
         tool_call_ids = {tr.tool_call_id for tr in tool_results}
 
-        # Find the assistant message containing these tool_uses so we only delete
-        # interrupt artifacts that follow the pending tool call.
+        # Resolve each tool_call_id to the assistant message that actually
+        # issued it. A single model turn is not guaranteed to land in one
+        # assistant message with multiple tool_use blocks -- some harness/
+        # model combinations (e.g. a custom-model-provider backend that
+        # doesn't support native parallel tool calls) emit each tool_use as
+        # its own separate assistant message even when the agent "calls them
+        # in the same turn". Requiring the whole batch to share one message
+        # silently drops every reconciliation for such models, so each
+        # tool_call_id is matched independently instead, and results are
+        # grouped by whichever message they actually came from. A model that
+        # does batch multiple tool_use blocks into one message still lands
+        # every one of its tool_call_ids on that same message, so this is a
+        # strict superset of the old single-message behavior, not a
+        # replacement for it.
         history = await self.get_session_history(session_id)
-        assistant_entry: AgentSessionHistory | None = None
-
+        id_to_entry: dict[str, AgentSessionHistory] = {}
+        remaining = set(tool_call_ids)
         for entry in reversed(history):
-            if entry.content.get("type") == "assistant":
-                tool_uses = self._extract_tool_uses_from_message(
-                    entry.content.get("message", {})
-                )
-                assistant_tool_call_ids = {
-                    tool_use_id
-                    for tool_use in tool_uses
-                    if isinstance(tool_use_id := tool_use.get("id"), str)
-                }
-                if tool_call_ids.issubset(assistant_tool_call_ids):
-                    assistant_entry = entry
-                    break
+            if not remaining:
+                break
+            if entry.content.get("type") != "assistant":
+                continue
+            tool_uses = self._extract_tool_uses_from_message(
+                entry.content.get("message", {})
+            )
+            entry_tool_call_ids = {
+                tool_use_id
+                for tool_use in tool_uses
+                if isinstance(tool_use_id := tool_use.get("id"), str)
+            }
+            matched = remaining & entry_tool_call_ids
+            for tool_call_id in matched:
+                id_to_entry[tool_call_id] = entry
+            remaining -= matched
 
-        if assistant_entry is None:
+        if remaining:
             logger.warning(
                 "Could not find assistant message with tool_use for continuation",
                 session_id=session_id,
-                tool_call_ids=tool_call_ids,
+                tool_call_ids=remaining,
             )
-            return
 
-        assistant_content = assistant_entry.content
-        assistant_uuid = assistant_content.get("uuid")
-        if not isinstance(assistant_uuid, str):
-            logger.warning(
-                "Assistant tool_use entry is missing uuid for continuation",
-                session_id=session_id,
-                tool_call_ids=tool_call_ids,
+        results_by_entry: dict[
+            int, tuple[AgentSessionHistory, list[ToolExecutionResult]]
+        ] = {}
+        for result in tool_results:
+            entry = id_to_entry.get(result.tool_call_id)
+            if entry is None:
+                continue
+            group = results_by_entry.setdefault(entry.surrogate_id, (entry, []))
+            group[1].append(result)
+
+        for assistant_entry, group_results in results_by_entry.values():
+            group_tool_call_ids = {r.tool_call_id for r in group_results}
+
+            assistant_content = assistant_entry.content
+            assistant_uuid = assistant_content.get("uuid")
+            if not isinstance(assistant_uuid, str):
+                logger.warning(
+                    "Assistant tool_use entry is missing uuid for continuation",
+                    session_id=session_id,
+                    tool_call_ids=group_tool_call_ids,
+                )
+                continue
+
+            # Delete interrupt entries that follow the assistant message
+            await self._delete_interrupt_entries_for_tool_calls(
+                session_id, assistant_entry.surrogate_id, group_tool_call_ids
             )
-            return
 
-        # Delete interrupt entries that follow the assistant message
-        await self._delete_interrupt_entries_for_tool_calls(
-            session_id, assistant_entry.surrogate_id, tool_call_ids
-        )
+            # Avoid duplicate tool_result rows if the activity is retried after
+            # the replacement has already been committed.
+            if await self._has_tool_result_entry_after(
+                session_id, assistant_entry.surrogate_id, group_tool_call_ids
+            ):
+                await self.session.commit()
+                logger.info(
+                    "Tool_result entry already exists for approval continuation",
+                    session_id=session_id,
+                    tool_call_ids=list(group_tool_call_ids),
+                )
+                continue
 
-        # Avoid duplicate tool_result rows if the activity is retried after the
-        # replacement has already been committed.
-        if await self._has_tool_result_entry_after(
-            session_id, assistant_entry.surrogate_id, tool_call_ids
-        ):
+            entry_content: dict[str, Any] = {
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": assistant_uuid,
+                "sessionId": session.sdk_session_id,
+                "type": "user",
+                "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "cwd": assistant_content.get("cwd") or "/home/agent",
+                "version": assistant_content.get("version") or "2.1.85",
+                "userType": assistant_content.get("userType") or "external",
+                "gitBranch": assistant_content.get("gitBranch") or "",
+                "entrypoint": assistant_content.get("entrypoint") or "sdk-py",
+                "isSidechain": False,
+                "permissionMode": "default",
+                "promptId": str(uuid.uuid4()),
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": result.tool_call_id,
+                            "content": self._serialize_tool_result(result.result),
+                            "is_error": result.is_error,
+                        }
+                        for result in group_results
+                    ],
+                },
+            }
+
+            self.session.add(
+                AgentSessionHistory(
+                    session_id=session_id,
+                    workspace_id=self.workspace_id,
+                    content=entry_content,
+                    kind=MessageKind.CHAT_MESSAGE.value,
+                )
+            )
             await self.session.commit()
+
             logger.info(
-                "Tool_result entry already exists for approval continuation",
+                "Replaced interrupt entries with tool_result",
                 session_id=session_id,
-                tool_call_ids=list(tool_call_ids),
+                tool_call_ids=list(group_tool_call_ids),
+                parent_uuid=assistant_uuid,
             )
-            return
-
-        entry_content: dict[str, Any] = {
-            "uuid": str(uuid.uuid4()),
-            "parentUuid": assistant_uuid,
-            "sessionId": session.sdk_session_id,
-            "type": "user",
-            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "cwd": assistant_content.get("cwd") or "/home/agent",
-            "version": assistant_content.get("version") or "2.1.85",
-            "userType": assistant_content.get("userType") or "external",
-            "gitBranch": assistant_content.get("gitBranch") or "",
-            "entrypoint": assistant_content.get("entrypoint") or "sdk-py",
-            "isSidechain": False,
-            "permissionMode": "default",
-            "promptId": str(uuid.uuid4()),
-            "message": {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": self._serialize_tool_result(result.result),
-                        "is_error": result.is_error,
-                    }
-                    for result in tool_results
-                ],
-            },
-        }
-
-        self.session.add(
-            AgentSessionHistory(
-                session_id=session_id,
-                workspace_id=self.workspace_id,
-                content=entry_content,
-                kind=MessageKind.CHAT_MESSAGE.value,
-            )
-        )
-        await self.session.commit()
-
-        logger.info(
-            "Replaced interrupt entries with tool_result",
-            session_id=session_id,
-            tool_call_ids=list(tool_call_ids),
-            parent_uuid=assistant_uuid,
-        )
 
     async def _has_tool_result_entry_after(
         self,

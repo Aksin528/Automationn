@@ -1129,6 +1129,34 @@ export type ApprovalInteraction = {
    * Condition to approve the action.
    */
   approve_if?: string | null
+  /**
+   * If true, the identity that triggered the workflow execution (the requester) may not also cast an approval vote on this interaction. Enforced server-side in the vote service, not the frontend.
+   */
+  separation_of_duties?: boolean
+}
+
+/**
+ * Lightweight approval record for polling/listing purposes.
+ *
+ * Does not resolve `approved_by` into a full user object (see
+ * `ApprovalRead` for that) -- only its email, via `approved_by_email`
+ * below, since external pollers (e.g. the Telegram sync workflow, so it
+ * can show who decided a card that wasn't decided through Telegram
+ * itself) need just enough to display who acted, not a full user object.
+ */
+export type ApprovalListItem = {
+  id: string
+  session_id: string
+  case_id?: string | null
+  tool_call_id: string
+  tool_name: string
+  status: ApprovalStatus
+  tool_call_args?: {
+    [key: string]: unknown
+  } | null
+  created_at: string
+  is_expired?: boolean
+  approved_by_email?: string | null
 }
 
 export type ApprovalMap = {
@@ -1159,6 +1187,50 @@ export type ApprovalRead = {
 }
 
 /**
+ * Event for when an approval-gated action requests approval.
+ */
+export type ApprovalRequestedEventRead = {
+  /**
+   * The execution ID of the workflow that triggered the event.
+   */
+  wf_exec_id?: string | null
+  type?: "approval_requested"
+  action_ref: string
+  required_approvers: number
+  /**
+   * The user who performed the action.
+   */
+  user_id?: string | null
+  /**
+   * The timestamp of the event.
+   */
+  created_at: string
+}
+
+/**
+ * Event for when an approval-gated action is approved or rejected.
+ */
+export type ApprovalResolvedEventRead = {
+  /**
+   * The execution ID of the workflow that triggered the event.
+   */
+  wf_exec_id?: string | null
+  type?: "approval_resolved"
+  action_ref: string
+  resolution: "approved" | "rejected"
+  /**
+   * The user who performed the action.
+   */
+  user_id?: string | null
+  /**
+   * The timestamp of the event.
+   */
+  created_at: string
+}
+
+export type resolution = "approved" | "rejected"
+
+/**
  * Possible states for a deferred tool approval.
  */
 export type ApprovalStatus = "pending" | "approved" | "rejected"
@@ -1168,6 +1240,43 @@ export type ApprovalStatus = "pending" | "approved" | "rejected"
  */
 export type ApprovalSubmission = {
   approvals: ApprovalMap
+}
+
+/**
+ * Event for when an approval-gated action's approval window expires
+ * unresolved.
+ */
+export type ApprovalTimedOutEventRead = {
+  /**
+   * The execution ID of the workflow that triggered the event.
+   */
+  wf_exec_id?: string | null
+  type?: "approval_timed_out"
+  action_ref: string
+  /**
+   * The user who performed the action.
+   */
+  user_id?: string | null
+  /**
+   * The timestamp of the event.
+   */
+  created_at: string
+}
+
+export type ApprovalVoteRequest = {
+  decision: "approve" | "reject"
+  comment?: string | null
+}
+
+export type decision = "approve" | "reject"
+
+/**
+ * Outcome of recording one vote on an approval interaction.
+ */
+export type ApprovalVoteResult = {
+  resolution: string | null
+  approve_count: number
+  required_approvers: number
 }
 
 export type Artifact =
@@ -2014,6 +2123,9 @@ export type CaseEventRead =
   | DropdownValueChangedEventRead
   | TableRowLinkedEventRead
   | TableRowUnlinkedEventRead
+  | ApprovalRequestedEventRead
+  | ApprovalResolvedEventRead
+  | ApprovalTimedOutEventRead
 
 /**
  * Case activity type values.
@@ -2049,6 +2161,9 @@ export type CaseEventType =
   | "comment_reply_created"
   | "comment_reply_updated"
   | "comment_reply_deleted"
+  | "approval_requested"
+  | "approval_resolved"
+  | "approval_timed_out"
 
 export type CaseEventsWithUsers = {
   /**
@@ -2270,6 +2385,24 @@ export type CaseStatusGroupCounts = {
   closed?: number
   unknown?: number
   other?: number
+}
+
+/**
+ * Summary of a case for inbox item context.
+ */
+export type CaseSummary = {
+  /**
+   * Case ID
+   */
+  id: string
+  /**
+   * Human-readable case ID, e.g. CASE-0123
+   */
+  short_id: string
+  /**
+   * Case summary/title
+   */
+  summary: string
 }
 
 export type CaseTableRowInsertCreate = {
@@ -4312,6 +4445,10 @@ export type InboxItemRead = {
    */
   workflow?: WorkflowSummary | null
   /**
+   * Associated case, when entity_type is 'case'
+   */
+  case?: CaseSummary | null
+  /**
    * ID of the source entity
    */
   source_id: string
@@ -4330,7 +4467,7 @@ export type InboxItemRead = {
 /**
  * Status of inbox items.
  */
-export type InboxItemStatus = "pending" | "completed" | "failed"
+export type InboxItemStatus = "pending" | "completed" | "failed" | "expired"
 
 /**
  * Types of inbox items.
@@ -4345,6 +4482,20 @@ export type InboxPendingCount = {
    * Number of pending inbox items
    */
   count: number
+}
+
+/**
+ * Pre-signed download URL for a case's rendered incident report PDF.
+ */
+export type IncidentReportDownloadResponse = {
+  /**
+   * Pre-signed download URL
+   */
+  download_url: string
+  /**
+   * Report file name
+   */
+  file_name: string
 }
 
 /**
@@ -4568,6 +4719,7 @@ export type InteractionRead = {
   actor: string | null
   action_ref: string
   action_type: string
+  current_approvals?: number | null
 }
 
 /**
@@ -9874,6 +10026,15 @@ export type GraphApplyGraphOperationsData = {
 
 export type GraphApplyGraphOperationsResponse = GraphResponse
 
+export type WorkflowExecutionsVoteOnInteractionData = {
+  executionId: string
+  interactionId: string
+  requestBody: ApprovalVoteRequest
+  workspaceId: string
+}
+
+export type WorkflowExecutionsVoteOnInteractionResponse = ApprovalVoteResult
+
 export type WorkflowExecutionsListWorkflowExecutionsData = {
   limit?: number | null
   trigger?: Array<TriggerType> | null
@@ -11162,6 +11323,15 @@ export type AgentSessionsForkSessionData = {
 
 export type AgentSessionsForkSessionResponse = AgentSessionRead
 
+export type ApprovalsListApprovalsData = {
+  caseId?: string | null
+  status?: ApprovalStatus | null
+  toolCallId?: Array<string> | null
+  workspaceId: string
+}
+
+export type ApprovalsListApprovalsResponse = Array<ApprovalListItem>
+
 export type ApprovalsSubmitApprovalsData = {
   requestBody: ApprovalSubmission
   sessionId: string
@@ -12131,12 +12301,34 @@ export type CasesCreateCommentData = {
 
 export type CasesCreateCommentResponse = unknown
 
+export type CasesListPendingApprovalsData = {
+  caseId: string
+  workspaceId: string
+}
+
+export type CasesListPendingApprovalsResponse = Array<InteractionRead>
+
 export type CasesListCommentThreadsData = {
   caseId: string
   workspaceId: string
 }
 
 export type CasesListCommentThreadsResponse = Array<CaseCommentThreadRead>
+
+export type CasesUploadIncidentReportPdfData = {
+  caseId: string
+  workspaceId: string
+}
+
+export type CasesUploadIncidentReportPdfResponse = void
+
+export type CasesDownloadIncidentReportPdfData = {
+  caseId: string
+  workspaceId: string
+}
+
+export type CasesDownloadIncidentReportPdfResponse =
+  IncidentReportDownloadResponse
 
 export type CasesUpdateCommentData = {
   caseId: string
@@ -13907,6 +14099,21 @@ export type $OpenApiTs = {
          * Successful Response
          */
         200: GraphResponse
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/workspaces/{workspace_id}/workflow-executions/{execution_id}/interactions/{interaction_id}/votes": {
+    post: {
+      req: WorkflowExecutionsVoteOnInteractionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: ApprovalVoteResult
         /**
          * Validation Error
          */
@@ -16239,6 +16446,21 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/workspaces/{workspace_id}/approvals": {
+    get: {
+      req: ApprovalsListApprovalsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<ApprovalListItem>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/workspaces/{workspace_id}/approvals/{session_id}": {
     post: {
       req: ApprovalsSubmitApprovalsData
@@ -17802,6 +18024,21 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/workspaces/{workspace_id}/cases/{case_id}/pending-approvals": {
+    get: {
+      req: CasesListPendingApprovalsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<InteractionRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/workspaces/{workspace_id}/cases/{case_id}/comments/threads": {
     get: {
       req: CasesListCommentThreadsData
@@ -17810,6 +18047,34 @@ export type $OpenApiTs = {
          * Successful Response
          */
         200: Array<CaseCommentThreadRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/workspaces/{workspace_id}/cases/{case_id}/report/pdf": {
+    post: {
+      req: CasesUploadIncidentReportPdfData
+      res: {
+        /**
+         * Successful Response
+         */
+        204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    get: {
+      req: CasesDownloadIncidentReportPdfData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: IncidentReportDownloadResponse
         /**
          * Validation Error
          */

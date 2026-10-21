@@ -32,6 +32,16 @@ model_list:
     litellm_params:
       model: openai/*
 
+  - model_name: groq/*
+    litellm_params:
+      model: groq/*
+      api_key: os.environ/GROQ_API_KEY
+
+  - model_name: llama-3.3-70b-versatile
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+
   # Catch-all: unqualified model names are routed to OpenAI's Chat Completions API.
   - model_name: "*"
     litellm_params:
@@ -39,6 +49,7 @@ model_list:
 
 general_settings:
   custom_auth: tracecat.agent.gateway.user_api_key_auth
+  master_key: sk-tracecat-internal
   database_url: null
 
 litellm_settings:
@@ -46,3 +57,4 @@ litellm_settings:
     - tracecat.agent.gateway.callback_handler
   drop_params: true
   reasoning_auto_summary: true
+  ssl_verify: false

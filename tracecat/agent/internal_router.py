@@ -79,8 +79,12 @@ async def _provider_secrets_context(
     agent_svc: AgentManagementService,
     model_provider: str,
     catalog_id: uuid.UUID | None = None,
+    model_name: str | None = None,
 ):
     """Set provider credentials in registry secrets context for this request."""
+    if catalog_id is None and model_provider == "custom-model-provider" and model_name:
+        catalog_id = await agent_svc.resolve_catalog_id(model_provider, model_name)
+
     if catalog_id is not None:
         credentials = await agent_svc.get_catalog_credentials(catalog_id)
         if not credentials:
@@ -155,7 +159,7 @@ async def run_agent_endpoint(
             await check_entitlement(session, role, Entitlement.AGENT_ADDONS)
 
         async with _provider_secrets_context(
-            agent_svc, config.model_provider, config.catalog_id
+            agent_svc, config.model_provider, config.catalog_id, config.model_name
         ):
             result: AgentOutput = await runtime_run_agent(
                 user_prompt=params.user_prompt,
@@ -201,7 +205,7 @@ async def rank_items_endpoint(
     try:
         agent_svc = AgentManagementService(session, role=role)
         async with _provider_secrets_context(
-            agent_svc, params.model_provider, params.catalog_id
+            agent_svc, params.model_provider, params.catalog_id, params.model_name
         ):
             return await ranker_rank_items(
                 items=params.items,
@@ -237,7 +241,7 @@ async def rank_items_pairwise_endpoint(
     try:
         agent_svc = AgentManagementService(session, role=role)
         async with _provider_secrets_context(
-            agent_svc, params.model_provider, params.catalog_id
+            agent_svc, params.model_provider, params.catalog_id, params.model_name
         ):
             return await ranker_rank_items_pairwise(
                 items=params.items,

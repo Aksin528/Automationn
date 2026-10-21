@@ -7,6 +7,7 @@ import {
   ChevronDown,
   KeyRound,
   LayersIcon,
+  LayoutDashboardIcon,
   ListChecksIcon,
   ListVideoIcon,
   LockIcon,
@@ -22,6 +23,7 @@ import {
 } from "lucide-react"
 import Link from "next/link"
 import { useParams, usePathname } from "next/navigation"
+import { env } from "next-runtime-env"
 import type * as React from "react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { useScopeCheck } from "@/components/auth/scope-guard"
@@ -54,6 +56,7 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { toast } from "@/components/ui/use-toast"
 import { useEntitlements } from "@/hooks/use-entitlements"
 import { usePendingApprovalsCount } from "@/hooks/use-pending-approvals-count"
 import { formatPendingApprovalCount } from "@/lib/approvals"
@@ -77,6 +80,8 @@ type NavItem = {
   badgeLabel?: string
   /** Small status pill shown after the title, e.g. "Beta". */
   tag?: string
+  /** Opens url in a new browser tab instead of Next.js routing. */
+  external?: boolean
   items?: {
     title: string
     url: string
@@ -274,6 +279,16 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     },
   ]
 
+  const navAnalytics: NavItem[] = [
+    {
+      title: "Dashboard",
+      url: env("NEXT_PUBLIC_GRAFANA_URL"),
+      icon: LayoutDashboardIcon,
+      visible: true,
+      external: true,
+    },
+  ]
+
   return (
     <Sidebar collapsible="offcanvas" variant="inset" {...props}>
       <SidebarHeader>
@@ -302,7 +317,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                         <SidebarMenuItem key={item.title}>
                           {item.items ? (
                             <SidebarMenuItem>
-                              <div className="flex w-full items-center gap-2 overflow-hidden rounded-md py-1.5 px-2 text-left text-[13px] text-zinc-700 dark:text-zinc-300">
+                              <div className="flex w-full items-center gap-2 overflow-hidden rounded-md py-1.5 px-2 text-left text-[13px] text-sidebar-foreground">
                                 <item.icon className="size-4 shrink-0" />
                                 <span className="font-medium">
                                   {item.title}
@@ -399,6 +414,51 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                               {formatPendingApprovalCount(item.badgeCount)}
                             </SidebarMenuBadge>
                           ) : null}
+                        </SidebarMenuItem>
+                      ))}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </CollapsibleContent>
+            </SidebarGroup>
+          </Collapsible>
+        )}
+        {navAnalytics.some((item) => item.visible === true) && (
+          <Collapsible defaultOpen className="group/collapsible">
+            <SidebarGroup>
+              <SidebarGroupLabel asChild>
+                <CollapsibleTrigger className="w-full">
+                  Analytics
+                  <ChevronDown className="ml-auto size-4 transition-transform group-data-[state=open]/collapsible:rotate-180" />
+                </CollapsibleTrigger>
+              </SidebarGroupLabel>
+              <CollapsibleContent>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {navAnalytics
+                      .filter((item) => item.visible === true)
+                      .map((item) => (
+                        <SidebarMenuItem key={item.title}>
+                          <SidebarMenuButton asChild>
+                            <a
+                              href={item.url ?? "#"}
+                              target={item.url ? "_blank" : undefined}
+                              rel="noopener noreferrer"
+                              onClick={(e) => {
+                                if (!item.url) {
+                                  e.preventDefault()
+                                  toast({
+                                    title: `${item.title} link not configured`,
+                                    description:
+                                      "Set NEXT_PUBLIC_GRAFANA_URL and restart the ui service.",
+                                    variant: "destructive",
+                                  })
+                                }
+                              }}
+                            >
+                              <item.icon />
+                              <span>{item.title}</span>
+                            </a>
+                          </SidebarMenuButton>
                         </SidebarMenuItem>
                       ))}
                   </SidebarMenu>

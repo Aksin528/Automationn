@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import uuid
 from collections.abc import Callable, Coroutine, Mapping
 from typing import Any, cast
 
@@ -506,6 +507,33 @@ class DSLActivities:
 
     @staticmethod
     @activity.defn
+    def resolve_action_args_activity(
+        input: EvaluateTemplatedObjectActivityInput,
+    ) -> dict[str, Any]:
+        """Resolve an action's templated args against a context, returning the
+        literal result directly (no object-storage indirection).
+
+        Used to snapshot an approval-gated action's parameters at the moment
+        the approval is requested, so the eventual execution (which may
+        happen much later, after a human decision) uses the values that were
+        actually shown to the approver rather than whatever the workflow
+        context looks like by the time it resumes. See
+        `tracecat_ee.interactions.decorators.maybe_interactive`.
+
+        Materializes any StoredObjects in operand before evaluation, same as
+        `evaluate_templated_object_activity`. Args dicts are small (unlike
+        arbitrary return values), so no object-storage round trip is needed.
+        """
+        materialized = run_sync(materialize_context(input.operand))
+        result = eval_templated_object(input.obj, operand=materialized)
+        if not isinstance(result, dict):
+            raise TracecatExpressionError(
+                f"Expected resolved action args to be a dict, got {type(result)}"
+            )
+        return result
+
+    @staticmethod
+    @activity.defn
     def handle_scatter_input_activity(
         input: ScatterActionInput,
     ) -> StoredObject:
@@ -712,6 +740,20 @@ class DSLActivities:
         evaled_args = await asyncio.to_thread(
             eval_templated_object, args, operand=materialized
         )
+        # If this workflow was triggered with a case_id (e.g. an
+        # Incident-Response-style workflow), thread it through so the
+        # resulting agent session can be linked to that case (see
+        # tracecat/dsl/workflow.py's AI_PRESET_AGENT handling). Best-effort
+        # only: any workflow without a case_id trigger, or a malformed one,
+        # is completely unaffected.
+        trigger_data = materialized.get("TRIGGER")
+        if isinstance(trigger_data, dict):
+            raw_case_id = trigger_data.get("case_id")
+            if raw_case_id and "trigger_case_id" not in evaled_args:
+                try:
+                    evaled_args["trigger_case_id"] = uuid.UUID(str(raw_case_id))
+                except (ValueError, AttributeError, TypeError):
+                    pass
         return PresetAgentActionArgs(**evaled_args)
 
     @staticmethod

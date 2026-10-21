@@ -11,6 +11,14 @@ APPROVAL_INTERRUPT_CONTENT_MARKERS = (
     "stop what you are doing and wait for the user",
     "request interrupted by user",
     "[request interrupted",
+    # Our own PreToolUse hook's deny reason (runtime.py's _pre_tool_use_hook)
+    # for a tool requiring approval -- this is a placeholder tool_result the
+    # SDK writes while the request is still pending, not the final decision,
+    # so it must be recognized here the same way as the SDK's own native
+    # interrupt phrasing above. Without this, reconciliation logic mistakes
+    # the pending-approval placeholder for the real (approved/denied) result
+    # and never replaces it.
+    "requires approval",
 )
 
 

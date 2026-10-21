@@ -1,0 +1,293 @@
+"""Cortex XDR state-changing / response-action tools for SOC MCP server.
+
+Deliberately separated from cortex_read.py so this module can be exposed as
+its own MCP integration (soc-mcp-actions) and bound only to responder-agent.
+See cortex_read.py's module docstring for why this split exists.
+"""
+
+from datetime import UTC, datetime
+
+from .cortex_common import CORTEX_API_URL, _client, _headers
+
+
+def register_cortex_action_tools(mcp):
+
+    @mcp.tool()
+    async def cortex_isolate_endpoint(endpoint_id: str, incident_id: str = "") -> dict:
+        """Isolate a Cortex XDR endpoint from the network. Requires the
+        endpoint_id (use cortex_get_endpoint_by_ip first if you only have an
+        IP). This is a real, irreversible-until-undone containment action —
+        only call this after explicit human approval.
+        """
+        url = f"{CORTEX_API_URL}/public_api/v1/endpoints/isolate"
+        request_data = {"endpoint_id": endpoint_id}
+        if incident_id:
+            request_data["incident_id"] = incident_id
+        payload = {"request_data": request_data}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "isolation_requested", "endpoint_id": endpoint_id, "response": resp.json()}
+
+    @mcp.tool()
+    async def cortex_unisolate_endpoint(endpoint_id: str) -> dict:
+        """Reverse isolation on a Cortex XDR endpoint (bring it back onto the
+        network). Use this to undo a mistaken or no-longer-needed isolation.
+        """
+        url = f"{CORTEX_API_URL}/public_api/v1/endpoints/unisolate"
+        payload = {"request_data": {"endpoint_id": endpoint_id}}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "unisolation_requested", "endpoint_id": endpoint_id, "response": resp.json()}
+
+    @mcp.tool()
+    async def cortex_scan_endpoint(endpoint_id: str) -> dict:
+        """Trigger a full AV scan on a Cortex XDR endpoint. Use
+        cortex_get_endpoint_by_ip first if you only have an IP.
+        """
+        url = f"{CORTEX_API_URL}/public_api/v1/endpoints/scan"
+        payload = {"request_data": {"filters": [
+            {"field": "endpoint_id_list", "operator": "in", "value": [endpoint_id]}
+        ]}}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "scan_requested", "endpoint_id": endpoint_id, "response": resp.json()}
+
+    @mcp.tool()
+    async def cortex_quarantine_file(endpoint_id: str, file_path: str, file_hash: str, incident_id: str = "") -> dict:
+        """Quarantine a specific file (by path + SHA256 hash) on a Cortex XDR
+        endpoint. This is a real, irreversible-until-restored containment
+        action — only call this after explicit human approval.
+        """
+        request_data: dict = {
+            "filters": [
+                {"field": "endpoint_id_list", "operator": "in", "value": [endpoint_id]}
+            ],
+            "file_path": file_path,
+            "file_hash": file_hash,
+        }
+        if incident_id:
+            request_data["incident_id"] = incident_id
+        url = f"{CORTEX_API_URL}/public_api/v1/endpoints/quarantine"
+        payload = {"request_data": request_data}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "quarantine_requested", "endpoint_id": endpoint_id, "response": resp.json()}
+
+    @mcp.tool()
+    async def cortex_update_case_status(
+        case_id: int,
+        status_progress: str,
+        resolve_reason: str = "",
+        resolve_comment: str = "",
+    ) -> dict:
+        """Update a Cortex XDR case's status (the new Cases & Issues API,
+        not the legacy Incidents API). status_progress must be one of "New",
+        "In Progress", "Resolved". resolve_reason is only used when setting
+        status to "Resolved" (e.g. "Resolved - Other", "Resolved - False
+        Positive"); resolve_comment is the free-text "Resolve comment" that
+        goes with it and is likewise only meaningful on "Resolved". Only call
+        after explicit human approval.
+        """
+        update_data: dict = {"status_progress": status_progress}
+        if resolve_reason:
+            update_data["resolve_reason"] = resolve_reason
+        if resolve_comment:
+            update_data["resolve_comment"] = resolve_comment
+        url = f"{CORTEX_API_URL}/public_api/v1/case/update/{case_id}"
+        payload = {"request_data": {"update_data": update_data}}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "update_requested", "case_id": case_id, "status_progress": status_progress}
+
+    @mcp.tool()
+    async def cortex_append_case_note(case_id: int, text: str) -> dict:
+        """Append a timestamped note to a Cortex XDR case's "notes" field.
+
+        There is no real comment/activity-log API for the new Cases & Issues
+        model — confirmed by checking case/schema for comment/activity/
+        timeline/annotation fields (none exist; only "notes" and
+        "resolve_comment", the latter settable only on resolution) and by
+        inspecting the Cortex web UI's own network calls, which use an
+        internal /api/webapp/comments/add/ endpoint authenticated by session
+        cookie, not an API key — unusable from here. So this tool reads the
+        case's current notes, appends the new text under a UTC timestamp,
+        and writes the combined string back, simulating an append-only log
+        in the one text field the public API actually exposes.
+        """
+        search_url = f"{CORTEX_API_URL}/public_api/v1/case/search"
+        search_payload = {
+            "request_data": {
+                "filters": [{"field": "case_id", "operator": "in", "value": [case_id]}]
+            }
+        }
+        async with _client() as client:
+            search_resp = await client.post(search_url, headers=_headers(), json=search_payload)
+            if search_resp.status_code >= 400:
+                return {"error": f"HTTP {search_resp.status_code}", "detail": search_resp.text}
+            cases = search_resp.json().get("reply", {}).get("DATA", [])
+            if not cases:
+                return {"error": "case_not_found", "case_id": case_id}
+            existing_notes = cases[0].get("notes") or ""
+
+            timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+            entry = f"[{timestamp}] {text}"
+            combined = f"{existing_notes}\n{entry}" if existing_notes else entry
+
+            update_url = f"{CORTEX_API_URL}/public_api/v1/case/update/{case_id}"
+            update_payload = {"request_data": {"update_data": {"notes": combined}}}
+            update_resp = await client.post(update_url, headers=_headers(), json=update_payload)
+        if update_resp.status_code >= 400:
+            return {"error": f"HTTP {update_resp.status_code}", "detail": update_resp.text}
+        return {"status": "note_appended", "case_id": case_id, "notes": combined}
+
+    @mcp.tool()
+    async def cortex_assign_case(case_id: int, assignee_mail: str = "") -> dict:
+        """Assign a Cortex XDR case to a user, identified by the e-mail they
+        use in Cortex (shown as the case's "assigned_user_mail"), or un-assign
+        the case when assignee_mail is empty. Used by the Tracecat -> Cortex
+        sync workflow to mirror an assignee change; not meant to be called
+        by an agent on its own judgement.
+
+        Cortex's case/update rejects "assigned_user_mail" as an update field
+        ("Invalid update fields"); the writable field is "assigned_user"
+        (confirmed by probing a real case), and the case's read-only
+        assigned_user_mail / assigned_user_pretty_name then follow from it.
+        """
+        url = f"{CORTEX_API_URL}/public_api/v1/case/update/{case_id}"
+        payload = {
+            "request_data": {"update_data": {"assigned_user": assignee_mail or None}}
+        }
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {
+            "status": "assign_requested" if assignee_mail else "unassign_requested",
+            "case_id": case_id,
+            "assignee_mail": assignee_mail or None,
+        }
+
+    @mcp.tool()
+    async def cortex_set_case_severity(case_id: int, severity: str) -> dict:
+        """Set a Cortex XDR case's severity to "low", "medium", "high" or
+        "critical". Used by the Tracecat -> Cortex sync workflow to mirror a
+        severity change; not meant to be called by an agent on its own
+        judgement.
+
+        The writable field is "user_severity" (the analyst's manual choice,
+        the same thing the Cortex UI severity dropdown sets); the case's
+        "severity" then follows it. Confirmed on a test case: update_data
+        {"user_severity": "critical"} returns HTTP 204, "severity" becomes
+        "critical" and modification_time is bumped. The values are the
+        lowercase words, exactly as case/search returns them.
+        """
+        severity = (severity or "").strip().lower()
+        if severity not in ("low", "medium", "high", "critical"):
+            return {"error": "invalid_severity", "severity": severity}
+        url = f"{CORTEX_API_URL}/public_api/v1/case/update/{case_id}"
+        payload = {"request_data": {"update_data": {"user_severity": severity}}}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "severity_requested", "case_id": case_id, "severity": severity}
+
+    @mcp.tool()
+    async def cortex_list_modified_cases(since_ms: int, limit: int = 50) -> dict:
+        """List Cortex XDR cases modified at or after since_ms (epoch
+        milliseconds), oldest modification first, trimmed to the fields the
+        Cortex -> Tracecat sync workflow compares (status, assignee, notes,
+        resolution). Read-only; it lives here, next to cortex_assign_case /
+        cortex_append_case_note, because the sync workflow already talks to
+        this MCP server without auth headers. Not meant for agents.
+
+        "modification_time" is the field that works for both the filter and
+        the sort on case/search (verified against this tenant: the schema
+        calls it "Last Updated"; "last_update_time" is rejected as a sort
+        field). The API returns no total_count, so callers use len(cases).
+        """
+        limit = max(1, min(int(limit), 100))
+        url = f"{CORTEX_API_URL}/public_api/v1/case/search"
+        payload = {
+            "request_data": {
+                "filters": [
+                    {"field": "modification_time", "operator": "gte", "value": int(since_ms)}
+                ],
+                "search_from": 0,
+                "search_to": limit,
+                "sort": {"field": "modification_time", "keyword": "asc"},
+            }
+        }
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        rows = resp.json().get("reply", {}).get("DATA", []) or []
+        keep = (
+            "case_id", "modification_time", "status_progress", "assigned_user_mail",
+            "notes", "resolve_reason", "resolve_comment", "severity", "user_severity",
+        )
+        cases = [{k: r.get(k) for k in keep} for r in rows]
+        return {"count": len(cases), "cases": cases}
+
+    @mcp.tool()
+    async def cortex_blocklist_hash(file_hash: str, comment: str = "") -> dict:
+        """Add a SHA256 file hash to the Cortex XDR global blocklist, so it's
+        blocked from executing across all endpoints. This is a tenant-wide
+        prevention policy change — only call after explicit human approval.
+
+        There is no way to undo this via API -- Cortex's public API has no
+        endpoint to remove a hash from the blocklist (confirmed: only the
+        add endpoints exist; removal is only exposed through Cortex's own
+        web console, via an internal session-cookie-authenticated route we
+        cannot call). If this needs to be reversed, it must be done manually
+        in the Cortex console (Endpoints > Policy Management > Exceptions
+        Configuration).
+        """
+        url = f"{CORTEX_API_URL}/public_api/v1/hash_exceptions/blocklist"
+        request_data: dict = {"hash_list": [file_hash]}
+        if comment:
+            request_data["comment"] = comment
+        payload = {"request_data": request_data}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "blocklist_requested", "hash": file_hash, "response": resp.json()}
+
+    @mcp.tool()
+    async def cortex_allowlist_hash(file_hash: str, comment: str = "") -> dict:
+        """Add a SHA256 file hash to the Cortex XDR global allowlist, so it's
+        exempt from prevention across all endpoints. This is a tenant-wide
+        policy change — only call after explicit human approval.
+
+        Cortex rejects adding a hash that's already present in the OTHER
+        list (confirmed on this tenant: "All hashes have already been added
+        to the allow or block list"). There is no API way to remove a hash
+        from the blocklist first -- Cortex's public API only exposes add
+        endpoints for hash exceptions, not removal (removal is web-console-
+        only, via an internal session-cookie-authenticated route we cannot
+        call). So a hash already on the blocklist can only be moved to the
+        allowlist by removing it manually in the Cortex console first
+        (Endpoints > Policy Management > Exceptions Configuration).
+        """
+        url = f"{CORTEX_API_URL}/public_api/v1/hash_exceptions/allowlist"
+        request_data: dict = {"hash_list": [file_hash]}
+        if comment:
+            request_data["comment"] = comment
+        payload = {"request_data": request_data}
+        async with _client() as client:
+            resp = await client.post(url, headers=_headers(), json=payload)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return {"status": "allowlist_requested", "hash": file_hash, "response": resp.json()}

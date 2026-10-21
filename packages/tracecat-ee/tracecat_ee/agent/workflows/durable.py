@@ -12,14 +12,17 @@ from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from pydantic_ai.messages import ToolCallPart
-    from pydantic_ai.tools import ToolApproved, ToolDenied
+    from pydantic_ai.tools import DeferredToolApprovalResult, ToolApproved, ToolDenied
 
     from tracecat import config
     from tracecat.agent.common.stream_types import HarnessType
     from tracecat.agent.common.types import (
+        MCPHttpServerConfig,
+        MCPServerConfig,
         MCPToolDefinition,
         SandboxAgentConfig,
         SandboxSubagentConfig,
+        is_http_mcp_server,
     )
     from tracecat.agent.executor.activity import (
         AgentExecutorInput,
@@ -36,7 +39,11 @@ with workflow.unsafe.imports_passed_through():
         build_tracecat_mcp_role,
     )
     from tracecat.agent.mcp.metadata import strip_proxy_tool_metadata
-    from tracecat.agent.mcp.utils import normalize_mcp_tool_name
+    from tracecat.agent.mcp.utils import (
+        LEGACY_REGISTRY_MCP_SERVER_NAME,
+        REGISTRY_MCP_SERVER_NAME,
+        normalize_mcp_tool_name,
+    )
     from tracecat.agent.parsers import try_parse_json
     from tracecat.agent.preset.activities import (
         ResolveAgentPresetConfigActivityInput,
@@ -75,7 +82,10 @@ with workflow.unsafe.imports_passed_through():
     from tracecat.chat.schemas import ChatMessage
     from tracecat.contexts import ctx_role
     from tracecat.dsl.common import RETRY_POLICIES
-    from tracecat.executor.activities import ExecutorActivities
+    from tracecat.executor.activities import (
+        ExecuteMCPToolActivityInput,
+        ExecutorActivities,
+    )
     from tracecat.logger import logger
     from tracecat.registry.lock.types import RegistryLock
     from tracecat.workflow.executions.correlation import (
@@ -143,6 +153,60 @@ def _build_approved_tool_run_input(
         execution_id=execution_id,
         logical_time=logical_time,
     )
+
+
+def _parse_user_mcp_tool_call(tool_name: str) -> tuple[str, str] | None:
+    """Split a persisted ``mcp.<server>.<tool>`` name into its parts.
+
+    Approval tool names are persisted in dot form (e.g.
+    ``mcp.soc-mcp-actions.cortex_scan_endpoint``), not the SDK's
+    ``mcp__<server>__<tool>`` form. Note that ``normalize_mcp_tool_name`` is
+    NOT the inverse of this -- it's a display helper that discards the
+    server name entirely (returning just ``cortex_scan_endpoint``), which is
+    exactly why routing an approved MCP tool through it loses the
+    information needed to actually resolve and execute the call.
+
+    Returns None for anything that isn't a genuine user MCP server tool
+    call. That excludes two cases, both left to the registry_lock path
+    (via normalize_mcp_tool_name, unchanged from before this function
+    existed):
+    - Plain core registry actions like ``core.cases.create_comment``,
+      which never carry the ``mcp.`` prefix at all.
+    - Core registry actions routed through the internal
+      ``tracecat-registry``/``tracecat_registry`` MCP proxy (e.g.
+      ``mcp.tracecat-registry.core.http_request``) -- that reserved
+      server name is Tracecat's own registry exposed as MCP, not a
+      user-configured external server, so it has no entry in
+      mcp_servers/mcp_server_by_name and must not be routed through
+      execute_mcp_tool_activity.
+    """
+    if not tool_name.startswith("mcp."):
+        return None
+    parts = tool_name.split(".", 2)
+    if len(parts) != 3:
+        return None
+    _, server_name, bare_tool_name = parts
+    if server_name in (REGISTRY_MCP_SERVER_NAME, LEGACY_REGISTRY_MCP_SERVER_NAME):
+        return None
+    return server_name, bare_tool_name
+
+
+def _approved_args_from_decision(
+    decision: bool | DeferredToolApprovalResult | None,
+    original_args: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the final tool args if `decision` is an approval, else None.
+
+    None covers both "denied" and "no decision yet" -- callers that need to
+    tell those apart should check get_decision(...) is None separately.
+    Mirrors the approved/denied split in
+    DurableAgentWorkflow._build_tool_lists_from_approvals.
+    """
+    if decision is True:
+        return original_args
+    if isinstance(decision, ToolApproved):
+        return {**original_args, **(decision.override_args or {})}
+    return None
 
 
 def _llm_route_for_config(
@@ -344,6 +408,18 @@ class DurableAgentWorkflow:
         self.approvals = ApprovalManager(role=self.role)
         self.max_requests = args.agent_args.max_requests
         self.max_tool_calls = args.agent_args.max_tool_calls
+        # Populated just before each approvals.prepare() call (see
+        # _run_with_agent_executor) so the set_approvals update handler --
+        # which runs independently of that method's local scope -- can look
+        # up the current turn's MCP server configs to eagerly execute a
+        # newly-approved containment tool immediately, without waiting for
+        # sibling approvals in the same batch to be decided too.
+        self._current_mcp_servers: list[MCPServerConfig] | None = None
+        # tool_call_id -> result for MCP tools already executed eagerly by
+        # _eagerly_execute_newly_approved_mcp_tools. Consumed (and cleared)
+        # by _execute_and_reconcile_approved_tools so a tool is never
+        # actually executed twice.
+        self._early_tool_results: dict[str, PendingToolResult] = {}
 
     def _upsert_tracecat_search_attributes(self) -> None:
         """Ensure direct agent runs have core Tracecat search attributes.
@@ -705,18 +781,38 @@ class DurableAgentWorkflow:
             )
 
     @workflow.update
-    def set_approvals(self, submission: WorkflowApprovalSubmission) -> None:
+    async def set_approvals(self, submission: WorkflowApprovalSubmission) -> None:
         submission = WorkflowApprovalSubmission.model_validate(submission)
         logger.info(
             "Setting approvals",
             approvals=submission.approvals,
             approved_by=submission.approved_by,
         )
+        # Snapshot which of these tool_call_ids had no decision yet, before
+        # merging this submission in -- these (and only these) are what
+        # just became newly approved/denied by this call. This check and
+        # the merge below run with no await between them, so a concurrent
+        # set_approvals call for the same tool_call_id can never see it as
+        # "newly decided" twice.
+        newly_decided_ids = [
+            tool_call_id
+            for tool_call_id in submission.approvals
+            if self.approvals.get_decision(tool_call_id) is None
+        ]
         self.approvals.set(
             submission.approvals,
             approved_by=submission.approved_by,
             decision_metadata=submission.decision_metadata,
         )
+        # Persist each newly-decided tool_call_id's own approval row right
+        # away, instead of waiting for every sibling in the batch to also
+        # be decided -- otherwise a reviewer's UI (Telegram, the case
+        # panel, the Inbox) keeps showing this decision as pending until
+        # the whole batch resolves, even though the decision itself was
+        # already made.
+        for tool_call_id in newly_decided_ids:
+            await self.approvals.apply_single_decision(tool_call_id)
+        await self._eagerly_execute_newly_approved_mcp_tools(newly_decided_ids)
 
     @set_approvals.validator
     def validate_set_approvals(self, submission: WorkflowApprovalSubmission) -> None:
@@ -892,6 +988,12 @@ class DurableAgentWorkflow:
 
             if result.approval_requested:
                 logger.info("Agent waiting for approval", session_id=self.session_id)
+                # Let set_approvals (which runs independently of this
+                # method's local scope) eagerly execute a newly-approved MCP
+                # tool the moment its own decision arrives, using this
+                # turn's MCP server configs.
+                self._current_mcp_servers = cfg.mcp_servers
+                self._early_tool_results.clear()
                 # Convert ToolCallContent to ToolCallPart for ApprovalManager
                 if result.approval_items:
                     tool_call_parts = [
@@ -928,6 +1030,7 @@ class DurableAgentWorkflow:
                         approved_tools=approved_tools,
                         denied_tools=denied_tools,
                         registry_lock=root_registry_lock,
+                        mcp_servers=cfg.mcp_servers,
                     )
                     logger.info(
                         "Tool execution completed",
@@ -1101,12 +1204,149 @@ class DurableAgentWorkflow:
 
         return approved, denied
 
+    async def _execute_mcp_tool_call(
+        self,
+        *,
+        tool_call: ApprovedToolCall,
+        bare_tool_name: str,
+        mcp_server_config: MCPHttpServerConfig,
+        service_role: Role,
+    ) -> PendingToolResult:
+        """Call one approved MCP tool and wrap the outcome as a
+        PendingToolResult.
+
+        Shared by the normal (full-batch) execution path in
+        _execute_and_reconcile_approved_tools and by eager, per-decision
+        execution in _eagerly_execute_newly_approved_mcp_tools.
+        """
+        try:
+            mcp_result = await workflow.execute_activity(
+                ExecutorActivities.execute_mcp_tool_activity,
+                args=[
+                    ExecuteMCPToolActivityInput(
+                        mcp_server_config=mcp_server_config,
+                        tool_name=bare_tool_name,
+                        args=strip_proxy_tool_metadata(tool_call.args),
+                    ),
+                    service_role,
+                ],
+                task_queue=config.TRACECAT__EXECUTOR_QUEUE,
+                start_to_close_timeout=timedelta(
+                    seconds=int(config.TRACECAT__EXECUTOR_CLIENT_TIMEOUT)
+                ),
+                heartbeat_timeout=timedelta(
+                    seconds=config.TRACECAT__ACTIVITY_HEARTBEAT_TIMEOUT
+                )
+                if config.TRACECAT__ACTIVITY_HEARTBEAT_TIMEOUT > 0
+                else None,
+                retry_policy=RETRY_POLICIES["activity:fail_fast"],
+                priority=AGENT_TOOL_PRIORITY,
+            )
+            return PendingToolResult(
+                tool_call_id=tool_call.tool_call_id,
+                tool_name=tool_call.tool_name,
+                tool_input=tool_call.args,
+                raw_result=mcp_result,
+            )
+        except ActivityError as e:
+            return PendingToolResult(
+                tool_call_id=tool_call.tool_call_id,
+                tool_name=tool_call.tool_name,
+                tool_input=tool_call.args,
+                raw_result=f"Tool execution failed: {_activity_error_message(e)}",
+                is_error=True,
+            )
+
+    async def _eagerly_execute_newly_approved_mcp_tools(
+        self, tool_call_ids: list[str]
+    ) -> None:
+        """Execute newly-approved MCP containment tools immediately.
+
+        A reviewer approving one proposed action (e.g. a scan) should not
+        have the real Cortex/Trellix/PMG call wait on a sibling action
+        (e.g. an isolate) they haven't decided on yet. This runs the real
+        call the moment a decision arrives -- independent of
+        ApprovalManager.is_ready(), which still only turns True once every
+        expected tool_call_id in the batch has a decision. Only that
+        full-batch readiness resumes the agent's own turn (see
+        _execute_and_reconcile_approved_tools), since Claude can only
+        produce a coherent next step once it can see the outcome of every
+        action it proposed, not just some of them -- but the underlying
+        action itself doesn't need to wait for that.
+
+        Results are stashed in self._early_tool_results and consumed (not
+        recomputed) by _execute_and_reconcile_approved_tools once the batch
+        is fully decided, so a tool is never actually executed twice.
+        Core registry actions are intentionally left out of this early
+        path -- they still execute only at full-batch reconcile time, same
+        as before.
+        """
+        if not tool_call_ids:
+            return
+        mcp_server_by_name: dict[str, MCPHttpServerConfig] = {
+            server["name"]: server
+            for server in (self._current_mcp_servers or [])
+            if is_http_mcp_server(server)
+        }
+        service_role = build_tracecat_mcp_role(
+            workspace_id=self.role.workspace_id,
+            organization_id=self.role.organization_id,
+            user_id=self.role.user_id,
+        )
+        for tool_call_id in tool_call_ids:
+            expected = self.approvals.get_expected_tool_call(tool_call_id)
+            if expected is None:
+                continue
+            approved_args = _approved_args_from_decision(
+                self.approvals.get_decision(tool_call_id), expected.args_as_dict()
+            )
+            if approved_args is None:
+                # Denied, or a decision shape this helper doesn't recognize
+                # -- handled normally at full-batch reconcile time.
+                continue
+            parsed_mcp = _parse_user_mcp_tool_call(expected.tool_name)
+            if parsed_mcp is None:
+                # Core registry action -- executes at reconcile time.
+                continue
+            server_name, bare_tool_name = parsed_mcp
+            tool_call = ApprovedToolCall(
+                tool_call_id=tool_call_id,
+                tool_name=expected.tool_name,
+                args=approved_args,
+            )
+            mcp_server_config = mcp_server_by_name.get(server_name)
+            if mcp_server_config is None:
+                self._early_tool_results[tool_call_id] = PendingToolResult(
+                    tool_call_id=tool_call_id,
+                    tool_name=expected.tool_name,
+                    tool_input=approved_args,
+                    raw_result=(
+                        "Tool execution failed: no configured MCP "
+                        f"server named '{server_name}' for this agent."
+                    ),
+                    is_error=True,
+                )
+                continue
+            logger.info(
+                "Eagerly executing newly-approved MCP tool",
+                session_id=self.session_id,
+                tool_call_id=tool_call_id,
+                mcp_server=server_name,
+            )
+            self._early_tool_results[tool_call_id] = await self._execute_mcp_tool_call(
+                tool_call=tool_call,
+                bare_tool_name=bare_tool_name,
+                mcp_server_config=mcp_server_config,
+                service_role=service_role,
+            )
+
     async def _execute_and_reconcile_approved_tools(
         self,
         *,
         approved_tools: list[ApprovedToolCall],
         denied_tools: list[DeniedToolCall],
         registry_lock: RegistryLock,
+        mcp_servers: list[MCPServerConfig] | None,
     ) -> list:
         logical_time = workflow.now()
         service_role = build_tracecat_mcp_role(
@@ -1115,7 +1355,55 @@ class DurableAgentWorkflow:
             user_id=self.role.user_id,
         )
         pending_results: list[PendingToolResult] = []
+        # Approval-gated MCP tools (mcp.<server>.<tool>, e.g. every
+        # soc-mcp-actions containment action) are never bound in
+        # registry_lock -- they're discovered live from a user-configured
+        # MCP server, not synced into the static core registry. Route those
+        # through execute_mcp_tool_activity instead of execute_action_activity;
+        # core registry actions keep using the unchanged registry_lock path
+        # below.
+        mcp_server_by_name: dict[str, MCPHttpServerConfig] = {
+            server["name"]: server
+            for server in (mcp_servers or [])
+            if is_http_mcp_server(server)
+        }
         for tool_call in approved_tools:
+            # Already run by _eagerly_execute_newly_approved_mcp_tools the
+            # moment this specific tool was approved -- reuse that result
+            # instead of calling the real MCP server a second time.
+            early_result = self._early_tool_results.pop(tool_call.tool_call_id, None)
+            if early_result is not None:
+                pending_results.append(early_result)
+                continue
+
+            parsed_mcp = _parse_user_mcp_tool_call(tool_call.tool_name)
+            if parsed_mcp is not None:
+                server_name, bare_tool_name = parsed_mcp
+                mcp_server_config = mcp_server_by_name.get(server_name)
+                if mcp_server_config is None:
+                    pending_results.append(
+                        PendingToolResult(
+                            tool_call_id=tool_call.tool_call_id,
+                            tool_name=tool_call.tool_name,
+                            tool_input=tool_call.args,
+                            raw_result=(
+                                "Tool execution failed: no configured MCP "
+                                f"server named '{server_name}' for this agent."
+                            ),
+                            is_error=True,
+                        )
+                    )
+                    continue
+                pending_results.append(
+                    await self._execute_mcp_tool_call(
+                        tool_call=tool_call,
+                        bare_tool_name=bare_tool_name,
+                        mcp_server_config=mcp_server_config,
+                        service_role=service_role,
+                    )
+                )
+                continue
+
             try:
                 stored = await workflow.execute_activity(
                     ExecutorActivities.execute_action_activity,
@@ -1166,7 +1454,19 @@ class DurableAgentWorkflow:
                 PendingToolResult(
                     tool_call_id=denied_tool.tool_call_id,
                     tool_name=denied_tool.tool_name,
-                    raw_result=f"Tool denied by user: {denied_tool.reason}",
+                    # Explicit and directive on purpose: a plain "Tool denied
+                    # by user" gives the model no signal not to retry, and in
+                    # practice models do retry the identical call. Spelling
+                    # out "don't call this again" here, in the tool_result
+                    # itself, is far more reliable than relying on system
+                    # instructions the model may not weigh as strongly.
+                    raw_result=(
+                        f"REJECTED by human reviewer: {denied_tool.reason}. "
+                        "Do not call this exact tool with the same arguments "
+                        "again in this session -- if other planned actions "
+                        "remain, proceed with those instead; otherwise stop "
+                        "and summarize what was rejected."
+                    ),
                     is_error=True,
                 )
             )

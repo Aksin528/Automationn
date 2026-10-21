@@ -42,6 +42,7 @@ _private_key.pem
 
 # Sensitive files
 *.pem
+!certs/dgk_ca.pem
 *.key
 *.crt
 *.env

@@ -55,6 +55,11 @@ export const RESOURCE_CATEGORIES: Record<
     description: "AI agent configuration and execution",
     resources: ["agent"],
   },
+  inbox: {
+    label: "Inbox",
+    description: "Pending agent approvals and inbox items",
+    resources: ["inbox"],
+  },
   secrets: {
     label: "Secrets",
     description: "Credential and secret management",

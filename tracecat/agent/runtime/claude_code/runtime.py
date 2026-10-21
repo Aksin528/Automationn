@@ -236,6 +236,17 @@ CUSTOM_MODEL_PROVIDER_AUTO_COMPACT_WINDOW = "128000"
 # (e.g. structured-output schema validation). Without a cap the CLI can death-loop
 # when the model keeps emitting output that fails validation.
 MAX_STOP_HOOK_RETRIES = 3
+# When a model turn contains multiple tool_use blocks and more than one
+# requires approval, the SDK dispatches a PreToolUse hook per tool call as
+# an independent async task. Interrupting the client immediately after the
+# FIRST approval-required tool is handled races ahead of the still-pending
+# hook callbacks for any sibling tool calls in the same turn, so those
+# never get a chance to stream/persist their own approval request. Instead
+# of interrupting inline, we debounce: each approval request (re)starts a
+# short timer, and the client is only interrupted once that timer elapses
+# with no new approval arriving - i.e. once every tool_use block in the
+# turn has had its hook evaluated.
+APPROVAL_INTERRUPT_DEBOUNCE_SECONDS = 0.3
 
 
 class ClaudeAgentRuntime:
@@ -274,6 +285,7 @@ class ClaudeAgentRuntime:
         self._pending_approval_tool_ids: set[str] = set()
         self.client: ClaudeSDKClient | None = None
         self._was_interrupted: bool = False
+        self._interrupt_debounce_task: asyncio.Task[None] | None = None
         # For incremental JSONL line tracking
         self._sdk_session_id: str | None = None
         self._last_seen_byte_offset: int = 0
@@ -290,6 +302,18 @@ class ClaudeAgentRuntime:
         self._system_prompt_fragments = tuple(system_prompt_fragments)
         # Tracks Stop hook retries within this run to break structured-output loops
         self._stop_hook_retries: int = 0
+        # This turn's configured output_type, if any (set in _build_options).
+        # Read by _stop_hook to decide whether a StructuredOutput call is
+        # mandatory before the turn is allowed to end.
+        self._output_type: str | dict[str, Any] | None = None
+        # True once this turn's StructuredOutput tool call has succeeded
+        # (set by _post_tool_use_hook). A fresh runtime instance is created
+        # per turn, so this doesn't need a separate reset between turns.
+        self._structured_output_received: bool = False
+        # Separate retry counter for the check above, so it doesn't share
+        # a budget with the CLI's own schema-validation retry loop that
+        # _stop_hook_retries already tracks.
+        self._structured_output_retries: int = 0
 
     @staticmethod
     def _is_manual_compaction_prompt(prompt: str) -> bool:
@@ -848,10 +872,13 @@ class ClaudeAgentRuntime:
         tool_input: dict[str, Any],
         tool_use_id: str,
     ) -> None:
-        """Handle an approval request by streaming and interrupting.
+        """Handle an approval request by streaming it and scheduling an interrupt.
 
-        Streams APPROVAL_REQUEST event via socket and interrupts the client.
-        The orchestrator handles persistence and coordination.
+        Streams APPROVAL_REQUEST event via socket. The orchestrator handles
+        persistence and coordination. The client interrupt is debounced (see
+        `_schedule_interrupt`) rather than fired inline, so that sibling
+        tool_use blocks in the same model turn get a chance to also stream
+        their own approval request before the session is paused.
         """
         self._pending_approval_tool_ids.add(tool_use_id)
 
@@ -866,9 +893,35 @@ class ClaudeAgentRuntime:
         )
         await self._event_writer.send_stream_event(approval_event)
 
-        logger.info("Approval request streamed, interrupting", tool_name=tool_name)
+        logger.info(
+            "Approval request streamed, scheduling interrupt", tool_name=tool_name
+        )
+
+        self._schedule_interrupt()
+
+    def _schedule_interrupt(self) -> None:
+        """(Re)start the debounced client interrupt.
+
+        Called once per approval-required tool call. Each call cancels any
+        previously scheduled interrupt and restarts the debounce window, so
+        the client is only actually interrupted after
+        `APPROVAL_INTERRUPT_DEBOUNCE_SECONDS` pass with no new approval
+        request arriving - i.e. once every tool_use block in the current
+        turn has been evaluated by the PreToolUse hook, not just the first.
+        """
+        if self._interrupt_debounce_task is not None:
+            self._interrupt_debounce_task.cancel()
+        self._interrupt_debounce_task = asyncio.create_task(self._debounced_interrupt())
+
+    async def _debounced_interrupt(self) -> None:
+        try:
+            await asyncio.sleep(APPROVAL_INTERRUPT_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            # Superseded by a newer approval request in the same turn.
+            return
 
         if self.client is not None:
+            logger.info("Debounce window elapsed, interrupting client")
             self._was_interrupted = True
             await self.client.interrupt()
 
@@ -969,18 +1022,54 @@ class ClaudeAgentRuntime:
         tool_use_id: str | None,
         context: HookContext,
     ) -> SyncHookJSONOutput:
-        """Stop hook: cap structured-output retry loops.
+        """Stop hook: require StructuredOutput, then cap retry loops.
 
-        The CLI runs this on every natural stop. When ``stop_hook_active`` is True
-        the CLI is already inside a retry loop (e.g. structured-output schema
-        validation failed and it wants the model to try again). We let the first
-        ``MAX_STOP_HOOK_RETRIES`` retries through, then terminate the turn so a
-        broken schema or stuck model can't death-loop.
+        The CLI runs this on every natural stop. Two separate jobs happen here:
+
+        1. If this agent has an output_type configured and the turn is
+           trying to end without a successful StructuredOutput call, block
+           the stop ourselves and tell the model to call it. This does not
+           rely on ``stop_hook_active`` (the CLI's own signal that it's
+           already retrying for a schema-validation failure) because that
+           signal doesn't reliably fire for every case that needs a retry --
+           empirically, a turn that already made other tool calls before
+           trying to finish with a plain-text answer instead of a real
+           StructuredOutput call is not always caught by the CLI on its own.
+        2. When ``stop_hook_active`` is True, the CLI is already inside its
+           own retry loop (e.g. structured-output schema validation failed
+           and it wants the model to try again). We let the first
+           ``MAX_STOP_HOOK_RETRIES`` retries through, then terminate the turn
+           so a broken schema or stuck model can't death-loop.
         """
         if input_data["hook_event_name"] != "Stop":
             raise ValueError(
                 f"Expected Stop hook event, got {input_data['hook_event_name']!r}"
             )
+
+        if self._output_type is not None and not self._structured_output_received:
+            self._structured_output_retries += 1
+            if self._structured_output_retries <= MAX_STOP_HOOK_RETRIES:
+                return {
+                    "decision": "block",
+                    "reason": (
+                        "You must call the StructuredOutput tool with your "
+                        "final answer before finishing -- do not just "
+                        "describe it in text or a code block. Call the tool "
+                        "now."
+                    ),
+                }
+            # Cap reached without ever getting a real tool call. Let it stop
+            # rather than loop forever; downstream normalization scripts
+            # already fall back to parsing JSON out of plain text for this
+            # exact case.
+            await self._event_writer.send_log(
+                "warning",
+                "Stop hook retry cap reached without a StructuredOutput call",
+                retries=self._structured_output_retries,
+                cap=MAX_STOP_HOOK_RETRIES,
+            )
+            return {}
+
         if not input_data.get("stop_hook_active"):
             return {}
 
@@ -1000,6 +1089,40 @@ class ClaudeAgentRuntime:
         )
         return {"continue_": False, "stopReason": reason}
 
+    async def _post_tool_use_hook(
+        self,
+        input_data: HookInput,
+        tool_use_id: str | None,  # noqa: ARG002
+        context: HookContext,  # noqa: ARG002
+    ) -> SyncHookJSONOutput:
+        """PostToolUse hook: end the turn as soon as StructuredOutput succeeds.
+
+        The system prompt already tells the model to stop right after this
+        call, but that's advisory -- some models don't reliably honor it and
+        keep going anyway: a redundant second (or third...) StructuredOutput
+        call, or a trailing text turn that just re-types the same JSON as
+        prose. This hook makes that stop mandatory instead of advisory: the
+        moment StructuredOutput succeeds (this hook only fires on success --
+        failures go to PostToolUseFailure instead), the turn ends here, in
+        code, before the model gets a chance to do either. Every other tool
+        call is untouched.
+        """
+        if input_data["hook_event_name"] != "PostToolUse":
+            raise ValueError(
+                f"Expected PostToolUse hook event, got {input_data['hook_event_name']!r}"
+            )
+        tool_name = input_data.get("tool_name", "")
+        if tool_name.lower() != "structuredoutput":
+            return {}
+
+        # Read by _stop_hook: a genuine StructuredOutput success happened
+        # this turn, so it shouldn't force a retry looking for one.
+        self._structured_output_received = True
+        return {
+            "continue_": False,
+            "stopReason": "Structured output already provided; ending turn.",
+        }
+
     def _build_system_prompt(
         self, instructions: str | None, output_type: str | dict[str, Any] | None = None
     ) -> str:
@@ -1014,7 +1137,9 @@ class ClaudeAgentRuntime:
             base += (
                 "\n\nYou MUST produce structured output as the very last thing in EVERY turn"
                 " — including follow-up turns. Do not add any commentary, explanation, or text"
-                " after the structured output. This applies to every response, not just the first one."
+                " after the structured output, whether in the same turn or in a new turn"
+                " afterward. Once your structured output tool call succeeds, you are finished"
+                " — do not send any further response of any kind, in this or any subsequent turn."
             )
 
         prompt_parts = [base]
@@ -1175,6 +1300,9 @@ class ClaudeAgentRuntime:
         stderr: Callable[[str], None],
     ) -> ClaudeAgentOptions:
         """Build Claude SDK options from runtime policy and payload config."""
+        # Stashed for _stop_hook, which needs to know whether this turn
+        # requires a StructuredOutput call before it's allowed to end.
+        self._output_type = payload.config.output_type
         system_prompt = self._build_system_prompt(
             payload.config.instructions,
             payload.config.output_type,
@@ -1213,6 +1341,7 @@ class ClaudeAgentRuntime:
             sandbox=self._sandbox_settings(),
             hooks={
                 "PreToolUse": [HookMatcher(hooks=[self._pre_tool_use_hook])],
+                "PostToolUse": [HookMatcher(hooks=[self._post_tool_use_hook])],
                 "Stop": [HookMatcher(hooks=[self._stop_hook])],
             },
             cwd=self._cwd,

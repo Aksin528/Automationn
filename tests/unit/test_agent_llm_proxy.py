@@ -694,6 +694,180 @@ async def test_forward_request_strips_anthropic_only_fields_for_non_anthropic_up
 
 
 @pytest.mark.anyio
+async def test_custom_model_provider_forces_thinking_disabled_when_not_enabled(
+    tmp_path: Path,
+) -> None:
+    """The CLI always emits thinking={"type": "adaptive"} for this route, so
+    when the route's own agent config has thinking disabled, the proxy must
+    override it with both the Ollama-style "thinking" field and vLLM's own
+    "chat_template_kwargs" field (vLLM ignores the former -- see the real
+    vLLM 0.29 /v1/messages evidence in llm_proxy.py's comment)."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        assert payload["thinking"] == {"type": "disabled"}
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"ok": True},
+        )
+
+    socket_proxy = LLMSocketProxy(
+        socket_path=tmp_path / "llm.sock",
+        routing_plan=_routing_plan(
+            direct_routes={
+                "qwen-direct": LLMRoute(
+                    base_url="https://qwen.example",
+                    model_provider="custom-model-provider",
+                    enable_thinking=False,
+                )
+            }
+        ),
+    )
+    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    writer = _FakeWriter()
+
+    try:
+        await socket_proxy._forward_request(
+            {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"Content-Type": "application/json"},
+                "body": orjson.dumps(
+                    {
+                        "model": "qwen-direct",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "thinking": {"type": "adaptive"},
+                    }
+                ),
+            },
+            cast(asyncio.StreamWriter, writer),
+        )
+    finally:
+        if socket_proxy._client is not None:
+            await socket_proxy._client.aclose()
+
+    response_text = writer.buffer.decode("utf-8")
+    assert response_text.startswith("HTTP/1.1 200 OK")
+
+
+@pytest.mark.anyio
+async def test_custom_model_provider_leaves_thinking_untouched_when_enabled(
+    tmp_path: Path,
+) -> None:
+    """When the route's own agent config has thinking enabled, the CLI's own
+    "adaptive" request must pass through unchanged -- no forced "disabled"
+    override and no "chat_template_kwargs" injected."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert "chat_template_kwargs" not in payload
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"ok": True},
+        )
+
+    socket_proxy = LLMSocketProxy(
+        socket_path=tmp_path / "llm.sock",
+        routing_plan=_routing_plan(
+            direct_routes={
+                "qwen-direct": LLMRoute(
+                    base_url="https://qwen.example",
+                    model_provider="custom-model-provider",
+                    enable_thinking=True,
+                )
+            }
+        ),
+    )
+    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    writer = _FakeWriter()
+
+    try:
+        await socket_proxy._forward_request(
+            {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"Content-Type": "application/json"},
+                "body": orjson.dumps(
+                    {
+                        "model": "qwen-direct",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "thinking": {"type": "adaptive"},
+                    }
+                ),
+            },
+            cast(asyncio.StreamWriter, writer),
+        )
+    finally:
+        if socket_proxy._client is not None:
+            await socket_proxy._client.aclose()
+
+    response_text = writer.buffer.decode("utf-8")
+    assert response_text.startswith("HTTP/1.1 200 OK")
+
+
+@pytest.mark.anyio
+async def test_custom_model_provider_disables_thinking_when_cli_sends_no_thinking_field(
+    tmp_path: Path,
+) -> None:
+    """On a direct (passthrough) route the CLI sends no "thinking" field at all
+    (confirmed via live logging against a real passthrough route). The
+    "chat_template_kwargs" override must still apply in that case -- it cannot
+    be gated on the "thinking" field's presence, since vLLM needs it regardless
+    of whether the CLI sent an Anthropic-shaped "thinking" field."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        assert "thinking" not in payload
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"ok": True},
+        )
+
+    socket_proxy = LLMSocketProxy(
+        socket_path=tmp_path / "llm.sock",
+        routing_plan=_routing_plan(
+            direct_routes={
+                "qwen-direct": LLMRoute(
+                    base_url="https://qwen.example",
+                    model_provider="custom-model-provider",
+                    enable_thinking=False,
+                )
+            }
+        ),
+    )
+    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    writer = _FakeWriter()
+
+    try:
+        await socket_proxy._forward_request(
+            {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"Content-Type": "application/json"},
+                "body": orjson.dumps(
+                    {
+                        "model": "qwen-direct",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                ),
+            },
+            cast(asyncio.StreamWriter, writer),
+        )
+    finally:
+        if socket_proxy._client is not None:
+            await socket_proxy._client.aclose()
+
+    response_text = writer.buffer.decode("utf-8")
+    assert response_text.startswith("HTTP/1.1 200 OK")
+
+
+@pytest.mark.anyio
 async def test_managed_route_can_defer_provider_cleanup_to_gateway(
     tmp_path: Path,
 ) -> None:

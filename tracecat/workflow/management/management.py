@@ -1168,6 +1168,10 @@ class WorkflowsManagementService(BaseWorkspaceService):
                 title=act_stmt.title,
                 description=act_stmt.description,
                 control_flow=control_flow.model_dump(),
+                is_interactive=act_stmt.interaction is not None,
+                interaction=act_stmt.interaction.model_dump()
+                if act_stmt.interaction
+                else None,
                 position_x=pos[0] if pos else 0.0,
                 position_y=pos[1] if pos else 0.0,
             )

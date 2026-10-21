@@ -6,6 +6,7 @@ import { yaml } from "@codemirror/lang-yaml"
 import type { Extension } from "@codemirror/state"
 import { EditorView } from "@codemirror/view"
 import ReactCodeMirror from "@uiw/react-codemirror"
+import { useTheme } from "next-themes"
 
 import { cn } from "@/lib/utils"
 
@@ -40,6 +41,7 @@ export function CodeEditor({
   wrapLongLines = false,
   className,
 }: CodeEditorProps) {
+  const { resolvedTheme } = useTheme()
   const languageExtension = getLanguageExtension(language)
   const extensions = [
     ...(languageExtension ? [languageExtension] : []),
@@ -52,6 +54,7 @@ export function CodeEditor({
       onChange={onChange}
       extensions={extensions}
       readOnly={readOnly}
+      theme={resolvedTheme === "dark" ? "dark" : "light"}
       className={cn(
         // Ensure the editor and all its tooltips/autocomplete popups are fully rounded and do not stick out
         "max-w-full min-w-0 rounded-md text-xs focus-visible:outline-none",

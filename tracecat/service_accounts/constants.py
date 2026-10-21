@@ -9,6 +9,7 @@ WORKSPACE_SERVICE_ACCOUNT_ASSIGNABLE_SCOPES: frozenset[str] = frozenset(
         "agent:update",
         "agent:delete",
         "agent:execute",
+        "inbox:read",
         "case:read",
         "case:create",
         "case:update",
