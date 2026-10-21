@@ -419,6 +419,7 @@ class CaseDropdownValuesService(BaseWorkspaceService):
         case: Case,
         definition_id: uuid.UUID,
         params: CaseDropdownValueSet,
+        record_agent_interaction: bool = True,
     ) -> CaseDropdownValueRead:
         case_id = case.id
         # Resolve old value
@@ -481,7 +482,9 @@ class CaseDropdownValuesService(BaseWorkspaceService):
         run_ctx = ctx_run.get()
         wf_exec_id = run_ctx.wf_exec_id if run_ctx else None
 
-        from tracecat.cases.schemas import DropdownValueChangedEvent
+        from tracecat.cases.event_schemas import (
+            DropdownValueChangedEvent,
+        )
         from tracecat.cases.service import CaseEventsService
 
         event = DropdownValueChangedEvent(
@@ -495,7 +498,11 @@ class CaseDropdownValuesService(BaseWorkspaceService):
             wf_exec_id=wf_exec_id,
         )
         events_service = CaseEventsService(session=self.session, role=self.role)
-        await events_service.create_event(case=case, event=event)
+        await events_service.create_event(
+            case=case,
+            event=event,
+            record_agent_interaction=record_agent_interaction,
+        )
 
         return CaseDropdownValueRead(
             id=row.id,
@@ -570,13 +577,18 @@ class CaseDropdownValuesService(BaseWorkspaceService):
     @requires_entitlement(Entitlement.CASE_ADDONS)
     async def apply_values(
         self,
-        case_id: uuid.UUID,
+        case: Case | uuid.UUID,
         values: Sequence[CaseDropdownValueInput],
         *,
         commit: bool = True,
+        record_agent_interaction: bool = True,
     ) -> list[CaseDropdownValueRead]:
         """Apply multiple dropdown selections to a case in a single transaction."""
-        case = await self._get_case(case_id)
+        if isinstance(case, uuid.UUID):
+            case = await self._get_case(case)
+        elif case.workspace_id != self.workspace_id:
+            # Preserve the same tenant scoping _get_case enforces for UUIDs.
+            raise TracecatNotFoundError(f"Case {case.id} not found")
         seen_definition_ids: set[uuid.UUID] = set()
         results: list[CaseDropdownValueRead] = []
 
@@ -601,6 +613,7 @@ class CaseDropdownValuesService(BaseWorkspaceService):
                 case=case,
                 definition_id=definition_id,
                 params=CaseDropdownValueSet(option_id=option_id),
+                record_agent_interaction=record_agent_interaction,
             )
             results.append(result)
 

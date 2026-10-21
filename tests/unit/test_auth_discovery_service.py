@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,8 +13,9 @@ from tracecat import config
 from tracecat.auth import discovery as auth_discovery_module
 from tracecat.auth.discovery import AuthDiscoveryMethod, AuthDiscoveryService
 from tracecat.auth.enums import AuthType
-from tracecat.db.models import Organization, OrganizationDomain
+from tracecat.db.models import Invitation, Organization, OrganizationDomain
 from tracecat.exceptions import TracecatValidationError
+from tracecat.invitations.enums import InvitationStatus
 from tracecat.organization.domains import normalize_domain
 
 pytestmark = pytest.mark.usefixtures("db")
@@ -62,14 +64,23 @@ async def test_discovery_prefers_saml_for_mapped_domains(
         "TRACECAT__AUTH_TYPES",
         {AuthType.BASIC, AuthType.OIDC, AuthType.SAML},
     )
+    setting_reader = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        auth_discovery_module, "get_setting", AsyncMock(return_value=True)
+        auth_discovery_module,
+        "get_setting_from_bypass_session",
+        setting_reader,
     )
     service = AuthDiscoveryService(session)
 
     response = await service.discover("user@acme.com")
 
     assert response.method == AuthDiscoveryMethod.SAML
+    setting_reader.assert_awaited_once_with(
+        "saml_enabled",
+        organization_id=organization.id,
+        session=session,
+        default=True,
+    )
 
 
 @pytest.mark.anyio
@@ -144,7 +155,9 @@ async def test_discovery_prefers_default_org_saml_for_unknown_domains_in_single_
         {AuthType.BASIC, AuthType.OIDC, AuthType.SAML},
     )
     monkeypatch.setattr(
-        auth_discovery_module, "get_setting", AsyncMock(return_value=True)
+        auth_discovery_module,
+        "get_setting_from_bypass_session",
+        AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
         auth_discovery_module,
@@ -170,7 +183,9 @@ async def test_discovery_unknown_domains_fallback_to_oidc_in_multi_tenant_with_s
         {AuthType.BASIC, AuthType.OIDC, AuthType.SAML},
     )
     monkeypatch.setattr(
-        auth_discovery_module, "get_setting", AsyncMock(return_value=True)
+        auth_discovery_module,
+        "get_setting_from_bypass_session",
+        AsyncMock(return_value=True),
     )
     service = AuthDiscoveryService(session)
 
@@ -204,7 +219,9 @@ async def test_discovery_prefers_org_hint_over_email_domain(
         {AuthType.BASIC, AuthType.OIDC, AuthType.SAML},
     )
     monkeypatch.setattr(
-        auth_discovery_module, "get_setting", AsyncMock(return_value=True)
+        auth_discovery_module,
+        "get_setting_from_bypass_session",
+        AsyncMock(return_value=True),
     )
     service = AuthDiscoveryService(session)
 
@@ -236,3 +253,36 @@ async def test_discovery_rejects_invalid_org_hint_without_fallback(
         await service.discover("user@acme.com", org_slug="does-not-exist")
 
     assert str(exc.value) == "Invalid organization"
+
+
+@pytest.mark.anyio
+async def test_discovery_ignores_invitations_once_saml_is_enabled(
+    session: AsyncSession,
+    organization: Organization,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing depends on org settings only, so it cannot reveal who is invited."""
+    monkeypatch.setattr(config, "TRACECAT__AUTH_TYPES", {AuthType.BASIC, AuthType.SAML})
+    monkeypatch.setattr(
+        auth_discovery_module,
+        "get_setting_from_bypass_session",
+        AsyncMock(return_value=True),
+    )
+    await _create_domain(session, organization.id, "invite-saml.com")
+    session.add(
+        Invitation(
+            id=uuid.uuid4(),
+            organization_id=organization.id,
+            email="invited@invite-saml.com",
+            token=uuid.uuid4().hex,
+            expires_at=datetime.now(UTC) + timedelta(days=7),
+            status=InvitationStatus.PENDING,
+        )
+    )
+    await session.commit()
+    service = AuthDiscoveryService(session)
+
+    invited = await service.discover("invited@invite-saml.com")
+    stranger = await service.discover("stranger@invite-saml.com")
+
+    assert invited.method == stranger.method == AuthDiscoveryMethod.SAML

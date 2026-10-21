@@ -20,22 +20,21 @@ from tracecat.auth.dependencies import WorkspaceActorRouteRole
 from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
-from tracecat.feature_flags import is_feature_enabled
-from tracecat.feature_flags.enums import FeatureFlag
+from tracecat.tiers.entitlements import check_entitlement
+from tracecat.tiers.enums import Entitlement
 
 
-def _require_agent_channels_enabled() -> None:
-    if not is_feature_enabled(FeatureFlag.AGENT_CHANNELS):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Feature not enabled",
-        )
+async def _require_agent_channels_entitlement(
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+) -> None:
+    await check_entitlement(session, role, Entitlement.AGENT_CHANNELS)
 
 
 router = APIRouter(
     prefix="/agent/channels/tokens",
     tags=["agent-channels"],
-    dependencies=[Depends(_require_agent_channels_enabled)],
+    dependencies=[Depends(_require_agent_channels_entitlement)],
 )
 
 
@@ -104,6 +103,11 @@ async def update_channel_token(
         )
     try:
         updated = await service.update_token(token, params)
+    except TracecatNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
     except TracecatValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -181,8 +185,8 @@ async def start_slack_oauth(
                 ),
             )
 
-    if token is None:
-        try:
+    try:
+        if token is None:
             token = await service.create_token(
                 AgentChannelTokenCreate(
                     agent_preset_id=params.agent_preset_id,
@@ -196,34 +200,34 @@ async def start_slack_oauth(
                     is_active=False,
                 )
             )
-        except TracecatNotFoundError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=str(exc),
-            ) from exc
-        except TracecatValidationError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=str(exc),
-            ) from exc
-    else:
-        existing_config = service.parse_stored_channel_config(
-            channel_type=ChannelType(token.channel_type),
-            config_payload=token.config,
-        )
-        updated = await service.update_token(
-            token,
-            AgentChannelTokenUpdate(
-                config=SlackChannelTokenConfig(
-                    slack_bot_token=existing_config.slack_bot_token,
-                    slack_client_id=params.client_id,
-                    slack_client_secret=params.client_secret,
-                    slack_signing_secret=params.signing_secret,
+        else:
+            existing_config = service.parse_stored_channel_config(
+                channel_type=ChannelType(token.channel_type),
+                config_payload=token.config,
+            )
+            updated = await service.update_token(
+                token,
+                AgentChannelTokenUpdate(
+                    config=SlackChannelTokenConfig(
+                        slack_bot_token=existing_config.slack_bot_token,
+                        slack_client_id=params.client_id,
+                        slack_client_secret=params.client_secret,
+                        slack_signing_secret=params.signing_secret,
+                    ),
+                    is_active=False,
                 ),
-                is_active=False,
-            ),
-        )
-        token = updated
+            )
+            token = updated
+    except TracecatNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except TracecatValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
     state = service.create_slack_oauth_state(
         token_id=token.id,

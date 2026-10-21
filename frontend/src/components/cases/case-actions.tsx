@@ -1,6 +1,5 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
 import { Copy, ExternalLink, TagsIcon, Trash2 } from "lucide-react"
 import Link from "next/link"
 import type { CaseReadMinimal } from "@/client"
@@ -16,7 +15,9 @@ import {
   DropdownMenuSubTrigger,
 } from "@/components/ui/dropdown-menu"
 import { toast } from "@/components/ui/use-toast"
+import { caseHref } from "@/lib/cases/urls"
 import { useCaseTagCatalog } from "@/lib/hooks"
+import { useQueryClient } from "@/lib/query"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 export function CaseActions({
@@ -80,7 +81,7 @@ export function CaseActions({
         asChild
       >
         <Link
-          href={`/workspaces/${workspaceId}/cases/${item.id}`}
+          href={caseHref(workspaceId, item.id)}
           target="_blank"
           rel="noopener noreferrer"
         >

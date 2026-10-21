@@ -13,6 +13,7 @@ from tracecat.integrations.schemas import (
     MCPConnectionOption,
     MCPConnectionSpec,
     MCPConnectionTarget,
+    MCPCredentialValueType,
     PlatformMCPCatalogStatus,
 )
 
@@ -55,6 +56,9 @@ class RawCredential(BaseModel):
     description: str | None = None
     required: bool = True
     secret: bool = True
+    default_value: str | None = None
+    placeholder: str | None = None
+    type: MCPCredentialValueType = "string"
     target: MCPConnectionTarget
 
 
@@ -83,8 +87,10 @@ class RawHttpConnectionSpec(BaseModel):
     server_uri: str | None = None
     credentials: list[RawCredential] | None = None
     scopes: list[str] | None = None
+    oauth_resource: str | None = None
     oauth_authorization_endpoint: str | None = None
     oauth_token_endpoint: str | None = None
+    oauth_authorize_params: dict[str, str] | None = None
 
 
 class RawStdioConnectionSpec(BaseModel):

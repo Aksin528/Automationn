@@ -9,8 +9,7 @@ from typing import Annotated
 
 from typing_extensions import Doc
 
-from tracecat_registry import registry, types
-from tracecat_registry.context import get_context
+from tracecat_registry import ctx, registry, types
 
 
 @registry.register(
@@ -23,7 +22,7 @@ from tracecat_registry.context import get_context
 async def get_case_metrics(
     case_ids: Annotated[
         list[str],
-        Doc("List of case IDs to get case metrics for."),
+        Doc("List of case IDs or short IDs (e.g. CASE-0042) to get case metrics for."),
     ],
 ) -> list[types.CaseDurationMetric]:
     """Get case metrics as OTEL-aligned time-series for the provided case IDs.
@@ -41,4 +40,4 @@ async def get_case_metrics(
     if not case_ids:
         return []
 
-    return await get_context().cases.get_case_metrics(case_ids)
+    return await ctx.cases.aio.get_case_metrics(case_ids)

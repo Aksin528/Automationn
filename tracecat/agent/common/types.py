@@ -6,12 +6,37 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, TypeGuard
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_core import ArgsKwargs
 
 from tracecat.agent.subagents import AgentSubagentsConfig
+from tracecat.integrations.schemas import MCPToolStatus
 
 if TYPE_CHECKING:
     from tracecat.agent.types import AgentConfig
+
+
+def read_reasoning_effort_as_enable_thinking(data: Any) -> Any:
+    """Replace a ``reasoning_effort`` key from newer app versions with ``enable_thinking``.
+
+    For ``mode="before"`` validators on configs that cross Temporal boundaries,
+    so this version can run payloads that a newer worker wrote. ``"off"`` maps to
+    ``False``; any other level, or null, maps to ``True``. An explicit
+    ``enable_thinking`` key takes precedence. Pydantic dataclass constructors
+    pass ``ArgsKwargs``, whose keyword arguments are mapped the same way.
+    """
+    if isinstance(data, ArgsKwargs):
+        if data.kwargs is None:
+            return data
+        return ArgsKwargs(
+            data.args, read_reasoning_effort_as_enable_thinking(data.kwargs)
+        )
+    if not isinstance(data, dict) or "reasoning_effort" not in data:
+        return data
+    data = dict(data)
+    reasoning_effort = data.pop("reasoning_effort")
+    data.setdefault("enable_thinking", reasoning_effort != "off")
+    return data
 
 
 class MCPHttpServerConfig(TypedDict):
@@ -58,6 +83,20 @@ class MCPHttpServerConfig(TypedDict):
     resolved from. Set when produced by ``AgentPresetService`` resolvers so
     callers can re-resolve secrets per use without re-listing integrations."""
 
+    tools: NotRequired[list[MCPServerToolSummary]]
+    """Optional explicit tool subset. Absence preserves the existing
+    whole-integration behavior."""
+
+
+class MCPServerToolSummary(TypedDict):
+    """Non-secret summary of a verified user MCP tool."""
+
+    name: str
+    description: NotRequired[str | None]
+    enabled: NotRequired[bool]
+    requires_approval: NotRequired[bool]
+    status: NotRequired[MCPToolStatus]
+
 
 class MCPStdioServerConfig(TypedDict):
     """Configuration for a stdio MCP server."""
@@ -74,6 +113,11 @@ class MCPStdioServerConfig(TypedDict):
     """Optional: UUID of the source ``mcp_integrations`` row this config was
     resolved from. See :class:`MCPHttpServerConfig.id`."""
 
+    tools: NotRequired[list[MCPServerToolSummary]]
+    """Optional, non-secret tool summaries from the latest successful
+    verification. Used by runtimes that cannot rediscover stdio tools cheaply
+    before the server process is available."""
+
 
 MCPServerConfig = MCPHttpServerConfig | MCPStdioServerConfig
 
@@ -81,6 +125,26 @@ MCPServerConfig = MCPHttpServerConfig | MCPStdioServerConfig
 def is_stdio_mcp_server(config: MCPServerConfig) -> TypeGuard[MCPStdioServerConfig]:
     """Narrow a generic ``MCPServerConfig`` to its stdio variant."""
     return config.get("type") == "stdio"
+
+
+def has_stdio_mcp_server(mcp_servers: list[MCPServerConfig] | None) -> bool:
+    """Return whether a config contains a stdio MCP server."""
+    return any(is_stdio_mcp_server(server) for server in mcp_servers or ())
+
+
+def requires_sandbox_internet_access(
+    *,
+    config: SandboxAgentConfig,
+    subagents: list[SandboxSubagentConfig],
+) -> bool:
+    """Return the effective sandbox network requirement for a runtime turn."""
+    if config.enable_internet_access or has_stdio_mcp_server(config.mcp_servers):
+        return True
+    return any(
+        subagent.config.enable_internet_access
+        or has_stdio_mcp_server(subagent.config.mcp_servers)
+        for subagent in subagents
+    )
 
 
 def is_http_mcp_server(config: MCPServerConfig) -> TypeGuard[MCPHttpServerConfig]:
@@ -170,6 +234,14 @@ class SandboxAgentConfig(BaseModel):
     """Whether to enable extended thinking for the Claude Code CLI."""
     enable_internet_access: bool = False
     """Whether to enable internet access tools (WebSearch, WebFetch)."""
+    library_skills: list[str] | None = None
+    """Library skill slugs; the executor stages them before sandbox start."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def read_reasoning_effort(cls, data: Any) -> Any:
+        """Accept activity inputs that a newer worker scheduled."""
+        return read_reasoning_effort_as_enable_thinking(data)
 
     @classmethod
     def from_agent_config(cls, config: AgentConfig) -> SandboxAgentConfig:
@@ -193,6 +265,7 @@ class SandboxAgentConfig(BaseModel):
             output_type=config.output_type,
             enable_thinking=config.enable_thinking,
             enable_internet_access=config.enable_internet_access,
+            library_skills=config.library_skills,
         )
 
 

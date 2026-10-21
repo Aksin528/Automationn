@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry import RegistrySecret
 
 from tests.shared import TEST_WF_ID, generate_test_exec_id
+from tests.support.executor_backend import TestBackend
 from tracecat import config
 from tracecat.auth.types import Role
 from tracecat.db.models import RegistryRepository, RegistryVersion
@@ -29,11 +30,9 @@ from tracecat.dsl.schemas import (
 )
 from tracecat.exceptions import (
     ExecutionError,
-    RegistryValidationError,
     TracecatValidationError,
 )
 from tracecat.executor import service
-from tracecat.executor.backends.test import TestBackend
 from tracecat.expressions.expectations import ExpectedField
 from tracecat.registry.actions.bound import BoundRegistryAction
 from tracecat.registry.actions.schemas import (
@@ -693,9 +692,11 @@ async def test_template_action_runs(
 
     if should_raise:
         # Production path wraps RegistryValidationError in ExecutionError
+        # without chaining it: the pydantic original echoes the rejected value.
         with pytest.raises(ExecutionError) as exc_info:
             await run_action_test(input=input, role=test_role)
-        assert isinstance(exc_info.value.__cause__, RegistryValidationError)
+        assert exc_info.value.info.type == "RegistryValidationError"
+        assert exc_info.value.__cause__ is None
     else:
         result = await run_action_test(input=input, role=test_role)
         assert result == expected
@@ -813,9 +814,11 @@ async def test_template_action_with_enums(
 
     if should_raise:
         # Production path wraps RegistryValidationError in ExecutionError
+        # without chaining it: the pydantic original echoes the rejected value.
         with pytest.raises(ExecutionError) as exc_info:
             await run_action_test(input=input, role=test_role)
-        assert isinstance(exc_info.value.__cause__, RegistryValidationError)
+        assert exc_info.value.info.type == "RegistryValidationError"
+        assert exc_info.value.__cause__ is None
     else:
         result = await run_action_test(input=input, role=test_role)
         assert result == expected

@@ -18,6 +18,8 @@ from tracecat.agent.folders.schemas import (
     AgentPresetDirectoryItem,
     DirectoryItem,
 )
+from tracecat.agent.preset.schemas import build_agent_preset_tool_summary
+from tracecat.agent.preset.service import AgentPresetService
 from tracecat.authz.controls import require_scope
 from tracecat.db.models import AgentFolder, AgentPreset
 from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
@@ -303,6 +305,7 @@ class AgentFolderService(BaseWorkspaceService):
         statement = select(AgentPreset).where(
             AgentPreset.workspace_id == self.workspace_id,
             AgentPreset.id == preset_id,
+            AgentPreset.deleted_at.is_(None),
         )
         result = await self.session.execute(statement)
         preset = result.scalar_one_or_none()
@@ -482,6 +485,7 @@ class AgentFolderService(BaseWorkspaceService):
             .where(
                 AgentPreset.workspace_id == self.workspace_id,
                 AgentPreset.folder_id == folder_id,
+                AgentPreset.deleted_at.is_(None),
             )
             .order_by(
                 AgentPreset.created_at.desc()
@@ -544,6 +548,7 @@ class AgentFolderService(BaseWorkspaceService):
                 .where(
                     AgentPreset.workspace_id == self.workspace_id,
                     AgentPreset.folder_id.in_(folder_ids),
+                    AgentPreset.deleted_at.is_(None),
                 )
                 .group_by(AgentPreset.folder_id)
             )
@@ -587,6 +592,9 @@ class AgentFolderService(BaseWorkspaceService):
                 updated_at=f.updated_at,
             )
 
+        policies = await AgentPresetService(
+            self.session, role=self.role
+        ).resolve_tool_policies(presets)
         for preset in presets:
             items_by_id[preset.id] = AgentPresetDirectoryItem(
                 type="preset",
@@ -594,9 +602,11 @@ class AgentFolderService(BaseWorkspaceService):
                 name=preset.name,
                 slug=preset.slug,
                 description=preset.description,
+                use_in_chat=preset.use_in_chat,
                 model_provider=preset.model_provider,
                 model_name=preset.model_name,
                 folder_id=preset.folder_id,
+                tool_summary=build_agent_preset_tool_summary(policies[preset.id]),
                 tags=[
                     TagRead.model_validate(tag, from_attributes=True)
                     for tag in preset.tags
@@ -675,5 +685,6 @@ class AgentFolderService(BaseWorkspaceService):
         exists_clause = sa.exists().where(
             AgentPreset.workspace_id == self.workspace_id,
             AgentPreset.folder_id == folder_id,
+            AgentPreset.deleted_at.is_(None),
         )
         return bool(await self.session.scalar(select(exists_clause)))

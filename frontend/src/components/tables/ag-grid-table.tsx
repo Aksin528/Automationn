@@ -6,116 +6,77 @@ import type {
   CellValueChangedEvent,
   ColDef,
   ColumnResizedEvent,
+  GetRowIdParams,
   GridApi,
   GridReadyEvent,
+  RowSelectionOptions,
   SelectionChangedEvent,
-  SuppressKeyboardEventParams,
-  ValueFormatterParams,
+  SelectionColumnDef,
 } from "ag-grid-community"
 import { AgGridReact } from "ag-grid-react"
-import { useCallback, useEffect, useMemo, useState } from "react"
-import type { TableColumnRead, TableRead, TableRowRead } from "@/client"
-import { AgGridCellEditor } from "@/components/tables/ag-grid-cell-editor"
-import { AgGridCellRenderer } from "@/components/tables/ag-grid-cell-renderer"
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react"
+import type { TableRead, TableRowRead } from "@/client"
 import { handleGridKeyDown } from "@/components/tables/ag-grid-clipboard"
+import {
+  buildEditableColumnDef,
+  isSearchableColumn,
+} from "@/components/tables/ag-grid-column-defs"
 import { AgGridColumnHeader } from "@/components/tables/ag-grid-column-header"
 import { AgGridContextMenu } from "@/components/tables/ag-grid-context-menu"
 import { AgGridPagination } from "@/components/tables/ag-grid-pagination"
 import { tracecatTheme } from "@/components/tables/ag-grid-theme"
-import { CellDisplay } from "@/components/tables/cell-display"
+import {
+  type TableRowQuery,
+  TableRowQueryContext,
+} from "@/components/tables/table-row-query-context"
+import { TableRowSearchBar } from "@/components/tables/table-row-search-bar"
 import { useTableSelection } from "@/components/tables/table-selection-context"
 import { useTablesPagination } from "@/hooks/pagination/use-tables-pagination"
 import { useLocalStorage } from "@/hooks/use-local-storage"
+import {
+  toRowSearchParams,
+  useRowSearch,
+  useStaleRowQueryReset,
+} from "@/hooks/use-row-search"
 import { useUpdateRow } from "@/lib/hooks"
+import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
-const TEXT_TYPES = new Set(["TEXT", "VARCHAR", "CHAR", "CITEXT", "BPCHAR"])
-const JSON_TYPES = new Set(["JSON", "JSONB"])
-const NUMERIC_TYPES = new Set([
-  "INT",
-  "INTEGER",
-  "BIGINT",
-  "SMALLINT",
-  "DECIMAL",
-  "NUMERIC",
-  "REAL",
-  "FLOAT",
-  "FLOAT8",
-  "FLOAT4",
-  "DOUBLE",
-  "DOUBLE PRECISION",
-  "BIGSERIAL",
-  "SERIAL",
-  "SERIAL4",
-  "SERIAL8",
-])
-const DATE_TYPES = new Set(["DATE", "TIMESTAMPTZ", "TIME", "TIMETZ"])
-const BOOLEAN_TYPES = new Set(["BOOL", "BOOLEAN"])
-function normalizeSqlType(rawType?: string) {
-  if (!rawType) return ""
-  const [base] = rawType.toUpperCase().split("(")
-  return base.trim()
+// Stable references: the grid re-applies any option whose identity changes,
+// and this component renders on every keystroke of the search.
+const EMPTY_ROWS: TableRowRead[] = []
+
+const MULTI_ROW_SELECTION: RowSelectionOptions = {
+  mode: "multiRow",
+  enableClickSelection: false,
+  headerCheckbox: true,
+  checkboxes: true,
+}
+
+const SELECTION_COLUMN_DEF: SelectionColumnDef = {
+  cellClass: "ag-selection-col-aligned",
+  headerClass: "ag-selection-col-aligned",
+}
+
+function getRowId(params: GetRowIdParams<TableRowRead>): string {
+  return params.data.id
 }
 
 /**
- * Suppress Enter, Tab, and Escape during editing so the cell editor
- * handles commit/cancel exclusively, preventing AG Grid from calling
- * getValue() before the editor has called onChange with the parsed value.
+ * Editable grid for a table's rows on the tables route, under a search row.
+ * Search and sort are both run by the API across the whole table.
  */
-function suppressEditorKeys(params: SuppressKeyboardEventParams): boolean {
-  if (!params.editing) return false
-  const key = params.event.key
-  return key === "Enter" || key === "Tab" || key === "Escape"
-}
-
-function numericValueFormatter(params: ValueFormatterParams): string {
-  const value = params.value
-  if (value === null || value === undefined) return ""
-  if (typeof value !== "number") return String(value)
-  if (!Number.isFinite(value)) return String(value)
-  if (Number.isInteger(value)) return String(value)
-  return parseFloat(value.toFixed(4)).toString()
-}
-
-function getColumnWidthPx(rawType?: string): number {
-  const normalizedType = normalizeSqlType(rawType)
-  if (JSON_TYPES.has(normalizedType)) return 480
-  if (TEXT_TYPES.has(normalizedType)) return 384
-  if (DATE_TYPES.has(normalizedType)) return 288
-  if (BOOLEAN_TYPES.has(normalizedType)) return 160
-  if (NUMERIC_TYPES.has(normalizedType)) return 224
-  return 288
-}
-
-function ReadOnlyCellRenderer({
-  value,
-  tableColumn,
-}: {
-  value: unknown
-  tableColumn: TableColumnRead
-}) {
-  return (
-    <div className="flex h-full w-full items-center overflow-hidden">
-      <div className="min-w-0 flex-1 overflow-hidden">
-        <CellDisplay value={value} column={tableColumn} />
-      </div>
-    </div>
-  )
-}
-
 export function AgGridTable({
   table: { id, name, columns },
-  rowsOverride,
-  readOnly = false,
-  hidePagination = false,
 }: {
   table: TableRead
-  rowsOverride?: TableRowRead[]
-  readOnly?: boolean
-  hidePagination?: boolean
 }) {
-  const isReadOnly = readOnly || rowsOverride !== undefined
-  const useAutoHeight = rowsOverride !== undefined
   const workspaceId = useWorkspaceId()
   const [pageSize, setPageSize] = useState(20)
   const [gridApi, setGridApi] = useState<GridApi | null>(null)
@@ -126,10 +87,26 @@ export function AgGridTable({
     {}
   )
 
+  const searchableColumns = useMemo(
+    () => columns.filter(isSearchableColumn),
+    [columns]
+  )
+  const { search, setSearch, debouncedSearch, clearSearch } = useRowSearch()
+  // Until one is picked, or once the picked one is gone, search the first.
+  function resolveSearchColumn(name: string | null): string | null {
+    const picked = searchableColumns.find((column) => column.name === name)
+    return (picked ?? searchableColumns[0])?.name ?? null
+  }
+  const { searchTerm, searchColumn } = toRowSearchParams({
+    term: debouncedSearch.term,
+    column: resolveSearchColumn(debouncedSearch.column),
+  })
+
   const {
     data: rows,
-    isLoading: rowsIsLoading,
-    error: rowsError,
+    isLoading,
+    isPlaceholderData,
+    error,
     goToNextPage,
     goToPreviousPage,
     goToFirstPage,
@@ -139,39 +116,71 @@ export function AgGridTable({
     totalEstimate,
     startItem,
     endItem,
+    sortingState,
+    setSorting,
   } = useTablesPagination({
     tableId: id,
     workspaceId,
     limit: pageSize,
-    enabled: rowsOverride === undefined,
+    searchTerm,
+    searchColumn,
   })
-  const rowData = rowsOverride ?? rows ?? []
-  const isLoading = rowsOverride === undefined ? rowsIsLoading : false
-  const error = rowsOverride === undefined ? rowsError : null
+  const rowData = rows.length > 0 ? rows : EMPTY_ROWS
+  const isSearching = searchTerm !== null
+  // The API's total counts the whole table, so it is wrong during a search.
+  const totalRows = isSearching ? undefined : totalEstimate
+
+  const rowQuery = useMemo<TableRowQuery>(
+    () => ({ sort: sortingState, onSortChange: setSorting }),
+    [sortingState, setSorting]
+  )
+  const resetRowQuery = useCallback(() => {
+    setSorting("", false)
+    clearSearch()
+  }, [setSorting, clearSearch])
+  const isStaleRowQuery = useStaleRowQueryReset({
+    error,
+    isActive: isSearching || sortingState.orderBy !== null,
+    reset: resetRowQuery,
+  })
+  // Deleting or renaming the sorted column removes the only header that could
+  // clear its sort, and no request fails to trigger the reset above.
+  const sortedColumn = sortingState.orderBy
+  useEffect(() => {
+    if (
+      sortedColumn !== null &&
+      !columns.some((column) => column.name === sortedColumn)
+    ) {
+      setSorting("", false)
+    }
+  }, [columns, sortedColumn, setSorting])
+  // With no searchable column left the input is disabled, so a typed term
+  // could not be cleared and would later apply to a newly added column.
+  const hasSearchableColumn = searchableColumns.length > 0
+  const hasSearchTerm = search.term !== ""
+  useEffect(() => {
+    if (!hasSearchableColumn && hasSearchTerm) {
+      clearSearch()
+    }
+  }, [hasSearchableColumn, hasSearchTerm, clearSearch])
 
   useEffect(() => {
-    if (id && rowsOverride === undefined) {
+    if (id) {
       document.title = `Tables | ${name}`
     }
-  }, [id, name, rowsOverride])
+  }, [id, name])
 
   const handlePageSizeChange = useCallback(
     (newPageSize: number) => {
-      if (rowsOverride !== undefined) {
-        return
-      }
       setPageSize(newPageSize)
       goToFirstPage()
     },
-    [goToFirstPage, rowsOverride]
+    [goToFirstPage]
   )
 
   const handleGridReady = useCallback(
     (event: GridReadyEvent) => {
       setGridApi(event.api)
-      if (isReadOnly) {
-        return
-      }
       updateSelection({
         gridApi: event.api,
         tableId: id,
@@ -180,14 +189,11 @@ export function AgGridTable({
         selectedRowIds: [],
       })
     },
-    [updateSelection, id, columns, isReadOnly]
+    [updateSelection, id, columns]
   )
 
   // Keep selection context in sync when table id or columns change after grid init
   useEffect(() => {
-    if (isReadOnly) {
-      return
-    }
     if (gridApi) {
       updateSelection({
         tableId: id,
@@ -197,27 +203,21 @@ export function AgGridTable({
       })
       gridApi.deselectAll()
     }
-  }, [id, columns, gridApi, updateSelection, isReadOnly])
+  }, [id, columns, gridApi, updateSelection])
 
   const handleSelectionChanged = useCallback(
     (event: SelectionChangedEvent) => {
-      if (isReadOnly) {
-        return
-      }
       const selectedRows = event.api.getSelectedRows() as TableRowRead[]
       updateSelection({
         selectedCount: selectedRows.length,
         selectedRowIds: selectedRows.map((r) => r.id),
       })
     },
-    [updateSelection, isReadOnly]
+    [updateSelection]
   )
 
   const handleCellValueChanged = useCallback(
     (event: CellValueChangedEvent) => {
-      if (isReadOnly) {
-        return
-      }
       if (event.oldValue !== event.newValue && event.colDef.field) {
         const rowData = event.data as TableRowRead
         updateRow({
@@ -230,7 +230,7 @@ export function AgGridTable({
         })
       }
     },
-    [id, workspaceId, updateRow, isReadOnly]
+    [id, workspaceId, updateRow]
   )
 
   const handleColumnResized = useCallback(
@@ -245,143 +245,93 @@ export function AgGridTable({
     [setSavedWidths]
   )
 
-  const columnDefs: ColDef[] = useMemo(() => {
-    const defs: ColDef[] = [
-      ...columns.map((column): ColDef => {
-        const normalizedType = normalizeSqlType(column.type)
-        const isJsonColumn = JSON_TYPES.has(normalizedType)
-        const isNumeric = NUMERIC_TYPES.has(normalizedType)
-        const baseDef: ColDef = {
-          field: column.name,
-          headerName: column.name,
-          sortable: true,
-          resizable: true,
-          width: savedWidths[column.name] ?? getColumnWidthPx(column.type),
-          minWidth: 100,
-          ...(isNumeric && { valueFormatter: numericValueFormatter }),
-        }
-
-        if (isReadOnly) {
-          return {
-            ...baseDef,
-            cellRenderer: ReadOnlyCellRenderer,
-            cellRendererParams: {
-              tableColumn: column,
-            },
-            editable: false,
-          }
-        }
-
-        return {
-          ...baseDef,
+  const columnDefs: ColDef[] = useMemo(
+    () =>
+      columns.map(
+        (column): ColDef => ({
+          ...buildEditableColumnDef(column, savedWidths),
           headerComponent: AgGridColumnHeader,
           headerComponentParams: {
             tableColumn: column,
           },
-          cellRenderer: AgGridCellRenderer,
-          cellRendererParams: {
-            tableColumn: column,
-          },
-          // JSON columns are edited only via the side panel
-          ...(isJsonColumn
-            ? { editable: false }
-            : {
-                cellEditor: AgGridCellEditor,
-                cellEditorParams: { tableColumn: column },
-                suppressKeyboardEvent: suppressEditorKeys,
-                editable: true,
-              }),
-        }
-      }),
-    ]
-    return defs
-  }, [columns, isReadOnly, savedWidths])
+        })
+      ),
+    [columns, savedWidths]
+  )
 
-  if (error) {
-    return (
+  let gridContent: ReactNode
+  if (error && !isStaleRowQuery) {
+    gridContent = (
       <div className="flex h-full items-center justify-center p-8">
         <p className="text-sm text-destructive">
           Failed to load table rows. Please try refreshing the page.
         </p>
       </div>
     )
-  }
-
-  return (
-    <div
-      className={`flex flex-col gap-2 pb-2 ${useAutoHeight ? "" : "h-full"}`}
-    >
-      {isReadOnly ? (
+  } else {
+    gridContent = (
+      <AgGridContextMenu gridApi={gridApi} columns={columns}>
         <div
-          className={useAutoHeight ? "" : "flex-1 min-h-0"}
+          // Dimmed while the previous rows stand in for the next request's.
+          className={cn(
+            "h-full transition-opacity",
+            isPlaceholderData && "opacity-60"
+          )}
+          aria-busy={isPlaceholderData}
           onKeyDown={(e) => handleGridKeyDown(e, gridApi)}
         >
-          <AgGridReact
-            theme={tracecatTheme}
-            domLayout={useAutoHeight ? "autoHeight" : undefined}
-            rowData={rowData}
-            columnDefs={columnDefs}
-            getRowId={(params) => params.data.id}
-            onGridReady={handleGridReady}
-            onColumnResized={handleColumnResized}
-            suppressContextMenu
-            headerHeight={36}
-            rowHeight={36}
-            animateRows={false}
-            loading={isLoading}
-          />
-        </div>
-      ) : (
-        <AgGridContextMenu gridApi={gridApi} columns={columns}>
-          <div
-            className={useAutoHeight ? "" : "flex-1 min-h-0"}
-            onKeyDown={(e) => handleGridKeyDown(e, gridApi)}
-          >
+          <TableRowQueryContext.Provider value={rowQuery}>
             <AgGridReact
               theme={tracecatTheme}
-              domLayout={useAutoHeight ? "autoHeight" : undefined}
               rowData={rowData}
               columnDefs={columnDefs}
-              getRowId={(params) => params.data.id}
+              getRowId={getRowId}
               onGridReady={handleGridReady}
               onColumnResized={handleColumnResized}
               onCellValueChanged={handleCellValueChanged}
               onSelectionChanged={handleSelectionChanged}
-              selectionColumnDef={{
-                cellClass: "ag-selection-col-aligned",
-                headerClass: "ag-selection-col-aligned",
-              }}
-              rowSelection={{
-                mode: "multiRow",
-                enableClickSelection: false,
-                headerCheckbox: true,
-                checkboxes: true,
-              }}
+              selectionColumnDef={SELECTION_COLUMN_DEF}
+              rowSelection={MULTI_ROW_SELECTION}
               suppressContextMenu
               headerHeight={36}
               rowHeight={36}
               animateRows={false}
               loading={isLoading}
             />
-          </div>
-        </AgGridContextMenu>
-      )}
-      {!hidePagination && rowsOverride === undefined && (
+          </TableRowQueryContext.Provider>
+        </div>
+      </AgGridContextMenu>
+    )
+  }
+
+  return (
+    <div className="flex h-full flex-col pb-2">
+      <TableRowSearchBar
+        searchableColumns={searchableColumns}
+        term={search.term}
+        onTermChange={(term) => setSearch({ ...search, term })}
+        column={resolveSearchColumn(search.column)}
+        onColumnChange={(column) => setSearch({ ...search, column })}
+        rowCount={totalRows}
+      />
+      <div className="min-h-0 flex-1">{gridContent}</div>
+      <div className="pt-2">
         <AgGridPagination
           currentPage={currentPage}
           hasNextPage={hasNextPage}
           hasPreviousPage={hasPreviousPage}
           pageSize={pageSize}
-          totalEstimate={totalEstimate}
+          totalEstimate={totalRows}
           startItem={startItem}
           endItem={endItem}
           onNextPage={goToNextPage}
           onPreviousPage={goToPreviousPage}
           onFirstPage={goToFirstPage}
           onPageSizeChange={handlePageSizeChange}
-          isLoading={isLoading}
+          // The placeholder rows' cursors belong to the previous request.
+          isLoading={isLoading || isPlaceholderData}
         />
-      )}
+      </div>
     </div>
   )
 }

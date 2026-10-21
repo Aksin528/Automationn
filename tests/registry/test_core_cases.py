@@ -8,13 +8,14 @@ import base64
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import tracecat_registry.core.cases as cases_core
 import tracecat_registry.types as registry_types
 from tracecat_registry.core.cases import (
     add_case_tag,
+    aggregate_cases,
     assign_user,
     create_case,
     create_comment,
@@ -26,6 +27,7 @@ from tracecat_registry.core.cases import (
     get_comment_thread,
     list_attachments,
     list_cases,
+    list_cases_by_row,
     list_comment_threads,
     list_comments,
     remove_case_tag,
@@ -51,8 +53,69 @@ def mock_cases_client():
 def mock_get_context(mock_cases_client: AsyncMock):
     """Mock get_context to return a fake context with mock cases client."""
     fake_ctx = SimpleNamespace(cases=mock_cases_client)
-    with patch.object(cases_core, "get_context", return_value=fake_ctx):
+    with patch("tracecat_registry.ctx.get_context", return_value=fake_ctx):
         yield
+
+
+@pytest.mark.anyio
+async def test_aggregate_cases_defaults(mock_cases_client: AsyncMock) -> None:
+    response = {"groups": [{"count": 0}], "truncated": False}
+    mock_cases_client.aggregate_cases.return_value = response
+
+    assert await aggregate_cases(group_by=[]) is response
+    mock_cases_client.aggregate_cases.assert_awaited_once_with(
+        spec={
+            "group_by": [],
+            "filters": None,
+            "aggs": None,
+            "min_count": None,
+            "order_by": None,
+            "sort": None,
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_aggregate_cases_forwards_options(mock_cases_client: AsyncMock) -> None:
+    filters = {"not": {"field": "fields.region", "op": "is_null"}}
+    group_by: list[str | dict[str, Any]] = [
+        {"field": "created_at", "bucket": "day", "timezone": "UTC"}
+    ]
+    aggs = [{"function": "count", "alias": "cases"}]
+    await aggregate_cases(
+        group_by=group_by,
+        filters=filters,
+        aggs=aggs,
+        limit=1500,
+        min_count=2,
+        order_by="cases",
+        sort="asc",
+    )
+    mock_cases_client.aggregate_cases.assert_awaited_once_with(
+        spec={
+            "group_by": group_by,
+            "filters": filters,
+            "aggs": aggs,
+            "limit": 1500,
+            "min_count": 2,
+            "order_by": "cases",
+            "sort": "asc",
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_aggregate_cases_preserves_validation_error(
+    mock_cases_client: AsyncMock,
+) -> None:
+    error = TracecatValidationError(
+        detail={"code": "query_timeout", "message": "Narrow the filters"},
+        status_code=422,
+    )
+    mock_cases_client.aggregate_cases.side_effect = error
+    with pytest.raises(TracecatValidationError) as exc:
+        await aggregate_cases(group_by=[])
+    assert exc.value is error
 
 
 @pytest.fixture
@@ -656,6 +719,11 @@ class TestCoreListCases:
 class TestCoreSearchCases:
     """Test cases for search_cases UDF behavior."""
 
+    async def test_search_cases_does_not_accept_short_id(self):
+        """short_id was never supported by the SDK; use get_case with a short ID."""
+        with pytest.raises(TypeError):
+            await search_cases(short_id="CASE-0001")  # pyright: ignore[reportCallIssue]
+
     async def test_search_cases_no_params(
         self, mock_cases_client: AsyncMock, mock_case_dict
     ):
@@ -966,6 +1034,22 @@ class TestCoreCaseTags:
 class TestCoreAttachments:
     """Test cases for attachment UDFs."""
 
+    async def test_attachment_actions_pass_short_case_id_through(
+        self, mock_cases_client: AsyncMock
+    ):
+        """Attachment actions should let the API resolve short case IDs."""
+        attachment_id = str(uuid.uuid4())
+        mock_cases_client.list_attachments.return_value = []
+        mock_cases_client.get_attachment_metadata.return_value = {}
+
+        await list_attachments(case_id="CASE-0042")
+        await get_attachment(case_id="CASE-0042", attachment_id=attachment_id)
+
+        mock_cases_client.list_attachments.assert_called_once_with("CASE-0042")
+        mock_cases_client.get_attachment_metadata.assert_called_once_with(
+            "CASE-0042", uuid.UUID(attachment_id)
+        )
+
     async def test_upload_attachment_success(
         self, mock_cases_client: AsyncMock, mock_case_dict
     ):
@@ -1260,3 +1344,49 @@ class TestCoreUploadAttachmentFromURL:
                 case_id=case_id,
                 url="https://example.com/docs/report.pdf",
             )
+
+
+@pytest.mark.anyio
+async def test_list_cases_by_row_returns_items(
+    mock_cases_client: AsyncMock,
+) -> None:
+    mock_cases_client.list_linked_cases.return_value = {
+        "items": [{"id": "case-1"}],
+        "next_cursor": "next",
+    }
+
+    result = await list_cases_by_row(
+        table_id="table-id",
+        row_id="row-id",
+        exclude_case_id="CASE-0001",
+        limit=10,
+        cursor="ignored-without-paginate",
+    )
+
+    assert result == [{"id": "case-1"}]
+    mock_cases_client.list_linked_cases.assert_awaited_once_with(
+        "table-id", "row-id", limit=10, exclude_case_id="CASE-0001"
+    )
+
+
+@pytest.mark.anyio
+async def test_list_cases_by_row_paginate_returns_response(
+    mock_cases_client: AsyncMock,
+) -> None:
+    response = {"items": [], "next_cursor": None}
+    mock_cases_client.list_linked_cases.return_value = response
+
+    result = await list_cases_by_row(
+        table_id="table-id", row_id="row-id", cursor="abc", paginate=True
+    )
+
+    assert result is response
+    mock_cases_client.list_linked_cases.assert_awaited_once_with(
+        "table-id", "row-id", limit=100, cursor="abc"
+    )
+
+
+@pytest.mark.anyio
+async def test_list_cases_by_row_rejects_large_limit() -> None:
+    with pytest.raises(TracecatValidationError):
+        await list_cases_by_row(table_id="t", row_id="r", limit=10_000)

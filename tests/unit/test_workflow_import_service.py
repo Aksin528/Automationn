@@ -99,6 +99,22 @@ def test_remote_webhook_defaults_include_headers_false():
     assert rw.include_headers is False
 
 
+async def _publish_workflow(
+    session: AsyncSession, workflow: Workflow, dsl: DSLInput
+) -> None:
+    definition = WorkflowDefinition(
+        workspace_id=workflow.workspace_id,
+        workflow_id=workflow.id,
+        version=1,
+        content=dsl.model_dump(exclude_unset=True),
+    )
+    session.add(definition)
+    workflow.version = definition.version
+    session.add(workflow)
+    await session.commit()
+    await session.refresh(workflow)
+
+
 class TestWorkflowImportService:
     """Test WorkflowImportService functionality."""
 
@@ -129,6 +145,7 @@ class TestWorkflowImportService:
         result = await import_service.import_workflows_atomic(
             remote_workflows=[remote_workflow_definition],
             commit_sha="abc123",
+            sync_schedules=True,
         )
 
         assert result.success is True
@@ -200,6 +217,27 @@ class TestWorkflowImportService:
         assert tag_names == {"test", "import"}
 
     @pytest.mark.anyio
+    async def test_import_single_new_workflow_preserves_schedules_by_default(
+        self,
+        import_service: WorkflowImportService,
+        remote_workflow_definition: RemoteWorkflowDefinition,
+        session: AsyncSession,
+    ):
+        """Test importing a workflow does not create schedules unless opted in."""
+        result = await import_service.import_workflows_atomic(
+            remote_workflows=[remote_workflow_definition],
+            commit_sha="abc123",
+        )
+
+        assert result.success is True
+
+        wf_id = WorkflowUUID.new("wf_testworkflow001")
+        stmt = select(Schedule).where(Schedule.workflow_id == wf_id)
+        result = await session.execute(stmt)
+        schedules = result.scalars().all()
+        assert len(schedules) == 0
+
+    @pytest.mark.anyio
     async def test_update_case_trigger_clears_existing_trigger_when_remote_block_missing(
         self,
         import_service: WorkflowImportService,
@@ -208,6 +246,7 @@ class TestWorkflowImportService:
         workflow = await import_service.wf_mgmt.create_db_workflow_from_dsl(
             sample_dsl, workflow_id=WorkflowUUID.new_uuid4()
         )
+        await _publish_workflow(import_service.session, workflow, sample_dsl)
         case_trigger_service = CaseTriggersService(
             import_service.session, role=import_service.role
         )
@@ -237,6 +276,7 @@ class TestWorkflowImportService:
         workflow = await import_service.wf_mgmt.create_db_workflow_from_dsl(
             sample_dsl, workflow_id=WorkflowUUID.new_uuid4()
         )
+        await _publish_workflow(import_service.session, workflow, sample_dsl)
         case_trigger_service = CaseTriggersService(
             import_service.session, role=import_service.role
         )
@@ -250,9 +290,9 @@ class TestWorkflowImportService:
         )
 
         with patch(
-            "tracecat.workflow.store.import_service.CaseTriggersService.upsert_case_trigger",
+            "tracecat.workflow.store.import_service.CaseTriggersService.sync_case_trigger",
             new_callable=AsyncMock,
-        ) as mock_upsert:
+        ) as mock_sync:
             await import_service._update_case_trigger(
                 workflow,
                 RemoteCaseTrigger(
@@ -262,13 +302,39 @@ class TestWorkflowImportService:
                 ),
             )
 
-        mock_upsert.assert_not_awaited()
+        mock_sync.assert_not_awaited()
         await import_service.session.refresh(workflow, ["case_trigger"])
 
         assert workflow.case_trigger is not None
         assert workflow.case_trigger.status == "offline"
         assert workflow.case_trigger.event_types == []
         assert workflow.case_trigger.tag_filters == []
+
+    @pytest.mark.anyio
+    async def test_update_case_trigger_uses_sync_path(
+        self,
+        import_service: WorkflowImportService,
+        sample_dsl: DSLInput,
+    ) -> None:
+        workflow = await import_service.wf_mgmt.create_db_workflow_from_dsl(
+            sample_dsl, workflow_id=WorkflowUUID.new_uuid4()
+        )
+        await _publish_workflow(import_service.session, workflow, sample_dsl)
+
+        with patch(
+            "tracecat.workflow.store.import_service.CaseTriggersService.sync_case_trigger",
+            new_callable=AsyncMock,
+        ) as mock_sync:
+            await import_service._update_case_trigger(
+                workflow,
+                RemoteCaseTrigger(
+                    status="online",
+                    event_types=[CaseEventType.CASE_CREATED],
+                    tag_filters=[],
+                ),
+            )
+
+        mock_sync.assert_awaited_once()
 
     @pytest.mark.anyio
     async def test_import_workflow_overwrite_behavior(
@@ -538,6 +604,42 @@ class TestWorkflowImportService:
         assert inputs2 == {"url": "https://example.com", "method": "GET"}
 
     @pytest.mark.anyio
+    async def test_import_runs_agent_catalog_correlation(
+        self,
+        import_service: WorkflowImportService,
+        remote_workflow_definition: RemoteWorkflowDefinition,
+    ):
+        """Git-sync import routes the definition through catalog correlation.
+
+        The remap logic itself is covered in test_workflow_management; here we
+        verify _import_single_workflow (the create/update chokepoint) invokes
+        it on the remote definition so synced workflows self-heal on pull. The
+        downstream create/update is stubbed to isolate the wiring.
+        """
+        seen: dict[str, object] = {}
+
+        async def fake_correlate(dsl):
+            seen["dsl"] = dsl
+            return dsl
+
+        with (
+            patch.object(
+                import_service.wf_mgmt,
+                "correlate_agent_catalog_ids",
+                side_effect=fake_correlate,
+            ) as correlate_mock,
+            patch.object(import_service.wf_mgmt, "get_workflow", return_value=None),
+            patch.object(
+                import_service, "_create_new_workflow", new=AsyncMock()
+            ) as create_mock,
+        ):
+            await import_service._import_single_workflow(remote_workflow_definition)
+
+        correlate_mock.assert_awaited_once()
+        assert seen["dsl"] is remote_workflow_definition.definition
+        create_mock.assert_awaited_once()
+
+    @pytest.mark.anyio
     async def test_schedule_handling_improvements(
         self,
         import_service: WorkflowImportService,
@@ -549,6 +651,7 @@ class TestWorkflowImportService:
         result = await import_service.import_workflows_atomic(
             remote_workflows=[remote_workflow_definition],
             commit_sha="abc123",
+            sync_schedules=True,
         )
         assert result.success is True
 
@@ -581,6 +684,7 @@ class TestWorkflowImportService:
         result = await import_service.import_workflows_atomic(
             remote_workflows=[updated_remote],
             commit_sha="def456",
+            sync_schedules=True,
         )
         assert result.success is True
 

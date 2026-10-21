@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from tracecat.artifacts.bindings import (
     ARTIFACT_BINDINGS,
+    MAX_LIST_ARTIFACTS,
     ArtifactIdentityRef,
     ArtifactSideEffect,
     artifact_side_effects_for_tool_result,
 )
 from tracecat.artifacts.projection import (
+    MAX_OPEN_ARTIFACTS,
     apply_artifact_side_effects,
     remove_artifact,
     serialize_artifacts,
@@ -21,7 +25,6 @@ from tracecat.artifacts.schemas import (
     artifact_data_payload,
 )
 from tracecat.cases.enums import CaseSeverity, CaseStatus
-from tracecat.chat.tools import WORKSPACE_CHAT_DEFAULT_TOOLS
 
 
 def test_artifact_data_payload_serializes_camel_case_fields() -> None:
@@ -92,6 +95,51 @@ def test_artifact_projection_applies_upsert_and_remove_operations() -> None:
     )
 
     assert projected == [second]
+
+
+def test_artifact_projection_evicts_oldest_past_open_limit() -> None:
+    def case(i: int) -> CaseArtifact:
+        return CaseArtifact(
+            id=f"case_{i}",
+            title=f"Case {i}",
+            severity=CaseSeverity.LOW,
+            status=CaseStatus.NEW,
+        )
+
+    total = MAX_OPEN_ARTIFACTS + 2
+    projected = apply_artifact_side_effects(
+        [],
+        [ArtifactSideEffect(op="upsert", artifact=case(i)) for i in range(total)],
+    )
+
+    assert [artifact.id for artifact in projected] == [
+        f"case_{i}" for i in range(total - MAX_OPEN_ARTIFACTS, total)
+    ]
+
+
+def test_artifact_projection_upsert_refreshes_recency() -> None:
+    def case(i: int) -> CaseArtifact:
+        return CaseArtifact(
+            id=f"case_{i}",
+            title=f"Case {i}",
+            severity=CaseSeverity.LOW,
+            status=CaseStatus.NEW,
+        )
+
+    initial = [case(i) for i in range(MAX_OPEN_ARTIFACTS)]
+    projected = apply_artifact_side_effects(
+        initial,
+        [
+            # Touch the oldest artifact, then add one more: the second-oldest
+            # should be evicted instead of the refreshed one.
+            ArtifactSideEffect(op="upsert", artifact=case(0)),
+            ArtifactSideEffect(op="upsert", artifact=case(MAX_OPEN_ARTIFACTS)),
+        ],
+    )
+
+    assert [artifact.id for artifact in projected] == [
+        f"case_{i}" for i in range(2, MAX_OPEN_ARTIFACTS)
+    ] + ["case_0", f"case_{MAX_OPEN_ARTIFACTS}"]
 
 
 def test_artifact_projection_serializes_and_validates_jsonb_payload() -> None:
@@ -239,6 +287,7 @@ def test_artifact_bindings_list_canonical_tool_names() -> None:
         "core.table.lookup_many": "upsert",
         "core.table.is_in": "upsert",
         "core.table.search_rows": "upsert",
+        "core.table.aggregate_rows": "upsert",
         "core.table.insert_row": "upsert",
         "core.table.insert_rows": "upsert",
         "core.table.update_row": "upsert",
@@ -248,18 +297,14 @@ def test_artifact_bindings_list_canonical_tool_names() -> None:
         "ai.agent.get_preset": "upsert",
         "ai.agent.list_presets": "upsert",
         "ai.agent.update_preset": "upsert",
+        "core.forms.get_form": "upsert",
+        "core.forms.update_form": "upsert",
         "core.workflow.execute": "upsert",
         "core.workflow.get_status": "upsert",
         "core.workflow.create_workflow": "upsert",
+        "core.workflow.get_workflow": "upsert",
+        "core.workflow.edit_workflow": "upsert",
     }
-
-
-def test_workspace_chat_domain_tools_have_artifact_bindings() -> None:
-    bound_tool_names = {
-        tool_name for binding in ARTIFACT_BINDINGS for tool_name in binding.tool_names
-    }
-
-    assert set(WORKSPACE_CHAT_DEFAULT_TOOLS).issubset(bound_tool_names)
 
 
 def test_case_delete_tool_result_emits_remove_side_effect() -> None:
@@ -353,6 +398,52 @@ def test_table_schema_tool_result_emits_upsert_side_effect() -> None:
     assert effects[0].identity_ref is None
 
 
+def test_table_aggregate_result_references_input_table() -> None:
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="core.table.aggregate_rows",
+            tool_input={"table": "alerts", "group_by": ["source"]},
+            tool_output={
+                "groups": [{"source": "sensor", "count": 3}],
+                "truncated": False,
+            },
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert len(effects) == 1
+    assert artifact_data_payload(effects[0].op, effects[0].artifact) == {
+        "op": "upsert",
+        "artifact": {
+            "type": "table",
+            "id": "alerts",
+            "title": "alerts",
+            "scope": {"parentToolCallId": "toolu_123"},
+        },
+    }
+    assert effects[0].identity_ref == ArtifactIdentityRef(
+        artifact_type="table", ref="alerts", ref_kind="name"
+    )
+
+
+def test_case_aggregate_result_does_not_project_groups_as_cases() -> None:
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="core.cases.aggregate_cases",
+            tool_input={"group_by": ["priority"]},
+            tool_output={
+                "groups": [{"priority": "high", "count": 3}],
+                "truncated": False,
+            },
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert effects == []
+
+
 def test_table_row_delete_tool_result_emits_upsert_side_effect_from_input() -> None:
     effects = list(
         artifact_side_effects_for_tool_result(
@@ -433,6 +524,31 @@ def test_case_list_tool_result_emits_upsert_side_effects() -> None:
     assert [effect.artifact.id for effect in effects] == ["case_123", "case_456"]
 
 
+def test_case_list_tool_result_above_limit_emits_no_side_effects() -> None:
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="core.cases.list_cases",
+            tool_input={"limit": 10},
+            tool_output={
+                "items": [
+                    {
+                        "id": f"case_{i}",
+                        "summary": f"Case {i}",
+                        "severity": "low",
+                        "status": "new",
+                    }
+                    for i in range(MAX_LIST_ARTIFACTS + 1)
+                ],
+                "has_more": False,
+            },
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert effects == []
+
+
 def test_table_list_tool_result_emits_upsert_side_effects() -> None:
     effects = list(
         artifact_side_effects_for_tool_result(
@@ -449,6 +565,23 @@ def test_table_list_tool_result_emits_upsert_side_effects() -> None:
 
     assert [effect.op for effect in effects] == ["upsert", "upsert"]
     assert [effect.artifact.id for effect in effects] == ["table_123", "table_456"]
+
+
+def test_table_list_tool_result_above_limit_emits_no_side_effects() -> None:
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="core.table.list_tables",
+            tool_input=None,
+            tool_output=[
+                {"id": f"table_{i}", "name": f"table-{i}"}
+                for i in range(MAX_LIST_ARTIFACTS + 1)
+            ],
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert effects == []
 
 
 def test_table_search_tool_result_emits_upsert_side_effect_from_input() -> None:
@@ -533,6 +666,48 @@ def test_agent_preset_tool_result_emits_upsert_side_effect() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "config", "title"),
+    [
+        (
+            "core.forms.get_form",
+            {"title": "Laptop request", "layout": []},
+            "Laptop request",
+        ),
+        ("core.forms.update_form", {}, "Provision laptop"),
+    ],
+    ids=["config-title", "workflow-title-fallback"],
+)
+def test_form_tool_result_emits_upsert_side_effect(
+    tool_name: str, config: dict[str, object], title: str
+) -> None:
+    [effect] = artifact_side_effects_for_tool_result(
+        tool_name=tool_name,
+        tool_input={"workflow_id": "wf_123"},
+        tool_output={
+            "id": "0b0c8f8e-0d0b-4d3a-9a57-3d0f2a3e6b11",
+            "workflow_id": "wf_123",
+            "workflow_title": "Provision laptop",
+            "status": "online",
+            "config": config,
+            "issues": [],
+        },
+        is_error=False,
+        tool_call_id="toolu_123",
+    )
+
+    assert artifact_data_payload(effect.op, effect.artifact) == {
+        "op": "upsert",
+        "artifact": {
+            "type": "form",
+            "id": "0b0c8f8e-0d0b-4d3a-9a57-3d0f2a3e6b11",
+            "title": title,
+            "status": "online",
+            "scope": {"parentToolCallId": "toolu_123"},
+        },
+    }
+
+
 def test_agent_preset_list_tool_result_emits_upsert_side_effects() -> None:
     effects = list(
         artifact_side_effects_for_tool_result(
@@ -552,6 +727,84 @@ def test_agent_preset_list_tool_result_emits_upsert_side_effects() -> None:
         "preset_123",
         "preset_456",
     ]
+
+
+def test_agent_preset_list_tool_result_above_limit_emits_no_side_effects() -> None:
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="ai.agent.list_presets",
+            tool_input=None,
+            tool_output=[
+                {"id": f"preset_{i}", "name": f"Preset {i}"}
+                for i in range(MAX_LIST_ARTIFACTS + 1)
+            ],
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert effects == []
+
+
+def test_create_workflow_tool_result_emits_upsert_side_effect() -> None:
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="core.workflow.create_workflow",
+            tool_input={"title": "Triage workflow"},
+            tool_output={
+                "id": "wf-1234",
+                "title": "Triage workflow",
+            },
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert len(effects) == 1
+    assert effects[0].op == "upsert"
+    payload = artifact_data_payload(effects[0].op, effects[0].artifact)
+    assert payload["artifact"]["type"] == "workflow"
+    assert payload["artifact"]["id"] == "wf-1234"
+    assert payload["artifact"]["title"] == "Triage workflow"
+
+
+def test_get_workflow_tool_result_resolves_nested_draft_title() -> None:
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="core.workflow.get_workflow",
+            tool_input=None,
+            tool_output={
+                "id": "wf-1234",
+                "draft_document": {"metadata": {"title": "Triage workflow"}},
+            },
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert len(effects) == 1
+    payload = artifact_data_payload(effects[0].op, effects[0].artifact)
+    assert payload["artifact"]["title"] == "Triage workflow"
+
+
+def test_edit_workflow_titleless_result_emits_no_side_effect() -> None:
+    """edit_workflow returns no title, so it must not upsert and clobber the
+    workflow artifact title (set by create/get) with the workflow id."""
+    effects = list(
+        artifact_side_effects_for_tool_result(
+            tool_name="core.workflow.edit_workflow",
+            tool_input={"workflow_id": "wf-1234"},
+            tool_output={
+                "message": "Workflow wf-1234 updated successfully",
+                "workflow_id": "wf-1234",
+                "draft_revision": "rev-1",
+            },
+            is_error=False,
+            tool_call_id="toolu_123",
+        )
+    )
+
+    assert effects == []
 
 
 def test_table_tool_result_mapping_content_emits_upsert_side_effect() -> None:

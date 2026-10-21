@@ -17,7 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat.authz.enums import ScopeSource
 from tracecat.authz.scopes import PRESET_ROLE_SCOPES
-from tracecat.db.models import Organization, Role, RoleScope, Scope
+from tracecat.db.models import (
+    Organization,
+    Role,
+    RoleScope,
+    Scope,
+)
 from tracecat.logger import logger
 
 # =============================================================================
@@ -88,6 +93,12 @@ SYSTEM_SCOPE_DEFINITIONS: list[ScopeDefinition] = [
         "org:rbac",
         "delete",
         "Delete roles, scopes, groups, and assignments",
+    ),
+    ScopeDefinition(
+        "org:scim:manage",
+        "org:scim",
+        "manage",
+        "Manage SCIM connections and mappings, including granting and revoking IdP-managed access",
     ),
     ScopeDefinition(
         "org:service_account:read",
@@ -187,11 +198,14 @@ SYSTEM_SCOPE_DEFINITIONS: list[ScopeDefinition] = [
         "remove",
         "Remove users from workspace",
     ),
+    # Deprecated: no route requires this scope; workspace role management is
+    # centralized in org settings. The row stays until custom-role links are
+    # cleared, because deleting a scope cascades through role_scope.
     ScopeDefinition(
         "workspace:member:update",
         "workspace:member",
         "update",
-        "Change member workspace roles",
+        "Deprecated. Change member workspace roles",
     ),
     # Workspace RBAC administration (delegated to workspace admins)
     ScopeDefinition(
@@ -200,11 +214,14 @@ SYSTEM_SCOPE_DEFINITIONS: list[ScopeDefinition] = [
         "read",
         "View workspace role assignments and group permissions",
     ),
+    # Deprecated: no route requires this scope; role and group management is
+    # centralized in org settings. The row stays until custom-role links are
+    # cleared, because deleting a scope cascades through role_scope.
     ScopeDefinition(
         "workspace:rbac:manage",
         "workspace:rbac",
         "manage",
-        "Manage workspace role assignments and group permissions",
+        "Deprecated. Manage workspace role assignments and group permissions",
     ),
     ScopeDefinition(
         "workspace:service_account:read",
@@ -239,6 +256,12 @@ SYSTEM_SCOPE_DEFINITIONS: list[ScopeDefinition] = [
         "workflow",
         "sync",
         "Sync workflows with the configured Git repository",
+    ),
+    ScopeDefinition(
+        "workspace_sync:sync",
+        "workspace_sync",
+        "sync",
+        "Sync workspace resources with the configured Git repository",
     ),
     ScopeDefinition("workflow:create", "workflow", "create", "Create new workflows"),
     ScopeDefinition(
@@ -279,6 +302,21 @@ SYSTEM_SCOPE_DEFINITIONS: list[ScopeDefinition] = [
     ScopeDefinition("case:create", "case", "create", "Create new cases"),
     ScopeDefinition("case:update", "case", "update", "Modify existing cases"),
     ScopeDefinition("case:delete", "case", "delete", "Delete cases"),
+    # Form scopes
+    ScopeDefinition("form:read", "form", "read", "View forms"),
+    ScopeDefinition("form:create", "form", "create", "Create new forms"),
+    ScopeDefinition("form:update", "form", "update", "Modify existing forms"),
+    ScopeDefinition("form:delete", "form", "delete", "Delete forms"),
+    ScopeDefinition("form:submit", "form", "submit", "Submit forms"),
+    ScopeDefinition(
+        "form:submission:read", "form:submission", "read", "View form submissions"
+    ),
+    ScopeDefinition(
+        "form:submission:delete",
+        "form:submission",
+        "delete",
+        "Delete form submissions",
+    ),
     # Inbox scopes
     ScopeDefinition("inbox:read", "inbox", "read", "View inbox items"),
     # Table scopes
@@ -296,6 +334,11 @@ SYSTEM_SCOPE_DEFINITIONS: list[ScopeDefinition] = [
     ScopeDefinition("variable:create", "variable", "create", "Create new variables"),
     ScopeDefinition("variable:update", "variable", "update", "Modify variables"),
     ScopeDefinition("variable:delete", "variable", "delete", "Delete variables"),
+    # Tunnel scopes
+    ScopeDefinition("tunnel:read", "tunnel", "read", "View network tunnels"),
+    ScopeDefinition("tunnel:create", "tunnel", "create", "Create network tunnels"),
+    ScopeDefinition("tunnel:update", "tunnel", "update", "Modify network tunnels"),
+    ScopeDefinition("tunnel:delete", "tunnel", "delete", "Delete network tunnels"),
     # Schedule scopes
     ScopeDefinition("schedule:read", "schedule", "read", "View schedules"),
     ScopeDefinition("schedule:create", "schedule", "create", "Create new schedules"),
@@ -353,6 +396,11 @@ class RoleDefinition(NamedTuple):
 
 PRESET_ROLE_DEFINITIONS: dict[str, RoleDefinition] = {
     # slug → RoleDefinition(name, description, scopes)
+    "workspace-intake": RoleDefinition(
+        "Intake only",
+        "Fill in and submit forms, no other workspace access",
+        PRESET_ROLE_SCOPES["workspace-intake"],
+    ),
     "workspace-viewer": RoleDefinition(
         "Workspace Viewer",
         "Read-only access to workspace resources",

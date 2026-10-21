@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import uuid
+from collections.abc import Sequence
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, select, update
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import NullPool
 
+from tests.database import TEST_DB_CONFIG
+from tracecat.agent.preset.tool_policy import PresetToolPolicyService
 from tracecat.auth.types import Role
 from tracecat.db.models import (
     PlatformRegistryIndex,
@@ -15,8 +24,12 @@ from tracecat.db.models import (
     RegistryRepository,
     RegistryVersion,
 )
-from tracecat.registry.actions.service import RegistryActionsService
+from tracecat.registry.actions.service import (
+    RegistryActionsService,
+    _ActionMetadataRow,
+)
 from tracecat.registry.constants import DEFAULT_REGISTRY_ORIGIN
+from tracecat.registry.versions.schemas import RegistryVersionManifest
 
 pytestmark = pytest.mark.usefixtures("db")
 
@@ -47,6 +60,7 @@ async def _seed_platform_registry(
     origin: str,
     version: str,
     action_names: list[str],
+    options: dict | None = None,
 ) -> PlatformRegistryRepository:
     repo = await session.scalar(
         select(PlatformRegistryRepository).where(
@@ -79,7 +93,7 @@ async def _seed_platform_registry(
                 name=name,
                 action_type="udf",
                 description=f"Platform action {action_name}",
-                options={"include_in_schema": True},
+                options=options or {"include_in_schema": True},
             )
         )
     await session.commit()
@@ -235,6 +249,146 @@ async def test_get_actions_from_index_filters_custom_and_keeps_platform_fallback
 
 
 @pytest.mark.anyio
+async def test_get_actions_from_index_reuses_manifest_for_same_version(
+    svc_role: Role,
+    session: AsyncSession,
+) -> None:
+    action_names = ["acme.batch.first", "acme.batch.second"]
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="platform-shared-manifest",
+        action_names=action_names,
+    )
+
+    service = RegistryActionsService(session, role=svc_role)
+    results = await service.get_actions_from_index(action_names)
+
+    assert set(results) == set(action_names)
+    assert results[action_names[0]].manifest is results[action_names[1]].manifest
+
+
+@pytest.mark.anyio
+async def test_get_actions_from_index_retries_version_replaced_between_queries(
+    svc_role: Role,
+) -> None:
+    action_name = "acme.batch.replaced"
+    origin = f"git+ssh://git@github.com/acme/registry-{uuid.uuid4()}.git"
+    engine = create_async_engine(
+        TEST_DB_CONFIG.test_url,
+        isolation_level="READ COMMITTED",
+        poolclass=NullPool,
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    repository_id: uuid.UUID | None = None
+
+    try:
+        async with session_factory() as seed_session:
+            repository = await _seed_org_registry(
+                seed_session,
+                role=svc_role,
+                origin=origin,
+                version="before-replacement",
+                action_names=[action_name],
+            )
+            repository_id = repository.id
+            old_version_id = repository.current_version_id
+            assert old_version_id is not None
+
+        async with session_factory() as read_session:
+            service = RegistryActionsService(read_session, role=svc_role)
+            original_load = service._load_action_manifests
+            load_calls = 0
+
+            async def replace_version_before_manifest_load(
+                rows: Sequence[_ActionMetadataRow],
+            ) -> dict[tuple[str, uuid.UUID], RegistryVersionManifest]:
+                nonlocal load_calls
+                load_calls += 1
+                if load_calls == 1:
+                    async with session_factory() as write_session:
+                        repository = await write_session.scalar(
+                            select(RegistryRepository).where(
+                                RegistryRepository.id == repository_id
+                            )
+                        )
+                        assert repository is not None
+                        repository.current_version_id = None
+                        await write_session.flush()
+                        await write_session.execute(
+                            delete(RegistryVersion).where(
+                                RegistryVersion.id == old_version_id
+                            )
+                        )
+
+                        replacement_manifest = _make_manifest(
+                            [action_name], origin=origin
+                        )
+                        replacement_manifest["actions"][action_name]["description"] = (
+                            "Replacement action"
+                        )
+                        replacement = RegistryVersion(
+                            organization_id=svc_role.organization_id,
+                            repository_id=repository.id,
+                            version="after-replacement",
+                            manifest=replacement_manifest,
+                            tarball_uri="s3://org/after-replacement.tar.gz",
+                        )
+                        write_session.add(replacement)
+                        await write_session.flush()
+                        repository.current_version_id = replacement.id
+                        write_session.add(
+                            RegistryIndex(
+                                organization_id=svc_role.organization_id,
+                                registry_version_id=replacement.id,
+                                namespace="acme.batch",
+                                name="replaced",
+                                action_type="udf",
+                                description="Replacement action",
+                                options={"include_in_schema": True},
+                            )
+                        )
+                        await write_session.commit()
+
+                return await original_load(rows)
+
+            with (
+                patch.object(
+                    service,
+                    "has_entitlement",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch.object(
+                    service,
+                    "_load_action_manifests",
+                    new=replace_version_before_manifest_load,
+                ),
+            ):
+                results = await service.get_actions_from_index([action_name])
+
+        assert load_calls == 2
+        assert results[action_name].index_entry.description == "Replacement action"
+        assert (
+            results[action_name].manifest.actions[action_name].description
+            == "Replacement action"
+        )
+    finally:
+        if repository_id is not None:
+            async with session_factory() as cleanup_session:
+                repository = await cleanup_session.scalar(
+                    select(RegistryRepository).where(
+                        RegistryRepository.id == repository_id
+                    )
+                )
+                if repository is not None:
+                    repository.current_version_id = None
+                    await cleanup_session.flush()
+                    await cleanup_session.delete(repository)
+                    await cleanup_session.commit()
+        await engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_list_actions_from_index_by_repository_returns_empty_for_custom_repo_without_entitlement(
     svc_role: Role,
     session: AsyncSession,
@@ -287,3 +441,354 @@ async def test_search_actions_from_index_hides_custom_actions_without_entitlemen
     }
     assert actions_to_origin[shared_action] == DEFAULT_REGISTRY_ORIGIN
     assert custom_only_action not in actions_to_origin
+
+
+@pytest.mark.anyio
+async def test_search_actions_from_index_treats_like_wildcards_as_literal_text(
+    session: AsyncSession,
+) -> None:
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="literal-search-1.0",
+        action_names=[
+            "tools.literal.search_events",
+            "tools.literal.searchXevents",
+            "tools.literal.percent",
+            "tools.literal.number",
+        ],
+    )
+    await session.execute(
+        update(PlatformRegistryIndex)
+        .where(PlatformRegistryIndex.name == "percent")
+        .values(description="completion 100% done")
+    )
+    await session.execute(
+        update(PlatformRegistryIndex)
+        .where(PlatformRegistryIndex.name == "number")
+        .values(description="completion 1000 done")
+    )
+    await session.commit()
+
+    role = Role(
+        type="service",
+        organization_id=uuid.uuid4(),
+        service_id="tracecat-api",
+    )
+    service = RegistryActionsService(session, role=role)
+    underscore_matches = await service.search_actions_from_index("search_events")
+    percent_matches = await service.search_actions_from_index("100% done")
+
+    assert {f"{entry.namespace}.{entry.name}" for entry, _ in underscore_matches} == {
+        "tools.literal.search_events"
+    }
+    assert {f"{entry.namespace}.{entry.name}" for entry, _ in percent_matches} == {
+        "tools.literal.percent"
+    }
+
+
+@pytest.mark.anyio
+async def test_search_actions_ranks_exact_namespace_before_large_related_catalog(
+    session: AsyncSession,
+) -> None:
+    related_actions = [
+        f"tools.example_security.event_{index:03d}" for index in range(60)
+    ]
+    exact_action = "tools.example.search_events"
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="ranked-search-1.0",
+        action_names=[*related_actions, exact_action],
+    )
+    service = RegistryActionsService(
+        session,
+        role=Role(
+            type="service",
+            organization_id=uuid.uuid4(),
+            service_id="tracecat-api",
+        ),
+    )
+
+    first_page = await service.search_actions_from_index("example", limit=20)
+    all_matches = await service.search_actions_from_index("example")
+
+    assert f"{first_page[0][0].namespace}.{first_page[0][0].name}" == exact_action
+    assert len(first_page) == 20
+    assert len(all_matches) == 61
+    assert [f"{entry.namespace}.{entry.name}" for entry, _ in all_matches] == [
+        exact_action,
+        *related_actions,
+    ]
+
+
+@pytest.mark.anyio
+async def test_classify_missing_actions_separates_entitlement_gaps(
+    svc_role: Role,
+    session: AsyncSession,
+) -> None:
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="platform-1.0",
+        action_names=["acme.platform.retired", "acme.platform.gated"],
+    )
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="platform-2.0",
+        action_names=["acme.platform.gated"],
+        options={"required_entitlements": ["agent_addons"]},
+    )
+
+    service = RegistryActionsService(session, role=svc_role)
+    with patch.object(
+        service, "_get_enabled_entitlements", new=AsyncMock(return_value=set())
+    ):
+        missing = await service.classify_missing_actions(
+            [
+                "acme.platform.retired",
+                "acme.platform.gated",
+                "acme.custom.only",
+                "malformed",
+            ]
+        )
+
+    assert missing.platform == frozenset({"acme.platform.retired"})
+    assert missing.entitlement_denied == frozenset({"acme.platform.gated"})
+
+
+@pytest.mark.anyio
+async def test_classify_missing_actions_denies_custom_registry_without_entitlement(
+    svc_role: Role,
+    session: AsyncSession,
+) -> None:
+    await _seed_org_registry(
+        session,
+        role=svc_role,
+        origin="git+ssh://git@github.com/acme/custom-registry.git",
+        version="org-1.0",
+        action_names=["acme.custom.only"],
+    )
+
+    service = RegistryActionsService(session, role=svc_role)
+    with patch.object(service, "has_entitlement", new=AsyncMock(return_value=False)):
+        missing = await service.classify_missing_actions(["acme.custom.only"])
+
+    assert missing.platform == frozenset()
+    assert missing.entitlement_denied == frozenset({"acme.custom.only"})
+
+
+@pytest.mark.anyio
+async def test_classify_missing_actions_requires_every_current_row_gated(
+    svc_role: Role,
+    session: AsyncSession,
+) -> None:
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="platform-1.0",
+        action_names=["acme.platform.shared"],
+        options={"required_entitlements": ["agent_addons"]},
+    )
+    await _seed_platform_registry(
+        session,
+        origin="git+ssh://git@github.com/acme/platform-extra.git",
+        version="extra-1.0",
+        action_names=["acme.platform.shared"],
+    )
+
+    service = RegistryActionsService(session, role=svc_role)
+    with (
+        patch.object(service, "has_entitlement", new=AsyncMock(return_value=True)),
+        patch.object(
+            service, "_get_enabled_entitlements", new=AsyncMock(return_value=set())
+        ),
+    ):
+        missing = await service.classify_missing_actions(["acme.platform.shared"])
+
+    assert missing.platform == frozenset({"acme.platform.shared"})
+    assert missing.entitlement_denied == frozenset()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("custom_enabled", "org_gated", "platform_gated"),
+    [
+        # A gated org override shadows the ungated platform action.
+        (True, True, False),
+        # The custom registry is off, so the gated platform row is selected.
+        (False, False, True),
+    ],
+)
+async def test_classify_missing_actions_follows_lookup_precedence(
+    svc_role: Role,
+    session: AsyncSession,
+    custom_enabled: bool,
+    org_gated: bool,
+    platform_gated: bool,
+) -> None:
+    action = "acme.shared.action"
+    gate = {"required_entitlements": ["agent_addons"]}
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="platform-1.0",
+        action_names=[action],
+        options=gate if platform_gated else None,
+    )
+    await _seed_org_registry(
+        session,
+        role=svc_role,
+        origin="git+ssh://git@github.com/acme/custom-registry.git",
+        version="org-1.0",
+        action_names=[action],
+    )
+    if org_gated:
+        await session.execute(update(RegistryIndex).values(options=gate))
+        await session.commit()
+
+    service = RegistryActionsService(session, role=svc_role)
+    with (
+        patch.object(
+            service, "has_entitlement", new=AsyncMock(return_value=custom_enabled)
+        ),
+        patch.object(
+            service, "_get_enabled_entitlements", new=AsyncMock(return_value=set())
+        ),
+    ):
+        found = await service.get_actions_from_index([action])
+        missing = await service.classify_missing_actions([action])
+
+    assert found == {}
+    assert missing.platform == frozenset()
+    assert missing.entitlement_denied == frozenset({action})
+
+
+async def _approval_defaults_both_ways(
+    session: AsyncSession,
+    role: Role,
+    names: list[str],
+    *,
+    custom_enabled: bool,
+) -> tuple[set[str], set[str]]:
+    """Registry defaults as compilation sees them, then as preset policy does."""
+    with (
+        patch.object(
+            RegistryActionsService,
+            "has_entitlement",
+            new=AsyncMock(return_value=custom_enabled),
+        ),
+        patch.object(
+            RegistryActionsService,
+            "_get_enabled_entitlements",
+            new=AsyncMock(return_value=set()),
+        ),
+    ):
+        compiled = {
+            name
+            for name, result in (
+                await RegistryActionsService(session, role=role).get_actions_from_index(
+                    names
+                )
+            ).items()
+            if result.index_entry.options.get("requires_approval") is True
+        }
+        # Approval options need no manifests.
+        with patch.object(
+            RegistryActionsService,
+            "_load_action_manifests",
+            new=AsyncMock(side_effect=AssertionError("manifest loaded")),
+        ):
+            policy = await PresetToolPolicyService(
+                session, role=role
+            ).registry_approval_defaults(names)
+    return compiled, policy
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("custom_enabled", "org_options", "platform_options", "expected"),
+    [
+        # The org row takes precedence over the platform row.
+        (True, {"requires_approval": True}, {}, {"acme.shared.action"}),
+        (True, {}, {"requires_approval": True}, set()),
+        # Without the custom registry, the platform row is selected.
+        (False, {"requires_approval": True}, {}, set()),
+        (False, {}, {"requires_approval": True}, {"acme.shared.action"}),
+        # A selected row with a missing entitlement is dropped, with no fallback.
+        (
+            True,
+            {"requires_approval": True, "required_entitlements": ["agent_addons"]},
+            {"requires_approval": True},
+            set(),
+        ),
+    ],
+)
+async def test_policy_approval_defaults_follow_compile_lookup_precedence(
+    svc_role: Role,
+    session: AsyncSession,
+    custom_enabled: bool,
+    org_options: dict[str, object],
+    platform_options: dict[str, object],
+    expected: set[str],
+) -> None:
+    action = "acme.shared.action"
+    await _seed_platform_registry(
+        session,
+        origin=DEFAULT_REGISTRY_ORIGIN,
+        version="platform-1.0",
+        action_names=[action],
+        options={"include_in_schema": True, **platform_options},
+    )
+    await _seed_org_registry(
+        session,
+        role=svc_role,
+        origin="git+ssh://git@github.com/acme/custom-registry.git",
+        version="org-1.0",
+        action_names=[action],
+    )
+    await session.execute(
+        update(RegistryIndex).values(options={"include_in_schema": True, **org_options})
+    )
+    await session.commit()
+
+    compiled, policy = await _approval_defaults_both_ways(
+        session,
+        svc_role,
+        [action, "acme.shared.missing"],
+        custom_enabled=custom_enabled,
+    )
+
+    assert compiled == policy == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("current_requires_approval", [False, True])
+async def test_policy_approval_defaults_follow_compile_version_selection(
+    svc_role: Role,
+    session: AsyncSession,
+    current_requires_approval: bool,
+) -> None:
+    action = "acme.versioned.action"
+    for version, requires_approval in (
+        ("platform-1.0", not current_requires_approval),
+        ("platform-2.0", current_requires_approval),
+    ):
+        # Reusing the origin promotes each seeded version to current.
+        await _seed_platform_registry(
+            session,
+            origin=DEFAULT_REGISTRY_ORIGIN,
+            version=version,
+            action_names=[action],
+            options={
+                "include_in_schema": False,
+                "requires_approval": requires_approval,
+            },
+        )
+
+    compiled, policy = await _approval_defaults_both_ways(
+        session, svc_role, [action], custom_enabled=True
+    )
+
+    assert compiled == policy == ({action} if current_requires_approval else set())

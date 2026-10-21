@@ -2,10 +2,10 @@
  * @jest-environment jsdom
  */
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { render, screen } from "@testing-library/react"
 import type { ReactNode } from "react"
 import { CaseItem } from "@/components/cases/case-item"
+import { QueryClient, QueryClientProvider } from "@/lib/query"
 
 jest.mock("@/providers/workspace-id", () => ({
   useWorkspaceId: () => "workspace-1",
@@ -43,6 +43,7 @@ function renderCaseItem() {
         caseData={{
           id: "case-1",
           short_id: "CASE-0001",
+          num_sub_cases: 0,
           created_at: "2026-04-13T00:00:00Z",
           updated_at: "2026-04-13T00:01:30Z",
           summary: "Database alert",
@@ -84,7 +85,14 @@ function renderCaseItem() {
           "field:priority_reason",
           "duration:duration-1",
         ]}
-        fieldTypesById={new Map([["priority_reason", "TEXT"]])}
+        fieldMetadataById={
+          new Map([
+            [
+              "priority_reason",
+              { display_name: "Why this matters", type: "TEXT" },
+            ],
+          ])
+        }
         durationNamesById={new Map([["duration-1", "Time to resolve"]])}
       />
     </QueryClientProvider>
@@ -120,6 +128,6 @@ describe("CaseItem", () => {
     expect(screen.getByText(/Started:/)).toBeInTheDocument()
     expect(screen.getByText(/Ended:/)).toBeInTheDocument()
     expect(screen.getByText("Analyst verdict")).toBeInTheDocument()
-    expect(screen.getByText("Priority reason")).toBeInTheDocument()
+    expect(screen.getByText("Why this matters")).toBeInTheDocument()
   })
 })

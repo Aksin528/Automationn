@@ -1,5 +1,6 @@
 "use client"
 
+import Cookies from "js-cookie"
 import {
   BuildingIcon,
   ChevronsUpDown,
@@ -8,13 +9,13 @@ import {
   RadarIcon,
 } from "lucide-react"
 import Link from "next/link"
-import { usePathname, useRouter, useSearchParams } from "next/navigation"
+import { useRouter } from "next/navigation"
 import { useState } from "react"
 import { useScopeCheck } from "@/components/auth/scope-guard"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
-  DialogClose,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -37,45 +38,49 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar"
+import { useEntitlements } from "@/hooks/use-entitlements"
+import {
+  useOrganization,
+  useOrganizationMemberships,
+} from "@/hooks/use-organization"
 import { useWorkspaceManager } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 import { getWorkspaceLandingPath } from "@/lib/workspace-navigation"
 
 export function AppMenu({ workspaceId }: { workspaceId: string }) {
   const router = useRouter()
-  const pathname = usePathname()
-  const searchParams = useSearchParams()
   const { workspaces, createWorkspace } = useWorkspaceManager()
+  const { organization: activeOrganization } = useOrganization()
+  const { organizations } = useOrganizationMemberships()
   const canAdministerOrg = useScopeCheck("org:update")
+  const canManageScim = useScopeCheck("org:scim:manage")
   const canCreateWorkspace = useScopeCheck("workspace:create")
+  const {
+    hasEntitlement,
+    hasEntitlementData,
+    isLoading: entitlementsLoading,
+  } = useEntitlements()
   const [dialogOpen, setDialogOpen] = useState(false)
   const [workspaceName, setWorkspaceName] = useState("")
   const [isCreating, setIsCreating] = useState(false)
 
+  // SCIM-only administrators land on SCIM, which needs the plan entitlement.
+  const canOpenScim =
+    canManageScim === true &&
+    hasEntitlementData &&
+    !entitlementsLoading &&
+    hasEntitlement("rbac_addons")
   const activeWorkspace = workspaces?.find((ws) => ws.id === workspaceId)
-
-  const buildWorkspaceHref = (
-    targetWorkspaceId: string,
-    options: { preserveRelativePath?: boolean } = {}
-  ) => {
-    const { preserveRelativePath = true } = options
-    const currentPath = pathname ?? ""
-    const search = searchParams?.toString()
-    if (!preserveRelativePath || !currentPath.startsWith("/workspaces/")) {
-      return getWorkspaceLandingPath(targetWorkspaceId)
-    }
-    const relativePath = currentPath.replace(/^\/workspaces\/[^/]+/, "")
-    const normalizedPath =
-      relativePath && relativePath !== "/" ? relativePath : "/chat"
-
-    return `/workspaces/${targetWorkspaceId}${normalizedPath}${
-      search ? `?${search}` : ""
-    }`
-  }
+  const showOrganizationSelector = (organizations?.length ?? 0) > 1
+  const canCreateAdditionalWorkspace =
+    canCreateWorkspace === true &&
+    hasEntitlementData &&
+    !entitlementsLoading &&
+    hasEntitlement("multi_workspace")
 
   const handleCreateWorkspace = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!workspaceName.trim()) return
+    if (!canCreateAdditionalWorkspace || !workspaceName.trim()) return
 
     setIsCreating(true)
     try {
@@ -83,9 +88,7 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
       setDialogOpen(false)
       setWorkspaceName("")
       // Navigate to the new workspace
-      router.push(
-        buildWorkspaceHref(newWorkspace.id, { preserveRelativePath: false })
-      )
+      router.push(getWorkspaceLandingPath(newWorkspace.id))
     } catch (error) {
       console.error("Failed to create workspace:", error)
     } finally {
@@ -103,6 +106,21 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
       .map((word) => word[0])
       .join("")
       .toUpperCase()
+  }
+
+  const handleSelectOrganization = (organizationId: string) => {
+    if (organizationId === activeOrganization?.id) {
+      return
+    }
+
+    Cookies.set("tracecat:active-org-id", organizationId, {
+      sameSite: "lax",
+      secure:
+        typeof window !== "undefined" && window.location.protocol === "https:",
+    })
+    // Hard navigation: switching orgs invalidates all org-scoped client state
+    // (React Query caches, providers), so re-bootstrap instead of router.push.
+    window.location.assign("/workspaces")
   }
 
   return (
@@ -134,7 +152,7 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
               <DropdownMenuItem key={workspace.id} asChild>
                 <Link
                   key={workspace.id}
-                  href={buildWorkspaceHref(workspace.id)}
+                  href={getWorkspaceLandingPath(workspace.id)}
                   className={cn(
                     "flex items-center gap-2 py-1 px-2",
                     workspace.id === workspaceId &&
@@ -151,7 +169,7 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
                 </Link>
               </DropdownMenuItem>
             ))}
-            {canCreateWorkspace === true && (
+            {canCreateAdditionalWorkspace && (
               <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
                 <DialogTrigger asChild>
                   <DropdownMenuItem
@@ -169,38 +187,35 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
                     </div>
                   </DropdownMenuItem>
                 </DialogTrigger>
-                <DialogContent className="sm:max-w-[425px]">
-                  <form onSubmit={handleCreateWorkspace}>
-                    <DialogHeader>
-                      <DialogTitle>Create a new workspace</DialogTitle>
-                      <DialogDescription>
-                        Workspaces are isolated environments where a team can
-                        work on cases, automations, and credentials.
-                      </DialogDescription>
-                    </DialogHeader>
-                    <div className="grid gap-4 py-4">
-                      <div className="grid gap-2">
-                        <Label htmlFor="workspace-name">Workspace name</Label>
-                        <Input
-                          id="workspace-name"
-                          value={workspaceName}
-                          onChange={(e) => setWorkspaceName(e.target.value)}
-                          placeholder="My workspace"
-                          disabled={isCreating}
-                        />
+                <DialogContent size="sm" className="sm:max-w-[425px]">
+                  <DialogHeader>
+                    <DialogTitle>Create a new workspace</DialogTitle>
+                    <DialogDescription>
+                      Workspaces are isolated environments where a team can work
+                      on cases, automations, and credentials.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <form
+                    onSubmit={handleCreateWorkspace}
+                    className="flex min-h-0 flex-1 flex-col"
+                  >
+                    <DialogBody>
+                      <div className="grid gap-4">
+                        <div className="grid gap-2">
+                          <Label htmlFor="workspace-name">Workspace name</Label>
+                          <Input
+                            id="workspace-name"
+                            value={workspaceName}
+                            onChange={(e) => setWorkspaceName(e.target.value)}
+                            placeholder="My workspace"
+                            disabled={isCreating}
+                          />
+                        </div>
                       </div>
-                    </div>
+                    </DialogBody>
                     <DialogFooter>
-                      <DialogClose asChild>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          disabled={isCreating}
-                        >
-                          Cancel
-                        </Button>
-                      </DialogClose>
                       <Button
+                        size="sm"
                         type="submit"
                         disabled={isCreating || !workspaceName.trim()}
                       >
@@ -212,11 +227,43 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
               </Dialog>
             )}
 
+            {showOrganizationSelector && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="text-xs font-medium text-muted-foreground">
+                  Organizations
+                </DropdownMenuLabel>
+                {organizations?.map((organization) => (
+                  <DropdownMenuItem
+                    key={organization.id}
+                    className={cn(
+                      "flex items-center gap-2 py-1 px-2",
+                      organization.id === activeOrganization?.id &&
+                        "bg-foreground/5 dark:bg-foreground/10"
+                    )}
+                    onSelect={() => handleSelectOrganization(organization.id)}
+                  >
+                    <div className="flex size-6 items-center justify-center rounded-md bg-muted text-[10px]">
+                      {getWorkspaceInitials(organization.name)}
+                    </div>
+                    <span className="flex-1">{organization.name}</span>
+                    {organization.id === activeOrganization?.id && (
+                      <CircleCheck className="ml-auto size-4" />
+                    )}
+                  </DropdownMenuItem>
+                ))}
+              </>
+            )}
+
             <DropdownMenuSeparator />
-            {canAdministerOrg && (
+            {(canAdministerOrg || canOpenScim) && (
               <DropdownMenuItem asChild>
                 <Link
-                  href="/organization"
+                  href={
+                    canAdministerOrg
+                      ? "/organization"
+                      : "/organization/settings/scim"
+                  }
                   className="flex items-center gap-2 py-1 px-2 cursor-default"
                 >
                   <div className="flex size-6 items-center justify-center">

@@ -30,6 +30,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -55,7 +56,6 @@ import {
 import { toast } from "@/components/ui/use-toast"
 import { useWorkspaceMcpPersonalAccessTokens } from "@/hooks/use-mcp-personal-access-tokens"
 import { getApiErrorDetail } from "@/lib/errors"
-import { useAppInfo } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
@@ -172,27 +172,6 @@ function tokenMatchesSearch(
     .some((value) => value.toLowerCase().includes(normalizedQuery))
 }
 
-function buildMcpUrl(publicAppUrl?: string): string {
-  if (publicAppUrl) {
-    return `${publicAppUrl.replace(/\/$/, "")}/mcp`
-  }
-  if (typeof window !== "undefined") {
-    return `${window.location.origin}/mcp`
-  }
-  return "https://<tracecat-app-url>/mcp"
-}
-
-function buildClaudeCommand(mcpUrl: string): string {
-  return [
-    `claude mcp add --transport http tracecat ${mcpUrl} \\`,
-    "  --header 'Authorization: Bearer ${TRACECAT_MCP_PAT}'",
-  ].join("\n")
-}
-
-function buildExportCommand(tokenValue: string): string {
-  return `export TRACECAT_MCP_PAT="${tokenValue}"`
-}
-
 function CreateTokenDialog({
   open,
   pending,
@@ -244,8 +223,8 @@ function CreateTokenDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <form onSubmit={handleSubmit} className="space-y-5">
+      <DialogContent size="md">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
           <DialogHeader>
             <DialogTitle>Create MCP token</DialogTitle>
             <DialogDescription>
@@ -253,63 +232,58 @@ function CreateTokenDialog({
               cannot use OIDC.
             </DialogDescription>
           </DialogHeader>
-
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="mcp-token-name">Name</Label>
-              <Input
-                id="mcp-token-name"
-                value={name}
-                onChange={(event) => setName(event.target.value)}
-                placeholder="Claude Code"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <Label>Expiration</Label>
-              <Select
-                value={expirationPreset}
-                onValueChange={(value) =>
-                  setExpirationPreset(value as ExpirationPreset)
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {EXPIRATION_PRESETS.map((preset) => (
-                    <SelectItem key={preset.value} value={preset.value}>
-                      {preset.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            {expirationPreset === "custom" ? (
+          <DialogBody>
+            <div className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="mcp-token-custom-expiration">
-                  Custom expiration
-                </Label>
+                <Label htmlFor="mcp-token-name">Name</Label>
                 <Input
-                  id="mcp-token-custom-expiration"
-                  type="datetime-local"
-                  value={customExpiration}
-                  onChange={(event) => setCustomExpiration(event.target.value)}
+                  id="mcp-token-name"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="Claude Code"
                 />
               </div>
-            ) : null}
-          </div>
 
+              <div className="space-y-2">
+                <Label>Expiration</Label>
+                <Select
+                  value={expirationPreset}
+                  onValueChange={(value) =>
+                    setExpirationPreset(value as ExpirationPreset)
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {EXPIRATION_PRESETS.map((preset) => (
+                      <SelectItem key={preset.value} value={preset.value}>
+                        {preset.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {expirationPreset === "custom" ? (
+                <div className="space-y-2">
+                  <Label htmlFor="mcp-token-custom-expiration">
+                    Custom expiration
+                  </Label>
+                  <Input
+                    id="mcp-token-custom-expiration"
+                    type="datetime-local"
+                    value={customExpiration}
+                    onChange={(event) =>
+                      setCustomExpiration(event.target.value)
+                    }
+                  />
+                </div>
+              ) : null}
+            </div>
+          </DialogBody>
           <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-            >
-              Cancel
-            </Button>
-            <Button type="submit" disabled={pending}>
+            <Button size="sm" type="submit" disabled={pending}>
               {pending ? "Creating..." : "Create token"}
             </Button>
           </DialogFooter>
@@ -321,84 +295,50 @@ function CreateTokenDialog({
 
 function IssuedTokenDialog({
   issuedCredential,
-  mcpUrl,
   onClose,
 }: {
   issuedCredential: MCPPersonalAccessTokenIssueResponse | null
-  mcpUrl: string
   onClose: () => void
 }) {
   const rawToken = issuedCredential?.issued_token.raw_token ?? ""
-  const tokenPreview = issuedCredential?.issued_token.token.preview ?? ""
-  const rawExportCommand = rawToken ? buildExportCommand(rawToken) : ""
-  const previewExportCommand = tokenPreview
-    ? buildExportCommand(tokenPreview)
-    : ""
-  const command = rawToken ? buildClaudeCommand(mcpUrl) : ""
 
   return (
     <Dialog
       open={issuedCredential !== null}
       onOpenChange={(open) => !open && onClose()}
     >
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-2xl overflow-hidden">
+      <DialogContent size="sm" className="w-[calc(100vw-2rem)] max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Set up an MCP PAT</DialogTitle>
+          <DialogTitle>MCP personal access token</DialogTitle>
           <DialogDescription>
-            The full token can only be copied now. Save it as a long-lived
-            secret for MCP clients that cannot use OAuth.
+            Copy your token now, it will not be shown again. See the{" "}
+            <a
+              href="https://docs.tracecat.com/automations/tracecat-mcp"
+              target="_blank"
+              rel="noreferrer"
+              className="underline underline-offset-2"
+            >
+              MCP docs
+            </a>{" "}
+            on connecting your client.
           </DialogDescription>
         </DialogHeader>
-
-        <div className="min-w-0 space-y-4">
-          <div className="min-w-0 space-y-2">
-            <Label>1. Export the token</Label>
-            <p className="text-xs text-muted-foreground">
-              Run this in the shell that launches your MCP client, or add it to
-              your shell profile, project env file, or env manager. The full
-              token can only be copied now and will not be shown again.
-            </p>
-            <div className="min-w-0 max-w-full rounded-md border bg-muted/30">
-              <div className="flex min-w-0 items-center justify-between gap-2 border-b px-3 py-2">
-                <div className="min-w-0 text-xs font-medium">
-                  Export command
-                </div>
-                <CopyButton
-                  value={rawExportCommand}
-                  toastMessage="MCP token export command copied."
-                  tooltipMessage="Copy export command"
-                />
-              </div>
-              <pre className="max-w-full overflow-x-auto p-3 text-xs leading-5">
-                <code className="block min-w-0">{previewExportCommand}</code>
-              </pre>
-            </div>
+        <DialogBody>
+          <div className="flex min-w-0 max-w-full items-center gap-3 rounded-lg bg-muted/60 px-4 py-3.5">
+            <code className="min-w-0 flex-1 truncate font-mono text-sm text-foreground/90 select-all">
+              {rawToken}
+            </code>
+            <CopyButton
+              value={rawToken}
+              toastMessage="MCP token copied."
+              tooltipMessage="Copy token"
+              className="size-6 shrink-0"
+              iconClassName="size-4 text-foreground/70"
+            />
           </div>
-
-          <div className="min-w-0 space-y-2">
-            <Label>2. Add Tracecat MCP</Label>
-            <p className="text-xs text-muted-foreground">
-              Run this after TRACECAT_MCP_PAT is available in the environment
-              used to start Claude Code.
-            </p>
-            <div className="min-w-0 max-w-full rounded-md border bg-muted/30">
-              <div className="flex min-w-0 items-center justify-between gap-2 border-b px-3 py-2">
-                <div className="min-w-0 text-xs font-medium">Setup command</div>
-                <CopyButton
-                  value={command}
-                  toastMessage="MCP setup command copied."
-                  tooltipMessage="Copy command"
-                />
-              </div>
-              <pre className="max-w-full overflow-x-auto p-3 text-xs leading-5">
-                <code className="block min-w-0">{command}</code>
-              </pre>
-            </div>
-          </div>
-        </div>
-
+        </DialogBody>
         <DialogFooter>
-          <Button type="button" onClick={onClose}>
+          <Button size="sm" type="button" onClick={onClose}>
             Done
           </Button>
         </DialogFooter>
@@ -494,8 +434,6 @@ export function WorkspaceMcpAccess() {
   const pathname = usePathname()
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { appInfo } = useAppInfo()
-  const mcpUrl = buildMcpUrl(appInfo?.public_app_url)
   const [createOpen, setCreateOpen] = useState(false)
   const [issuedCredential, setIssuedCredential] =
     useState<MCPPersonalAccessTokenIssueResponse | null>(null)
@@ -713,7 +651,6 @@ export function WorkspaceMcpAccess() {
       />
       <IssuedTokenDialog
         issuedCredential={issuedCredential}
-        mcpUrl={mcpUrl}
         onClose={() => setIssuedCredential(null)}
       />
       <AlertDialog

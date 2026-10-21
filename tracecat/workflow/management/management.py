@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import sqlalchemy as sa
 import yaml
@@ -12,14 +13,15 @@ from pydantic import ValidationError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import selectinload
 from temporalio import activity
-from temporalio.exceptions import ApplicationError
 
-from tracecat.audit.logger import audit_log
+from tracecat.agent.catalog.service import AgentCatalogService
+from tracecat.audit.logger import AuditEventDetails, audit_log
 from tracecat.authz.controls import require_scope
 from tracecat.contexts import ctx_logical_time
 from tracecat.db.models import (
     Action,
     CaseTrigger,
+    Form,
     Schedule,
     Webhook,
     Workflow,
@@ -33,16 +35,32 @@ from tracecat.dsl.common import (
     DSLInput,
     build_action_statements_from_actions,
     edge_components_from_dep,
+    expects_key_order,
 )
-from tracecat.dsl.schemas import DSLConfig, ExecutionContext, RunContext
+from tracecat.dsl.enums import PlatformAction
+from tracecat.dsl.schemas import (
+    DSLConfig,
+    ExecutionContext,
+    FixedActionResult,
+    RunContext,
+)
+from tracecat.dsl.validation import normalize_trigger_inputs
 from tracecat.dsl.view import RFGraph
-from tracecat.exceptions import TracecatValidationError
+from tracecat.exceptions import (
+    BuiltinRegistryHasNoSelectionError,
+    TracecatNotFoundError,
+    TracecatValidationError,
+    WorkflowAliasResolutionError,
+)
 from tracecat.expressions.eval import eval_templated_object
+from tracecat.forms.storage import delete_file_blobs, lock_forms_for_deletion
 from tracecat.identifiers import WorkflowID
 from tracecat.identifiers.workflow import (
     LEGACY_WF_ID_PATTERN,
     WF_ID_SHORT_PATTERN,
+    WorkflowExecutionID,
     WorkflowUUID,
+    exec_id_to_parts,
 )
 from tracecat.pagination import (
     BaseCursorPaginator,
@@ -50,16 +68,31 @@ from tracecat.pagination import (
     CursorPaginationParams,
 )
 from tracecat.registry.lock.service import RegistryLockService
+from tracecat.registry.lock.types import RegistryLock
+from tracecat.runtime.errors import (
+    RetryDisposition,
+    RuntimeErrorClassification,
+    RuntimeErrorKind,
+)
 from tracecat.service import BaseWorkspaceService
+from tracecat.temporal.errors import raise_application_error_from_classification
 from tracecat.validation.schemas import (
     DSLValidationResult,
     ValidationDetail,
     ValidationResult,
+    ValidationResultType,
 )
 from tracecat.validation.service import validate_dsl
 from tracecat.workflow.actions.schemas import ActionControlFlow, ActionEdge
 from tracecat.workflow.case_triggers.service import CaseTriggersService
-from tracecat.workflow.executions.enums import ExecutionType
+from tracecat.workflow.executions.enums import ExecutionType, TriggerType
+from tracecat.workflow.executions.rerun import (
+    WorkflowRerunPlan,
+    WorkflowRerunResponse,
+    invalid_requested_refs,
+    match_rerun_actions,
+)
+from tracecat.workflow.executions.schemas import WorkflowExecutionCreateResponse
 from tracecat.workflow.graph.service import WorkflowGraphService
 from tracecat.workflow.management.definitions import WorkflowDefinitionsService
 from tracecat.workflow.management.layout import (
@@ -85,10 +118,46 @@ from tracecat.workflow.schedules import bridge
 from tracecat.workflow.schedules.service import WorkflowSchedulesService
 
 
+class _ModelKey(NamedTuple):
+    """Stable cross-environment identity of a model selection.
+
+    ``catalog_id`` is a per-environment UUID; this ``(provider, name)`` pair is
+    what correlates the same model across environments. Used as the cache key
+    when re-mapping catalog ids on import.
+    """
+
+    provider: str
+    name: str
+
+
+@dataclass
+class WorkflowPublishResult:
+    """Outcome of publishing (committing) a workflow draft.
+
+    ``version`` is the newly committed definition version on success, or ``None``
+    when ``errors`` is non-empty. Callers render ``errors`` (correctable
+    validation problems) rather than treating publish failure as an exception.
+    """
+
+    version: int | None
+    errors: list[ValidationResult]
+
+    @property
+    def ok(self) -> bool:
+        return self.version is not None and not self.errors
+
+
 class WorkflowsManagementService(BaseWorkspaceService):
     """Manages CRUD operations for Workflows."""
 
     service_name = "workflows"
+
+    def _workflow_update_audit_details(
+        self, workflow_id: WorkflowID, params: WorkflowUpdate
+    ) -> AuditEventDetails:
+        return AuditEventDetails(
+            data={"changed_fields": sorted(params.model_fields_set)}
+        )
 
     @staticmethod
     def _workflow_fields_from_dsl(dsl: DSLInput) -> dict[str, Any]:
@@ -97,6 +166,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
             "title": dsl.title,
             "description": dsl.description,
             "expects": dsl.entrypoint.model_dump(mode="json").get("expects"),
+            "expects_order": expects_key_order(dsl.entrypoint.expects),
             "returns": dsl.returns,
             "config": dsl.config.model_dump(),
             "error_handler": dsl.error_handler,
@@ -547,7 +617,11 @@ class WorkflowsManagementService(BaseWorkspaceService):
         )
 
     async def get_workflow(
-        self, workflow_id: WorkflowID, *, for_update: bool = False
+        self,
+        workflow_id: WorkflowID,
+        *,
+        for_update: bool = False,
+        normalize: bool = True,
     ) -> Workflow | None:
         workflow_uuid = WorkflowUUID.new(workflow_id)
         statement = (
@@ -567,7 +641,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
             statement = statement.with_for_update()
         result = await self.session.execute(statement)
         workflow = result.scalar_one_or_none()
-        if workflow:
+        if workflow and normalize:
             commit = not for_update
             await self._ensure_workflow_system_resources(workflow, commit=commit)
             await self._reconcile_graph_object_with_actions(workflow, commit=commit)
@@ -720,23 +794,30 @@ class WorkflowsManagementService(BaseWorkspaceService):
         return WorkflowUUID.new(res) if res else None
 
     @require_scope("workflow:update")
+    @audit_log(
+        resource_type="workflow",
+        action="update",
+        attempt_metadata=_workflow_update_audit_details,
+    )
     async def update_workflow(
         self, workflow_id: WorkflowID, params: WorkflowUpdate
     ) -> Workflow:
         workflow_uuid = WorkflowUUID.new(workflow_id)
+        set_fields = params.model_dump(exclude_unset=True)
         statement = select(Workflow).where(
             Workflow.workspace_id == self.workspace_id,
             Workflow.id == workflow_uuid,
         )
         result = await self.session.execute(statement)
         workflow = result.scalar_one()
-        set_fields = params.model_dump(exclude_unset=True)
         if "object" in set_fields:
             graph = RFGraph.model_validate(set_fields["object"])
             normalized_graph = graph.normalize_action_ids()
             set_fields["object"] = normalized_graph.model_dump(
                 by_alias=True, mode="json"
             )
+        if "expects" in set_fields:
+            workflow.expects_order = expects_key_order(set_fields["expects"])
 
         for key, value in set_fields.items():
             # Safe because params has been validated
@@ -784,12 +865,19 @@ class WorkflowsManagementService(BaseWorkspaceService):
                     error=str(e),
                 )
 
+        # The cascade removes the form and its file rows. Their blobs are
+        # deleted after the commit, best effort.
+        form_file_keys = await lock_forms_for_deletion(
+            self.session, self.workspace_id, Form.workflow_id == workflow_uuid
+        )
+
         # Now delete the workflow (cascade will handle database schedule cleanup)
         await self.session.delete(workflow)
         await self.session.commit()
+        await delete_file_blobs(form_file_keys)
 
     @require_scope("workflow:create")
-    @audit_log(resource_type="workflow", action="create")
+    @audit_log(resource_type="workflow", action="create", resource_id_attr="id")
     async def create_workflow(self, params: WorkflowCreate) -> Workflow:
         """Create a new workflow."""
         now = datetime.now().strftime("%b %d, %Y, %H:%M:%S")
@@ -883,6 +971,105 @@ class WorkflowsManagementService(BaseWorkspaceService):
             await self.session.rollback()
             raise e
 
+    @require_scope("workflow:update")
+    @audit_log(
+        resource_type="workflow",
+        action="publish",
+    )
+    async def publish_workflow(self, workflow_id: WorkflowID) -> WorkflowPublishResult:
+        """Publish (commit) a workflow's current draft as a new versioned definition.
+
+        Validates the draft (structural + semantic), freezes a registry lock over
+        its actions, creates a new ``WorkflowDefinition``, and bumps the workflow's
+        version. Correctable validation problems are returned as
+        ``WorkflowPublishResult.errors`` (not raised) so every caller -- the MCP
+        publish tool, the public commit route, and the internal route -- can render
+        them in its own transport shape. Shared so the orchestration lives in one
+        place instead of being duplicated per caller.
+
+        Raises:
+            TracecatNotFoundError: If the workflow does not exist.
+        """
+
+        workflow = await self.get_workflow(workflow_id)
+        if workflow is None:
+            raise TracecatNotFoundError(f"Workflow {workflow_id} not found")
+
+        # Tier 1: build DSL from the current draft (structural validation).
+        try:
+            dsl = await self.build_dsl_from_workflow(workflow)
+        except TracecatValidationError as e:
+            return WorkflowPublishResult(
+                version=None,
+                errors=[
+                    ValidationResult.new(
+                        DSLValidationResult(status="error", msg=str(e), detail=e.detail)
+                    )
+                ],
+            )
+        except ValidationError as e:
+            return WorkflowPublishResult(
+                version=None,
+                errors=[
+                    ValidationResult.new(
+                        DSLValidationResult(
+                            status="error",
+                            msg=str(e),
+                            detail=ValidationDetail.list_from_pydantic(e),
+                        )
+                    )
+                ],
+            )
+
+        # Tier 2: semantic validation (secrets, args, references).
+        if val_errors := await validate_dsl(
+            session=self.session, dsl=dsl, role=self.role
+        ):
+            return WorkflowPublishResult(version=None, errors=list(val_errors))
+
+        # Phase 1: resolve a registry lock over the DSL's actions so the
+        # published definition is pinned to exact action versions.
+        lock_service = RegistryLockService(self.session, self.role)
+        action_names = {action.action for action in dsl.actions}
+        try:
+            registry_lock = await lock_service.resolve_lock_with_bindings(action_names)
+        except BuiltinRegistryHasNoSelectionError as e:
+            return WorkflowPublishResult(
+                version=None,
+                errors=[
+                    ValidationResult.new(
+                        type=ValidationResultType.DSL,
+                        status="error",
+                        msg=str(e),
+                        detail=[
+                            ValidationDetail(
+                                type="registry.builtin_sync_pending",
+                                msg=str(e),
+                                loc=("registry_lock",),
+                            )
+                        ],
+                    )
+                ],
+            )
+        workflow.registry_lock = registry_lock.model_dump()
+
+        # Phase 2/3: create the definition and bump the workflow version.
+        defn_service = WorkflowDefinitionsService(self.session, self.role)
+        defn = await defn_service.create_workflow_definition(
+            workflow_id,
+            dsl,
+            alias=workflow.alias,
+            registry_lock=registry_lock,
+            commit=False,
+        )
+        workflow.version = defn.version
+        self.session.add(workflow)
+        self.session.add(defn)
+        await self.session.commit()
+        await self.session.refresh(workflow)
+        await self.session.refresh(defn)
+        return WorkflowPublishResult(version=defn.version, errors=[])
+
     async def build_dsl_from_workflow(self, workflow: Workflow) -> DSLInput:
         """Build a DSLInput from a Workflow."""
 
@@ -897,14 +1084,304 @@ class WorkflowsManagementService(BaseWorkspaceService):
         return DSLInput(
             title=workflow.title,
             description=workflow.description,
-            entrypoint=DSLEntrypoint(expects=workflow.expects),
+            entrypoint=DSLEntrypoint(
+                expects=workflow.expects, expects_order=workflow.expects_order
+            ),
             actions=action_statements,
             config=DSLConfig(**workflow.config),
             returns=workflow.returns,
             error_handler=workflow.error_handler,
         )
 
+    async def locked_action_results(
+        self, workflow_id: WorkflowID, dsl: DSLInput
+    ) -> dict[str, FixedActionResult]:
+        """Results of the draft's locked actions, for a draft run to reuse.
+
+        A lock that can't be reused (its source run is gone, the action failed
+        there, or its type changed) is skipped, so that action runs fresh.
+        """
+        stmt = select(Action).where(
+            Action.workflow_id == WorkflowUUID.new(workflow_id),
+            Action.locked_execution_id.is_not(None),
+        )
+        locked = (await self.session.execute(stmt)).scalars().all()
+        refs_by_exec: dict[str, list[str]] = {}
+        for action in locked:
+            if action.locked_execution_id:
+                refs_by_exec.setdefault(action.locked_execution_id, []).append(
+                    action.ref
+                )
+        if not refs_by_exec:
+            return {}
+
+        from tracecat.workflow.executions.service import WorkflowExecutionsService
+
+        exec_service = await WorkflowExecutionsService.connect(role=self.role)
+        results: dict[str, FixedActionResult] = {}
+        for exec_id, refs in refs_by_exec.items():
+            try:
+                if exec_id_to_parts(exec_id)[0] != WorkflowUUID.new(workflow_id):
+                    raise ValueError("Locked run belongs to another workflow.")
+                source = await exec_service.get_rerun_source(exec_id)
+            except Exception as e:
+                self.logger.warning(
+                    "Skipping unusable action lock",
+                    execution_id=exec_id,
+                    error_type=type(e).__name__,
+                )
+                continue
+            match = match_rerun_actions(source, dsl, fixed_action_refs=refs)
+            results.update(match.fixed)
+        return results
+
+    @require_scope("workflow:execute")
+    async def run_workflow(
+        self,
+        workflow_id: WorkflowID,
+        *,
+        inputs: Any | None = None,
+        use_draft: bool = True,
+        version: int | None = None,
+    ) -> WorkflowExecutionCreateResponse:
+        """Run a workflow from its draft state or a published definition.
+
+        This is the single entry point shared by the internal run endpoint (used
+        by the chat SDK) and the MCP ``run_workflow`` tool.
+
+        Args:
+            workflow_id: Workflow UUID (short ``wf_...`` or full format).
+            inputs: Trigger inputs passed to the workflow.
+            use_draft: When ``True`` (default), build the DSL from the current
+                draft graph and run it without publishing. When ``False``, run a
+                published definition.
+            version: Published definition version to run. Only applies when
+                ``use_draft`` is ``False``; ``None`` runs the current published
+                version. Ignored when ``use_draft`` is ``True`` (a draft has no
+                version number).
+
+        Returns:
+            WorkflowExecutionCreateResponse with the workflow and execution IDs.
+
+        Raises:
+            TracecatNotFoundError: If the workflow, or the requested published
+                version, does not exist.
+            TracecatValidationError: If the draft has no actions or fails
+                validation, or if the trigger inputs do not match the
+                workflow's input schema.
+        """
+        wf_id = WorkflowUUID.new(workflow_id)
+        dsl, registry_lock, _ = await self._load_run_target(
+            wf_id, use_draft=use_draft, version=version
+        )
+        self._validate_trigger_inputs(dsl, inputs)
+
+        # Import here to avoid pulling the Temporal-client execution stack into
+        # the management import chain.
+        from tracecat.workflow.executions.service import WorkflowExecutionsService
+
+        exec_service = await WorkflowExecutionsService.connect(role=self.role)
+        if use_draft:
+            return await exec_service.create_draft_workflow_execution_wait_for_start(
+                dsl=dsl,
+                wf_id=wf_id,
+                payload=inputs,
+                trigger_type=TriggerType.MANUAL,
+                fixed_action_results=await self.locked_action_results(wf_id, dsl),
+            )
+        return await exec_service.create_workflow_execution_wait_for_start(
+            dsl=dsl,
+            wf_id=wf_id,
+            payload=inputs,
+            trigger_type=TriggerType.MANUAL,
+            registry_lock=registry_lock,
+        )
+
+    async def _load_run_target(
+        self, wf_id: WorkflowUUID, *, use_draft: bool, version: int | None
+    ) -> tuple[DSLInput, RegistryLock | None, int | None]:
+        """Load the draft or a published definition to run.
+
+        Returns the DSL, its registry lock, and the published version (None for drafts).
+        """
+        if use_draft:
+            workflow = await self.get_workflow(wf_id)
+            if workflow is None:
+                raise TracecatNotFoundError(f"Workflow {wf_id.short()} not found")
+            # Raises TracecatValidationError on an empty/invalid draft graph.
+            dsl = await self.build_dsl_from_workflow(workflow)
+            # Run the same tiered validator used at commit time so a broken draft
+            # returns a fixable error instead of failing mid-execution.
+            if val_errors := await validate_dsl(
+                session=self.session, dsl=dsl, role=self.role
+            ):
+                raise TracecatValidationError(
+                    f"Draft workflow validation failed with {len(val_errors)} "
+                    "error(s). Fix the draft or publish a working version first.",
+                    detail=[err.root.model_dump(mode="json") for err in val_errors],
+                )
+            # Draft executions resolve the registry lock dynamically.
+            return dsl, None, None
+        defn_service = WorkflowDefinitionsService(self.session, self.role)
+        defn = await defn_service.get_definition_by_workflow_id(wf_id, version=version)
+        if defn is None:
+            if version is not None:
+                raise TracecatNotFoundError(
+                    f"Workflow {wf_id.short()} has no published version {version}."
+                )
+            raise TracecatNotFoundError(
+                f"Workflow {wf_id.short()} has no published definition. "
+                "Publish the workflow before running a published version."
+            )
+        registry_lock = (
+            RegistryLock.model_validate(defn.registry_lock)
+            if defn.registry_lock
+            else None
+        )
+        return DSLInput(**defn.content), registry_lock, defn.version
+
+    @staticmethod
+    def _validate_trigger_inputs(dsl: DSLInput, inputs: Any | None) -> None:
+        """Validate trigger inputs against the entrypoint schema up front.
+
+        A bad payload returns a fixable error here instead of failing inside the
+        (async) workflow run. Dispatch does not re-check inputs against expects.
+        """
+        if expects := dsl.entrypoint.expects:
+            try:
+                normalize_trigger_inputs(
+                    expects,
+                    {} if inputs is None else inputs,
+                    model_name="TriggerInputsValidator",
+                )
+            except ValidationError as e:
+                raise TracecatValidationError(
+                    "Trigger inputs do not match the workflow's input schema.",
+                    detail=ValidationDetail.list_from_pydantic(e),
+                ) from e
+
+    async def rerun_workflow_execution(
+        self,
+        execution_id: WorkflowExecutionID,
+        *,
+        use_draft: bool = True,
+        version: int | None = None,
+        fixed_action_refs: list[str] | None = None,
+        rerun_from_ref: str | None = None,
+        dry_run: bool = False,
+    ) -> WorkflowRerunPlan | WorkflowRerunResponse:
+        """Rerun a past execution against the draft or a published version.
+
+        The new run reuses the source run's trigger inputs. Actions that
+        succeeded in the source run and exist in the target with the same ref
+        and action type reuse the stored result instead of running.
+
+        Args:
+            execution_id: The past execution to rerun.
+            use_draft: Rerun against the current draft. When ``False``, rerun
+                against a published version.
+            version: Published version when ``use_draft`` is ``False``.
+                ``None`` uses the current published version.
+            fixed_action_refs: Refs whose results to reuse. ``None`` reuses
+                every match; refs that cannot be reused are rejected.
+            rerun_from_ref: Run this action and everything downstream of it
+                fresh, even when their results could be reused.
+            dry_run: Return the match plan without starting a run.
+
+        Raises:
+            TracecatNotFoundError: If the execution, workflow, or version does
+                not exist.
+            TracecatValidationError: If the target fails validation, the source
+                inputs fail the target's input schema, or a requested ref
+                cannot be reused.
+        """
+        from tracecat.workflow.executions.service import (
+            WorkflowExecutionNotFoundError,
+            WorkflowExecutionsService,
+        )
+
+        try:
+            wf_id, _ = exec_id_to_parts(execution_id)
+        except ValueError as e:
+            raise TracecatValidationError(str(e)) from e
+        # Loads through workspace-scoped queries, so another workspace's run
+        # is rejected before its history is read.
+        dsl, registry_lock, resolved_version = await self._load_run_target(
+            WorkflowUUID.new(wf_id), use_draft=use_draft, version=version
+        )
+        wf_id = WorkflowUUID.new(wf_id)
+        exec_service = await WorkflowExecutionsService.connect(role=self.role)
+        try:
+            source = await exec_service.get_rerun_source(execution_id)
+        except WorkflowExecutionNotFoundError as e:
+            raise TracecatNotFoundError(str(e)) from e
+        try:
+            match = match_rerun_actions(
+                source,
+                dsl,
+                fixed_action_refs=fixed_action_refs,
+                rerun_from_ref=rerun_from_ref,
+            )
+        except ValueError as e:
+            raise TracecatValidationError(str(e)) from e
+        inputs_error: TracecatValidationError | None = None
+        try:
+            self._validate_trigger_inputs(dsl, source.trigger_inputs)
+        except TracecatValidationError as e:
+            inputs_error = e
+        plan = WorkflowRerunPlan(
+            source_execution_id=execution_id,
+            workflow_id=wf_id.short(),
+            use_draft=use_draft,
+            version=resolved_version,
+            actions=match.actions,
+            fixed_action_refs=list(match.fixed),
+            unmatched_refs=match.unmatched_refs,
+            inputs_error=str(inputs_error) if inputs_error else None,
+        )
+        if dry_run:
+            return plan
+        if invalid := invalid_requested_refs(match, fixed_action_refs):
+            raise TracecatValidationError(
+                "These actions have no reusable result in the source run for "
+                f"this target: {', '.join(invalid)}",
+                detail={"refs": invalid},
+            )
+        if inputs_error is not None:
+            raise inputs_error
+
+        if use_draft:
+            response = (
+                await exec_service.create_draft_workflow_execution_wait_for_start(
+                    dsl=dsl,
+                    wf_id=wf_id,
+                    payload=source.trigger_inputs,
+                    trigger_type=TriggerType.MANUAL,
+                    fixed_action_results=match.fixed,
+                )
+            )
+        else:
+            response = await exec_service.create_workflow_execution_wait_for_start(
+                dsl=dsl,
+                wf_id=wf_id,
+                payload=source.trigger_inputs,
+                trigger_type=TriggerType.MANUAL,
+                registry_lock=registry_lock,
+                fixed_action_results=match.fixed,
+            )
+        return WorkflowRerunResponse(
+            message=response["message"],
+            wf_id=WorkflowUUID.new(response["wf_id"]).short(),
+            wf_exec_id=response["wf_exec_id"],
+            plan=plan,
+        )
+
     @require_scope("workflow:update")
+    @audit_log(
+        resource_type="workflow",
+        action="update",
+        resource_id_attr="id",
+    )
     async def restore_workflow_definition(
         self, workflow: Workflow, definition: WorkflowDefinition
     ) -> Workflow:
@@ -975,8 +1452,8 @@ class WorkflowsManagementService(BaseWorkspaceService):
             if item["ref"] in ref_to_action_id
         ]
         graph_service = WorkflowGraphService(self.session, role=self.role)
-        await graph_service.apply_operations(
-            workflow_id=WorkflowUUID.new(workflow.id),
+        await graph_service.apply_operations_to_locked_workflow(
+            workflow,
             base_version=workflow.graph_version,
             operations=[
                 GraphOperation(
@@ -996,7 +1473,144 @@ class WorkflowsManagementService(BaseWorkspaceService):
         await self.session.refresh(workflow, ["actions", "webhook", "schedules"])
         return workflow
 
+    async def correlate_agent_catalog_ids(self, dsl: DSLInput) -> DSLInput:
+        """Re-map agent action model ``catalog_id``s to local catalog rows.
+
+        A model selection's ``catalog_id`` is a per-environment UUID, but the
+        ``(model_provider, model_name)`` tuple is stable across environments.
+        On import we look up the local catalog row for that tuple and rewrite
+        the ``catalog_id`` so the action resolves credentials here.
+
+        Covers both ``ai.agent`` and ``ai.action`` — both carry the same
+        ``AgentActionArgs`` model selection and pass ``catalog_id`` into
+        execution.
+
+        This is purely additive: when no local row matches, the stored
+        ``catalog_id`` is left untouched (the workflow still imports). Other
+        actions and selections without a ``catalog_id`` are skipped. When the
+        incoming ``catalog_id`` is already visible and enabled locally it is
+        kept as-is — a same-environment pull must not rewrite the user's
+        selected row to another enabled row that wins the tuple resolver.
+
+        Runs only on the import/sync boundaries (manual import and git-sync
+        pull) where a ``catalog_id`` may have come from another environment —
+        not on ordinary workflow saves, where the id is already local.
+        """
+        org_id = self.role.organization_id
+        if org_id is None:
+            return dsl
+
+        # Both action types carry the same ``AgentActionArgs`` model selection.
+        correlated_actions = (PlatformAction.AI_AGENT, PlatformAction.AI_ACTION)
+
+        # Cheap early-out: no DB work unless a correlated action exists.
+        if not any(act_stmt.action in correlated_actions for act_stmt in dsl.actions):
+            return dsl
+
+        catalog_svc = AgentCatalogService(session=self.session)
+        # Cache resolutions by (provider, name) — a synced workflow may have
+        # many agent actions on the same model; this avoids repeat DB queries.
+        # ``None`` results (no match / ambiguous) are cached too.
+        resolved: dict[_ModelKey, uuid.UUID | None] = {}
+        # Cache whether an incoming catalog_id is already enabled locally.
+        already_local: dict[str, bool] = {}
+        rewritten = False
+        new_actions = list(dsl.actions)
+        for idx, act_stmt in enumerate(dsl.actions):
+            if act_stmt.action not in correlated_actions:
+                continue
+
+            args = act_stmt.args
+            # Model selection arrives nested under ``model`` and/or as flat
+            # ``model_name`` / ``model_provider`` / ``catalog_id`` fields.
+            # ``AgentActionArgs`` merges nested over flat per-key, so a mixed
+            # shape (e.g. nested provider/name but a top-level ``catalog_id``)
+            # keeps the flat ``catalog_id``. Mirror that merge here: read each
+            # field from nested when present, else fall back to flat.
+            nested = args.get("model")
+            nested = nested if isinstance(nested, dict) else None
+            # Per-key merge of nested over flat, matching AgentActionArgs.
+            merged = {**args, **nested} if nested is not None else args
+
+            catalog_id = merged.get("catalog_id")
+            model_provider = merged.get("model_provider")
+            model_name = merged.get("model_name")
+            if not catalog_id or not model_provider or not model_name:
+                continue
+
+            # Preserve an already-local selection: if the incoming catalog_id is
+            # itself visible and enabled here, keep it. Otherwise a
+            # same-environment pull could rewrite the user's chosen row to a
+            # different enabled row (e.g. an org vs platform duplicate) that
+            # merely wins the (provider, name) tuple resolver's ordering.
+            catalog_id_str = str(catalog_id)
+            if catalog_id_str not in already_local:
+                try:
+                    parsed_id = uuid.UUID(catalog_id_str)
+                except (ValueError, TypeError):
+                    # Not a literal UUID (e.g. a template expression evaluated
+                    # at runtime): leave the selection untouched.
+                    already_local[catalog_id_str] = True
+                else:
+                    already_local[
+                        catalog_id_str
+                    ] = await catalog_svc.is_catalog_id_enabled(
+                        org_id=org_id,
+                        catalog_id=parsed_id,
+                        workspace_id=self.workspace_id,
+                    )
+            if already_local[catalog_id_str]:
+                continue
+
+            key = _ModelKey(provider=str(model_provider), name=str(model_name))
+            if key in resolved:
+                local_id = resolved[key]
+            else:
+                local_id = await catalog_svc.resolve_catalog_id_by_model(
+                    org_id=org_id,
+                    model_provider=key.provider,
+                    model_name=key.name,
+                    workspace_id=self.workspace_id,
+                )
+                resolved[key] = local_id
+            if local_id is None or str(local_id) == str(catalog_id):
+                continue
+
+            # Store the id as a string so it survives ``yaml.dump`` of the
+            # action inputs (a ``uuid.UUID`` object serializes to a Python
+            # object tag that ``yaml.safe_load`` rejects on export).
+            new_catalog_id = str(local_id)
+            new_args = dict(args)
+            # Always set the flat ``catalog_id`` and, when the nested block
+            # carries one, update it too. The runtime merges nested over flat
+            # per-key, so keeping both copies in sync means the effective id is
+            # correct whichever one wins.
+            new_args["catalog_id"] = new_catalog_id
+            if nested is not None and "catalog_id" in nested:
+                new_model = dict(nested)
+                new_model["catalog_id"] = new_catalog_id
+                new_args["model"] = new_model
+            new_actions[idx] = act_stmt.model_copy(update={"args": new_args})
+            rewritten = True
+            self.logger.info(
+                "Re-mapped agent catalog_id on import",
+                action_ref=act_stmt.ref,
+                model_provider=model_provider,
+                model_name=model_name,
+                old_catalog_id=str(catalog_id),
+                new_catalog_id=str(local_id),
+            )
+
+        if not rewritten:
+            return dsl
+        return dsl.model_copy(update={"actions": new_actions})
+
     @require_scope("workflow:create")
+    @audit_log(
+        resource_type="workflow",
+        action="create",
+        resource_id_attr="id",
+    )
     async def create_workflow_from_external_definition(
         self,
         import_data: dict[str, Any],
@@ -1015,6 +1629,10 @@ class WorkflowsManagementService(BaseWorkspaceService):
         # NOTE: We do not support adding invalid workflows
 
         dsl = external_defn.definition
+        # `ai.agent` model selections carry a per-environment ``catalog_id``.
+        # Best-effort re-map it to the equivalent local model so imported
+        # workflows resolve credentials in this environment.
+        dsl = await self.correlate_agent_catalog_ids(dsl)
         imported_trigger_position, imported_viewport, imported_action_positions = (
             external_defn.extract_layout_positions()
         )
@@ -1047,6 +1665,25 @@ class WorkflowsManagementService(BaseWorkspaceService):
         if external_defn.case_trigger is not None and (
             external_defn.case_trigger.is_configured()
         ):
+            if external_defn.case_trigger.status == "online":
+                defn_service = WorkflowDefinitionsService(
+                    session=self.session, role=self.role
+                )
+                defn = await defn_service.create_initial_workflow_definition(
+                    WorkflowUUID.new(workflow.id),
+                    dsl,
+                    alias=workflow.alias,
+                    registry_lock=(
+                        RegistryLock.model_validate(workflow.registry_lock)
+                        if workflow.registry_lock
+                        else None
+                    ),
+                    commit=False,
+                )
+                workflow.version = defn.version
+                self.session.add(workflow)
+                await self.session.flush()
+
             case_trigger_service = CaseTriggersService(self.session, role=self.role)
             await case_trigger_service.upsert_case_trigger(
                 WorkflowUUID.new(workflow.id),
@@ -1055,6 +1692,8 @@ class WorkflowsManagementService(BaseWorkspaceService):
                 commit=False,
             )
             await self.session.commit()
+            # Keep server-generated fields loaded for response serialization.
+            await self.session.refresh(workflow)
         return workflow
 
     @require_scope("workflow:create")
@@ -1156,7 +1795,10 @@ class WorkflowsManagementService(BaseWorkspaceService):
                 start_delay=act_stmt.start_delay,
                 wait_until=act_stmt.wait_until,
                 join_strategy=act_stmt.join_strategy,
+                environment=act_stmt.environment,
+                tunnel=act_stmt.tunnel,
                 mask_output=act_stmt.mask_output,
+                unsafe_disable_secret_error_withholding=act_stmt.unsafe_disable_secret_error_withholding,
             )
             pos = (action_positions or {}).get(act_stmt.ref)
             new_action = Action(
@@ -1280,9 +1922,14 @@ class WorkflowsManagementService(BaseWorkspaceService):
                     id_or_alias, use_committed=use_committed
                 )
             if not handler_wf_id:
-                raise ApplicationError(
-                    f"Couldn't find matching workflow for alias {id_or_alias!r}",
-                    non_retryable=True,
-                    type="WorkflowAliasResolutionError",
+                error = WorkflowAliasResolutionError(
+                    "The configured workflow alias does not resolve"
                 )
+                classification = RuntimeErrorClassification.user(
+                    kind=RuntimeErrorKind.WORKFLOW_DEFINITION_NOT_FOUND,
+                    message="The configured error handler workflow could not be found",
+                    retry_disposition=RetryDisposition.NON_RETRYABLE,
+                    cause=error,
+                )
+                raise_application_error_from_classification(classification)
         return handler_wf_id

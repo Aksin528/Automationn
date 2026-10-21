@@ -2,42 +2,57 @@
 title: "Getting started"
 ---
 
+import FirstSuperadmin from "/snippets/first-superadmin.mdx";
 import McpInstallation from "/snippets/mcp-installation.mdx";
-import McpInstallationSelfHosted from "/snippets/mcp-installation-self-hosted.mdx";
 
-Self-host your own instance or join Tracecat Community Cloud.
-The easiest way to get started is to connect your agent harness (Claude Code, Cursor, OpenAI Codex) to Tracecat.
-
-## Self-host
-
-Docker Compose is the easiest way to self-host.
-Check out the full guide [here](/self-hosting/docker-compose) or follow the quickstart below.
-
-```bash
-# Setup environment variables and secrets
-curl -o env.sh https://raw.githubusercontent.com/TracecatHQ/tracecat/1.0.0-beta.48/env.sh
-curl -o .env.example https://raw.githubusercontent.com/TracecatHQ/tracecat/1.0.0-beta.48/.env.example
-chmod +x env.sh && ./env.sh
-
-# Download Caddyfile
-curl -o Caddyfile https://raw.githubusercontent.com/TracecatHQ/tracecat/1.0.0-beta.48/Caddyfile
-
-# Download Docker Compose file
-curl -o docker-compose.yml https://raw.githubusercontent.com/TracecatHQ/tracecat/1.0.0-beta.48/docker-compose.yml
-
-# Start Tracecat
-docker compose up -d
-```
+The recommended way to get started is to connect your coding agent — Claude Code, OpenAI Codex, GitHub Copilot, or Cursor — to the Tracecat MCP server.
+This works with Tracecat Cloud or your own self-hosted instance.
 
 ## Connect MCP
-
-<McpInstallationSelfHosted />
-
-## Cloud
-
-<Badge icon="credit-card" color="blue" size="lg" shape="pill">Subscription required</Badge>
 
 Connecting your agent to Tracecat Cloud automatically creates an account for you.
 You can also sign up manually via [https://platform.tracecat.com](https://platform.tracecat.com).
 
 <McpInstallation />
+
+## Self-host
+
+Choose a deployment method:
+
+- [Docker Compose](/self-hosting/docker-compose): Run every service on a single host. This is the fastest way to self-host.
+- [AWS ECS Fargate](/self-hosting/aws-fargate): Deploy to your own AWS account with Terraform.
+- [Kubernetes](/self-hosting/kubernetes): Install the Helm chart on EKS, GKE, or any conformant cluster.
+- [Air-gapped deployment](/self-hosting/air-gapped): Run on Kubernetes with no runtime internet access.
+
+See [Architecture](/self-hosting/architecture) for how the services fit together.
+
+### Docker Compose quickstart
+
+Follow the full [Docker Compose guide](/self-hosting/docker-compose) or run the commands below.
+
+```bash
+# Setup environment variables and secrets
+curl -o env.sh https://raw.githubusercontent.com/TracecatHQ/tracecat/1.2.1/env.sh
+curl -o .env.example https://raw.githubusercontent.com/TracecatHQ/tracecat/1.2.1/.env.example
+chmod +x env.sh && ./env.sh
+
+# Download Caddyfile
+curl -o Caddyfile https://raw.githubusercontent.com/TracecatHQ/tracecat/1.2.1/Caddyfile
+
+# Download Docker Compose file
+curl -o docker-compose.yml https://raw.githubusercontent.com/TracecatHQ/tracecat/1.2.1/docker-compose.yml
+
+# Start Tracecat
+docker compose up -d
+```
+
+### First login
+
+<FirstSuperadmin />
+
+## Next steps
+
+- See [Environment variables](/self-hosting/environment-variables) to configure your deployment.
+- See [TLS and certificates](/self-hosting/tls) to serve Tracecat over HTTPS.
+- See [User management](/manage-platform/users) to invite your team.
+- See [SAML SSO](/authentication/saml) or [OIDC](/authentication/oidc) to sign in through your identity provider.

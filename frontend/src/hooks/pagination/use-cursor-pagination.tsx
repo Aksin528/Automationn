@@ -1,8 +1,8 @@
 "use client"
 
-import { useQuery } from "@tanstack/react-query"
 import { useCallback, useState } from "react"
 import type { ApiError } from "@/client"
+import { type Query, useQuery } from "@/lib/query"
 
 export interface CursorPaginationResponse<T> {
   items: T[]
@@ -39,8 +39,44 @@ export interface UseCursorPaginationOptions<
   enabled?: boolean
   staleTime?: number
   refetchOnWindowFocus?: boolean
-  refetchInterval?: number | false
+  refetchInterval?:
+    | number
+    | false
+    | ((query: Query<CursorPaginationResponse<T>, ApiError>) => number | false)
   refetchIntervalInBackground?: boolean
+  retry?:
+    | boolean
+    | number
+    | ((failureCount: number, error: ApiError) => boolean)
+  placeholderData?: (
+    previousData: CursorPaginationResponse<T> | undefined,
+    previousQuery: Query<CursorPaginationResponse<T>, ApiError> | undefined
+  ) => CursorPaginationResponse<T> | undefined
+}
+
+/**
+ * A `placeholderData` that keeps the previous page on screen while the next
+ * one loads (a new search, sort, page or page size), but only while the query
+ * key still starts with `identity`. A request for something else, such as
+ * another table, starts empty instead of showing rows that are not its own.
+ *
+ * Call it per render rather than hoisting the result: React Query reuses the
+ * rows on screen without asking again while the function's identity is
+ * unchanged, which would carry them across a change of `identity`.
+ */
+export function keepPreviousPageFor<T>(
+  identity: readonly (string | number | null)[]
+): NonNullable<
+  UseCursorPaginationOptions<T, CursorPaginationParams>["placeholderData"]
+> {
+  return (previousData, previousQuery) => {
+    const previousKey = previousQuery?.queryKey
+    if (!previousKey) return undefined
+    const isSameIdentity = identity.every(
+      (part, index) => previousKey[index] === part
+    )
+    return isSameIdentity ? previousData : undefined
+  }
 }
 
 export interface CursorPaginationState {
@@ -66,6 +102,8 @@ export function useCursorPagination<T, P extends CursorPaginationParams>({
   refetchOnWindowFocus,
   refetchInterval,
   refetchIntervalInBackground,
+  retry,
+  placeholderData,
 }: UseCursorPaginationOptions<T, P>) {
   const [paginationState, setPaginationState] = useState<CursorPaginationState>(
     DEFAULT_PAGINATION_STATE
@@ -96,7 +134,7 @@ export function useCursorPagination<T, P extends CursorPaginationParams>({
     ...(additionalParams || {}),
   } as P
 
-  const { data, isLoading, error, refetch } = useQuery<
+  const { data, isLoading, isPlaceholderData, error, refetch } = useQuery<
     CursorPaginationResponse<T>,
     ApiError
   >({
@@ -113,10 +151,15 @@ export function useCursorPagination<T, P extends CursorPaginationParams>({
     refetchOnWindowFocus,
     refetchInterval,
     refetchIntervalInBackground,
+    // An explicit `undefined` would override the provider's default, which
+    // skips retries on 4xx.
+    ...(retry !== undefined && { retry }),
+    placeholderData,
   })
 
   const goToNextPage = () => {
-    if (!data?.next_cursor) return
+    // Placeholder data is another request's page: its cursor is not ours.
+    if (isPlaceholderData || !data?.next_cursor) return
 
     setPaginationState((prev) => ({
       currentCursor: data.next_cursor || null,
@@ -160,6 +203,12 @@ export function useCursorPagination<T, P extends CursorPaginationParams>({
     // Data
     data: data?.items || [],
     isLoading,
+    /**
+     * Whether `data` is the previous request's page, standing in while this
+     * one loads. Only ever true for callers that pass `placeholderData`. Its
+     * `hasNextPage` and cursors describe that previous request.
+     */
+    isPlaceholderData,
     error,
     refetch,
 

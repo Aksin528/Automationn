@@ -1,10 +1,12 @@
 import { type NextRequest, NextResponse } from "next/server"
+import { getAuthErrorCodeFromBody, getAuthErrorPath } from "@/lib/auth-error"
 import { getPostAuthDecisionPath } from "@/lib/auth-redirect"
 import {
   decodeAndSanitizeReturnUrl,
   POST_AUTH_RETURN_URL_COOKIE_NAME,
   serializeClearPostAuthReturnUrlCookie,
 } from "@/lib/auth-return-url"
+import { forwardClientAttributionHeaders } from "@/lib/forwarded-request-headers"
 import { buildUrl } from "@/lib/ss-utils"
 
 /**
@@ -19,20 +21,28 @@ export const GET = async (request: NextRequest) => {
     request.cookies.get(POST_AUTH_RETURN_URL_COOKIE_NAME)?.value
   )
 
+  const headers = new Headers()
   const incomingCookie = request.headers.get("cookie")
+  if (incomingCookie) {
+    headers.set("cookie", incomingCookie)
+  }
+  forwardClientAttributionHeaders(request.headers, headers)
+
   const response = await fetch(url.toString(), {
-    headers: incomingCookie ? { cookie: incomingCookie } : undefined,
+    headers,
     cache: "no-store",
   })
   const setCookieHeader = response.headers.get("set-cookie")
 
   if (!response.ok) {
+    const body = await response.text()
     console.error(
-      `OAuth callback failed with status ${response.status}: ${await response.text()}`
+      `OAuth callback failed with status ${response.status}: ${body}`
     )
     const resp = await fetch(buildUrl("/info"))
     const { public_app_url } = await resp.json()
-    return NextResponse.redirect(new URL("/auth/error", public_app_url))
+    const errorPath = getAuthErrorPath(getAuthErrorCodeFromBody(body))
+    return NextResponse.redirect(new URL(errorPath, public_app_url))
   }
 
   // Get redirect

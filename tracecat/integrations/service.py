@@ -1,47 +1,88 @@
 """Service for managing user integrations with external services."""
 
+import asyncio
+import random
 import re
 import secrets
 import uuid
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
 import httpx
 import orjson
 import sqlalchemy as sa
+from authlib.integrations.base_client.errors import OAuthError
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from authlib.oauth2.rfc7636 import create_s256_code_challenge
 from pydantic import SecretStr
 from slugify import slugify
 from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy.exc import DBAPIError
+from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import TerminatedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from tracecat import config
+from tracecat.agent.common.types import MCPHttpServerConfig
+from tracecat.agent.mcp.stdio_probe_types import (
+    MCP_STDIO_PROBE_TIMEOUT_CAP,
+    StdioMCPProbeResult,
+    StdioMCPProbeWorkflowInput,
+    build_stdio_mcp_probe_workflow_id,
+    sanitize_stdio_probe_error,
+)
+from tracecat.agent.mcp.utils import is_tracecat_registry_server_name
+from tracecat.agent.workflows.mcp_probe import StdioMCPProbeWorkflow
 from tracecat.auth.secrets import get_db_encryption_key
-from tracecat.authz.controls import require_scope
-from tracecat.db.engine import get_async_session_bypass_rls_context_manager
+from tracecat.authz.controls import has_scope, require_scope
+from tracecat.contexts import ctx_role
+from tracecat.db.engine import (
+    get_async_session_bypass_rls_context_manager,
+    get_async_session_context_manager,
+)
 from tracecat.db.models import (
     AgentPreset,
+    AgentPresetVersionSkill,
     AgentSession,
     MCPIntegration,
     OAuthIntegration,
     OAuthStateDB,
+    Skill,
+    SkillVersionMcpTool,
     WorkspaceOAuthProvider,
 )
+from tracecat.dsl.client import get_temporal_client
+from tracecat.exceptions import TracecatValidationError
 from tracecat.identifiers import UserID
 from tracecat.integrations.catalog.loader import (
     get_platform_mcp_catalog_entries,
     get_platform_mcp_catalog_entry_by_provider_id,
     get_platform_mcp_catalog_entry_by_slug,
 )
+from tracecat.integrations.catalog.resolver import (
+    CatalogConnectionError,
+    ResolvedCatalogConnection,
+    catalog_binding_is_current,
+    connect_options,
+    resolve_available_catalog_entry,
+    resolve_catalog_connection,
+)
 from tracecat.integrations.catalog.types import PlatformMCPCatalogEntry
-from tracecat.integrations.enums import MCPAuthType, OAuthGrantType
+from tracecat.integrations.enums import (
+    IntegrationStatus,
+    MCPAuthType,
+    OAuthGrantType,
+)
 from tracecat.integrations.mcp_validation import (
     ALLOWED_MCP_COMMANDS,
     MAX_SERVER_NAME_LENGTH,
+    MCPConfigurationError,
+    MCPConnectionVerificationError,
     MCPValidationError,
     validate_mcp_command_config,
 )
@@ -52,6 +93,8 @@ from tracecat.integrations.providers.base import (
     ClientCredentialsOAuthProvider,
     CustomOAuthProviderMixin,
     MCPAuthProvider,
+    build_dcr_payload,
+    mcp_requested_scopes,
     oauth_authorization_server_metadata_urls,
     validate_oauth_endpoint,
     validate_oauth_endpoint_resolves_public_async,
@@ -61,16 +104,26 @@ from tracecat.integrations.schemas import (
     IntegrationOAuthConnect,
     MCPConnectionSpec,
     MCPHttpIntegrationCreate,
+    MCPHttpIntegrationTestConnectionRequest,
     MCPHTTPOAuth2ConnectionSpec,
     MCPIntegrationCreate,
     MCPIntegrationSource,
+    MCPIntegrationTestConnectionRequest,
+    MCPIntegrationTestConnectionResponse,
     MCPIntegrationUpdate,
     MCPStdioIntegrationCreate,
+    MCPStdioIntegrationTestConnectionRequest,
+    MCPToolPolicyUpdate,
+    MCPToolSummary,
+    MCPVerificationStatusRead,
+    OAuthTokenState,
     PlatformMCPCatalogState,
     ProviderConfig,
     ProviderKey,
     ProviderMetadata,
     ProviderScopes,
+    credential_reauth_required,
+    validate_url_credential_values,
 )
 from tracecat.integrations.types import (
     DCRResponse,
@@ -78,9 +131,17 @@ from tracecat.integrations.types import (
     OAuthServerMetadata,
     TokenResponse,
 )
+from tracecat.sanitization import sanitize_urls_in_text
 from tracecat.secrets.encryption import decrypt_value, encrypt_value, is_set
 from tracecat.service import BaseWorkspaceService
-from tracecat.tiers.enums import Entitlement
+
+MCP_TEST_CONNECTION_TIMEOUT_CAP = 15
+"""Maximum seconds an MCP connection verification may take."""
+
+OAUTH_REFRESH_LOCK_NOT_AVAILABLE = "55P03"
+OAUTH_REFRESH_RETRY_TIMEOUT_SECONDS = 10.0
+OAUTH_REFRESH_RETRY_MIN_SECONDS = 0.025
+OAUTH_REFRESH_RETRY_MAX_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -89,6 +150,10 @@ class PlatformMCPCatalogConnectResult:
 
     mcp_integration: MCPIntegration | None = None
     oauth_connect: IntegrationOAuthConnect | None = None
+    # True when this request created the MCP row. A failed connect-time
+    # verification may delete the row only in that case; pre-existing rows
+    # returned by idempotent connects must survive transient failures.
+    created: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,12 +164,24 @@ class MCPIntegrationWithState:
     state: PlatformMCPCatalogState
 
 
+@dataclass(frozen=True)
+class MCPOAuthConnectionState:
+    """OAuth credential fields needed to derive an MCP connection state."""
+
+    token_state: OAuthTokenState
+    grant_type: OAuthGrantType
+
+
 class InsecureOAuthEndpointError(ValueError):
     """Raised when OAuth endpoints are not secured with HTTPS."""
 
 
 class ProviderConfigurationRequiredError(ValueError):
     """Raised when an OAuth provider must be configured before connection."""
+
+
+class OAuthRefreshBusyError(RuntimeError):
+    """Raised when an OAuth integration stays locked past the retry deadline."""
 
 
 @dataclass(frozen=True)
@@ -116,6 +193,7 @@ class MCPOAuthDiscoveryEndpoints:
     token_methods: list[str]
     registration_endpoint: str | None
     resource: str
+    scopes_supported: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -125,6 +203,8 @@ class MCPOAuthRegistrationResult:
     client_id: str
     client_secret: str | None
     auth_method: str | None
+    # RFC 7591 scope echo (AS-registered whitelist); None = no echo / not from DCR.
+    registered_scopes: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,12 +215,34 @@ class MCPOAuthCallbackState:
     token_auth_method: str | None
 
 
+class _AuthorizeUrlKwargs(TypedDict, total=False):
+    scope: str
+
+
 _CUSTOM_MCP_OAUTH_PROVIDER_PREFIX = "custom_mcp_"
 _MCP_TOKEN_AUTH_METHODS: frozenset[str] = frozenset(
     {"client_secret_basic", "client_secret_post", "none"}
 )
 _CATALOG_PLACEHOLDER_RE = re.compile(
     r"(\{[A-Za-z_][A-Za-z0-9_]*\}|<[A-Za-z_][A-Za-z0-9_-]*>)"
+)
+# Authorize-request parameters the service owns; catalog-pinned extras
+# (``oauth_authorize_params``) may never override them.
+_RESERVED_MCP_AUTHORIZE_PARAMS: frozenset[str] = frozenset(
+    {
+        "client_id",
+        "redirect_uri",
+        "response_type",
+        "state",
+        "scope",
+        "resource",
+        "code_challenge",
+        "code_challenge_method",
+        # Named parameters of authlib's create_authorization_url(); a pinned
+        # code_verifier would replace the S256 challenge computed here.
+        "code_verifier",
+        "url",
+    }
 )
 
 
@@ -182,7 +284,7 @@ class IntegrationService(BaseWorkspaceService):
         return normalized
 
     @staticmethod
-    def _validate_stdio_server_config(
+    def validate_stdio_server_config(
         *,
         command: str | None,
         args: list[str] | None = None,
@@ -200,6 +302,106 @@ class IntegrationService(BaseWorkspaceService):
             )
         except MCPValidationError as exc:
             raise ValueError(str(exc)) from exc
+
+    @staticmethod
+    def _normalize_stdio_command(command: str | None) -> str | None:
+        """Return the stored form of a stdio command for equality checks."""
+        if command is None:
+            return None
+        stripped = command.strip()
+        return stripped or None
+
+    @staticmethod
+    def _normalize_stdio_args(args: Sequence[str] | None) -> list[str]:
+        """Return the stored-equivalent form of stdio args."""
+        return list(args or [])
+
+    @staticmethod
+    def _normalize_mcp_timeout(timeout: int | None) -> int:
+        """Return the effective MCP timeout; stored null means the UI default."""
+        return timeout or 30
+
+    @classmethod
+    def _stdio_connection_values_changed(
+        cls,
+        *,
+        existing: MCPIntegration,
+        target_command: str | None,
+        target_args: Sequence[str] | None,
+        target_timeout: int | None,
+        stdio_env_was_provided: bool,
+    ) -> bool:
+        """Whether the persisted stdio process configuration would change."""
+        if stdio_env_was_provided:
+            return True
+        return (
+            cls._normalize_stdio_command(existing.stdio_command)
+            != cls._normalize_stdio_command(target_command)
+            or cls._normalize_stdio_args(existing.stdio_args)
+            != cls._normalize_stdio_args(target_args)
+            or cls._normalize_mcp_timeout(existing.timeout)
+            != cls._normalize_mcp_timeout(target_timeout)
+        )
+
+    @staticmethod
+    def _exception_chain_contains(
+        exc: BaseException, target_type: type[BaseException]
+    ) -> bool:
+        """Return whether ``exc`` or a nested Temporal cause has ``target_type``."""
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            if isinstance(current, target_type):
+                return True
+            seen.add(id(current))
+            next_exc = getattr(current, "cause", None) or current.__cause__
+            current = next_exc if isinstance(next_exc, BaseException) else None
+        return False
+
+    @staticmethod
+    def _merge_mcp_tool_summaries(
+        discovered_tools: Sequence[MCPToolSummary],
+        stored_tools: list[dict[str, Any]] | None,
+        *,
+        mcp_integration_id: object | None = None,
+    ) -> list[MCPToolSummary]:
+        """Merge fresh discovery into stored tool policy.
+
+        Discovery owns the tool name, description, and availability status.
+        Stored rows own user policy fields (enabled and requires_approval).
+        Tools that disappeared remain in the snapshot as disabled-by-status
+        entries so the UI can show what changed without silently losing policy.
+        """
+        stored = (
+            MCPToolSummary.validate_stored(
+                stored_tools, mcp_integration_id=mcp_integration_id
+            )
+            or []
+        )
+        stored_by_name = {tool.name: tool for tool in stored}
+        merged: list[MCPToolSummary] = []
+        discovered_names: set[str] = set()
+
+        for discovered in discovered_tools:
+            previous = stored_by_name.get(discovered.name)
+            merged.append(
+                MCPToolSummary(
+                    name=discovered.name,
+                    description=discovered.description,
+                    enabled=previous.enabled if previous is not None else True,
+                    requires_approval=previous.requires_approval
+                    if previous is not None
+                    else False,
+                    status="available",
+                )
+            )
+            discovered_names.add(discovered.name)
+
+        for previous in stored:
+            if previous.name not in discovered_names:
+                merged.append(previous.model_copy(update={"status": "missing"}))
+
+        return merged
 
     async def _provider_identifier_taken(
         self, provider_id: str, grant_type: OAuthGrantType
@@ -567,6 +769,52 @@ class IntegrationService(BaseWorkspaceService):
         urls.append(f"{base_url}/.well-known/oauth-authorization-server")
         return urls
 
+    @classmethod
+    def _catalog_pinned_oauth_endpoints(
+        cls,
+        catalog_spec: MCPConnectionSpec,
+        *,
+        server_uri: str,
+        oauth_resource: str | None,
+        allowed_endpoint_hosts: frozenset[str],
+    ) -> MCPOAuthDiscoveryEndpoints | None:
+        """Use a catalog row's pinned OAuth endpoints instead of discovery.
+
+        Rows pin endpoints precisely when the MCP server does not advertise
+        usable RFC 8414 metadata, so discovery would fail. DCR is unavailable
+        on this path; such rows supply OAuth client credentials.
+
+        Pinned endpoints belong to the vendor deployment at the row's own
+        ``server_uri``. A row that also lets the user supply the URI (a
+        self-hosted or regional deployment) falls back to discovery from the
+        user's host as soon as that URI differs from the row's default.
+        Templated row URIs carry no default and keep their pins.
+        """
+        if not isinstance(catalog_spec, MCPHTTPOAuth2ConnectionSpec):
+            return None
+        authorization_endpoint = catalog_spec.oauth_authorization_endpoint
+        token_endpoint = catalog_spec.oauth_token_endpoint
+        if not authorization_endpoint or not token_endpoint:
+            return None
+        default_uri = catalog_spec.server_uri
+        if (
+            default_uri
+            and not _CATALOG_PLACEHOLDER_RE.search(default_uri)
+            and server_uri != default_uri
+        ):
+            return None
+        return MCPOAuthDiscoveryEndpoints(
+            authorization_endpoint=cls._validate_mcp_oauth_endpoint(
+                authorization_endpoint, allowed_hosts=allowed_endpoint_hosts
+            ),
+            token_endpoint=cls._validate_mcp_oauth_endpoint(
+                token_endpoint, allowed_hosts=allowed_endpoint_hosts
+            ),
+            token_methods=[],
+            registration_endpoint=None,
+            resource=cls._mcp_resource_uri(oauth_resource or server_uri),
+        )
+
     @staticmethod
     def _validate_mcp_oauth_endpoint(
         endpoint: str,
@@ -737,9 +985,10 @@ class IntegrationService(BaseWorkspaceService):
         self,
         *,
         server_uri: str,
+        oauth_resource: str | None = None,
         allowed_endpoint_hosts: frozenset[str] = frozenset(),
     ) -> MCPOAuthDiscoveryEndpoints:
-        resource_uri = self._mcp_resource_uri(server_uri)
+        resource_uri = self._mcp_resource_uri(oauth_resource or server_uri)
         resource_host = urlparse(resource_uri).hostname
         if resource_host is None:
             raise ValueError("MCP server URI is missing a hostname")
@@ -757,7 +1006,7 @@ class IntegrationService(BaseWorkspaceService):
                 continue
             # Metadata may override the canonical resource identifier we send as
             # the OAuth `resource` parameter; re-validate it before trusting it.
-            if metadata.resource:
+            if metadata.resource and oauth_resource is None:
                 resource_uri = self._mcp_resource_uri(metadata.resource)
             if metadata.is_complete:
                 direct_metadata = metadata
@@ -807,6 +1056,7 @@ class IntegrationService(BaseWorkspaceService):
             if registration_endpoint
             else None,
             resource=resource_uri,
+            scopes_supported=direct_metadata.scopes_supported,
         )
 
     async def _resolve_mcp_oauth_endpoints(
@@ -814,6 +1064,7 @@ class IntegrationService(BaseWorkspaceService):
         *,
         server_uri: str,
         provider_config: ProviderConfig,
+        oauth_resource: str | None = None,
     ) -> MCPOAuthDiscoveryEndpoints:
         """Resolve OAuth endpoints for a custom MCP provider.
 
@@ -839,7 +1090,12 @@ class IntegrationService(BaseWorkspaceService):
                 # safe here.
                 token_methods=[],
                 registration_endpoint=None,
-                resource=self._mcp_resource_uri(server_uri),
+                resource=self._mcp_resource_uri(oauth_resource or server_uri),
+            )
+        if oauth_resource is not None:
+            return await self._discover_mcp_oauth_endpoints(
+                server_uri=server_uri,
+                oauth_resource=oauth_resource,
             )
         return await self._discover_mcp_oauth_endpoints(server_uri=server_uri)
 
@@ -849,15 +1105,14 @@ class IntegrationService(BaseWorkspaceService):
         registration_endpoint: str,
         client_name: str,
         token_auth_method: str | None,
+        requested_scopes: list[str],
     ) -> MCPOAuthRegistrationResult:
-        payload: dict[str, object] = {
-            "client_name": client_name,
-            "redirect_uris": [self._mcp_oauth_redirect_uri()],
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-        }
-        if token_auth_method:
-            payload["token_endpoint_auth_method"] = token_auth_method
+        payload = build_dcr_payload(
+            client_name=client_name,
+            redirect_uris=[self._mcp_oauth_redirect_uri()],
+            token_endpoint_auth_method=token_auth_method,
+            requested_scopes=requested_scopes,
+        )
 
         await validate_oauth_endpoint_resolves_public_async(registration_endpoint)
         async with httpx.AsyncClient() as client:
@@ -877,10 +1132,28 @@ class IntegrationService(BaseWorkspaceService):
         auth_method = (
             registration_response.token_endpoint_auth_method or token_auth_method
         )
+        # RFC 7591 responses echo the AS-registered metadata; flag when the AS
+        # dropped the refresh_token grant we requested. An absent echo (None)
+        # means "as requested"; a declared-empty [] means the AS stripped grants.
+        grant_types_downgraded = (
+            registration_response.grant_types is not None
+            and "refresh_token" not in registration_response.grant_types
+        )
+        # RFC 7591 `scope` echoes the scopes the AS registered (its whitelist);
+        # None when the response omits it.
+        registered_scopes = registration_response.registered_scopes
+        self.logger.info(
+            "Registered custom MCP OAuth client",
+            registration_endpoint_host=urlparse(registration_endpoint).hostname,
+            registered_grant_types=registration_response.grant_types,
+            registered_scope=registration_response.scope,
+            grant_types_downgraded=grant_types_downgraded,
+        )
         return MCPOAuthRegistrationResult(
             client_id=registration_response.client_id,
             client_secret=registration_response.client_secret,
             auth_method=auth_method,
+            registered_scopes=registered_scopes,
         )
 
     async def _generate_custom_mcp_provider_id(self, *, name: str) -> str:
@@ -936,6 +1209,8 @@ class IntegrationService(BaseWorkspaceService):
         server_uri: str,
         endpoints: MCPOAuthDiscoveryEndpoints,
         registration: MCPOAuthRegistrationResult,
+        requested_scopes: list[str],
+        authorize_params: Mapping[str, str] | None = None,
     ) -> IntegrationOAuthConnect:
         if self.role.user_id is None:
             raise ValueError("User ID is required")
@@ -974,45 +1249,69 @@ class IntegrationService(BaseWorkspaceService):
             token_auth_method=token_auth_method,
             with_response_type=True,
         )
+        # Only send a scope param when we have something to request; today's
+        # behavior omits it entirely when there are no scopes.
+        authorize_kwargs: _AuthorizeUrlKwargs = {}
+        if requested_scopes:
+            authorize_kwargs["scope"] = " ".join(requested_scopes)
+        # Catalog-pinned vendor extras (e.g. Google access_type/prompt); the
+        # reserved set keeps them from clobbering the parameters set below.
+        extra_authorize_params = {
+            key: value
+            for key, value in (authorize_params or {}).items()
+            if key not in _RESERVED_MCP_AUTHORIZE_PARAMS
+        }
         auth_url, _ = client.create_authorization_url(
             endpoints.authorization_endpoint,
             state=str(state_id),
             code_challenge=code_challenge,
             code_challenge_method="S256",
             resource=endpoints.resource,
+            **extra_authorize_params,
+            **authorize_kwargs,
         )
         return IntegrationOAuthConnect(
             auth_url=auth_url,
             provider_id=integration.provider_id,
         )
 
-    @require_scope("integration:create")
+    @require_scope("integration:create", "integration:read")
     async def connect_mcp_oauth_discovery(
         self,
         *,
         params: MCPHttpIntegrationCreate,
-        catalog_spec: MCPConnectionSpec | None = None,
+        resolved_catalog: ResolvedCatalogConnection | None = None,
         existing_mcp_integration: MCPIntegration | None = None,
     ) -> PlatformMCPCatalogConnectResult:
         if params.server_type != "http" or params.auth_type != MCPAuthType.OAUTH2:
             raise ValueError("MCP OAuth discovery requires an HTTP OAuth MCP server")
+        # Resolve the catalog binding once per request and thread it onward.
+        if resolved_catalog is None:
+            resolved_catalog = self._resolve_catalog_connection_for_create(params)
+        catalog_spec = resolved_catalog.spec if resolved_catalog else None
         if params.oauth_integration_id is not None:
+            # Reusing an existing OAuth integration skips discovery, but the row
+            # still needs the headers its recipe marks required or it is created
+            # unusable and only fails later at verification.
+            if catalog_spec is not None:
+                self._validate_required_catalog_headers(
+                    params=params, catalog_spec=catalog_spec
+                )
             return PlatformMCPCatalogConnectResult(
-                mcp_integration=await self.create_mcp_integration(params=params)
+                mcp_integration=await self.create_mcp_integration(
+                    params=params, resolved_catalog=resolved_catalog
+                ),
+                created=True,
             )
 
         scopes: list[str] | None = None
-        if catalog_spec is None and params.catalog_slug:
-            catalog = get_platform_mcp_catalog_entry_by_slug(
-                params.catalog_slug, include_private=True
-            )
-            if catalog is not None:
-                catalog_spec = self._catalog_connection_spec(catalog)
         allowed_endpoint_hosts: frozenset[str] = frozenset()
+        oauth_resource: str | None = None
         if catalog_spec is not None:
             if not isinstance(catalog_spec, MCPHTTPOAuth2ConnectionSpec):
                 raise ValueError("Catalog option is not an HTTP OAuth MCP server")
             scopes = catalog_spec.scopes
+            oauth_resource = catalog_spec.oauth_resource
             # Hosts of catalog-pinned OAuth endpoints are trusted during
             # discovery; the catalog is repo-owned, so a pinned endpoint
             # states explicitly where the provider serves OAuth.
@@ -1024,18 +1323,67 @@ class IntegrationService(BaseWorkspaceService):
                 )
                 if endpoint and (hostname := urlparse(endpoint).hostname)
             )
+            # Fail before any discovery or registration call so a row that
+            # cannot connect is never half-created.
+            self._validate_required_catalog_headers(
+                params=params, catalog_spec=catalog_spec
+            )
+            # Only client_id is needed to build a client, so a required secret
+            # left out would fail at token exchange; refuse before any
+            # registration parsing, discovery, or DCR.
+            self._validate_required_oauth_client_credentials(
+                params=params, catalog_spec=catalog_spec
+            )
 
-        endpoints = await self._discover_mcp_oauth_endpoints(
-            server_uri=params.server_uri,
-            allowed_endpoint_hosts=allowed_endpoint_hosts,
-        )
-        # Prefer user-supplied OAuth client credentials; otherwise fall back to
-        # dynamic client registration (DCR) against the discovered endpoint.
         registration = self._mcp_oauth_client_registration_from_credentials(
             params=params,
             catalog_spec=catalog_spec,
         )
-        used_byo_credentials = registration is not None
+        # Captured before DCR reassigns ``registration`` below.
+        needs_dcr = registration is None
+        # Catalog-pinned endpoints replace discovery only when registration is
+        # not needed: the catalog never pins a registration endpoint, so a DCR
+        # flow must still discover one even on a pinned row.
+        pinned_endpoints = (
+            self._catalog_pinned_oauth_endpoints(
+                catalog_spec,
+                server_uri=params.server_uri,
+                oauth_resource=oauth_resource,
+                allowed_endpoint_hosts=allowed_endpoint_hosts,
+            )
+            if catalog_spec is not None and not needs_dcr
+            else None
+        )
+        if pinned_endpoints is not None:
+            endpoints = pinned_endpoints
+        elif oauth_resource is not None:
+            endpoints = await self._discover_mcp_oauth_endpoints(
+                server_uri=params.server_uri,
+                oauth_resource=oauth_resource,
+                allowed_endpoint_hosts=allowed_endpoint_hosts,
+            )
+        else:
+            endpoints = await self._discover_mcp_oauth_endpoints(
+                server_uri=params.server_uri,
+                allowed_endpoint_hosts=allowed_endpoint_hosts,
+            )
+        # Request offline_access only when the AS advertises it, so refresh
+        # tokens survive session-bound authorization policies. Computed once and
+        # threaded to both DCR and the authorize URL so the two can't disagree.
+        # A fresh connect has no stored grant, so an empty catalog scope list
+        # means unconfigured and may still expand with offline_access.
+        requested_scopes = mcp_requested_scopes(
+            scopes=scopes or None, scopes_supported=endpoints.scopes_supported
+        )
+        self.logger.info(
+            "Connecting custom MCP OAuth integration",
+            provider_id=params.catalog_slug,
+            integration_name=params.name,
+            scopes_supported=endpoints.scopes_supported,
+            requested_scopes=requested_scopes,
+        )
+        # Prefer user-supplied OAuth client credentials; otherwise fall back to
+        # dynamic client registration (DCR) against the discovered endpoint.
         if registration is None:
             if not endpoints.registration_endpoint:
                 raise ValueError(
@@ -1047,13 +1395,28 @@ class IntegrationService(BaseWorkspaceService):
                 token_auth_method=self._select_mcp_registration_auth_method(
                     endpoints.token_methods
                 ),
+                requested_scopes=requested_scopes,
+            )
+        # RFC 7591: a DCR scope echo is the authoritative registered set.
+        effective_scopes = (
+            registration.registered_scopes
+            if registration.registered_scopes is not None
+            else requested_scopes
+        )
+        if effective_scopes != requested_scopes:
+            self.logger.info(
+                "Using registered custom MCP OAuth scopes",
+                integration_name=params.name,
+                requested_scopes=requested_scopes,
+                registered_scopes=registration.registered_scopes,
+                effective_scopes=effective_scopes,
             )
         oauth_integration = await self._create_custom_mcp_oauth_provider(
             name=params.name,
             description=params.description,
             endpoints=endpoints,
             registration=registration,
-            scopes=scopes,
+            scopes=effective_scopes,
         )
         if existing_mcp_integration is not None:
             existing_mcp_integration.oauth_integration_id = oauth_integration.id
@@ -1064,23 +1427,182 @@ class IntegrationService(BaseWorkspaceService):
             mcp_integration = existing_mcp_integration
         else:
             overrides: dict[str, object] = {
-                "oauth_integration_id": oauth_integration.id
+                "oauth_integration_id": oauth_integration.id,
+                # Consumed into the OAuth client above; never stored on the
+                # MCP row.
+                "oauth_client_credentials": None,
             }
-            # Credentials already consumed into the OAuth client; don't persist them.
-            if used_byo_credentials:
+            # Legacy overload: with no dedicated oauth_client_credentials, a
+            # BYO client arrived in custom_credentials and was consumed into
+            # the OAuth client, so it must not persist as headers. When the
+            # dedicated field carried the client, custom_credentials is plain
+            # headers JSON and is kept.
+            if not needs_dcr and params.oauth_client_credentials is None:
                 overrides["custom_credentials"] = None
             create_params = params.model_copy(update=overrides)
-            mcp_integration = await self.create_mcp_integration(params=create_params)
+            mcp_integration = await self.create_mcp_integration(
+                params=create_params, resolved_catalog=resolved_catalog
+            )
         oauth_connect = await self._start_custom_mcp_oauth_authorization(
             integration=oauth_integration,
             server_uri=mcp_integration.server_uri or params.server_uri,
             endpoints=endpoints,
             registration=registration,
+            requested_scopes=effective_scopes,
+            authorize_params=(
+                catalog_spec.oauth_authorize_params
+                if isinstance(catalog_spec, MCPHTTPOAuth2ConnectionSpec)
+                else None
+            ),
         )
         return PlatformMCPCatalogConnectResult(
             mcp_integration=mcp_integration,
             oauth_connect=oauth_connect,
+            created=existing_mcp_integration is None,
         )
+
+    @classmethod
+    def _mcp_oauth_client_credentials_payload(
+        cls,
+        *,
+        params: MCPHttpIntegrationCreate,
+        catalog_spec: MCPConnectionSpec,
+    ) -> str | None:
+        """Return the raw JSON holding a user-created OAuth client, if any.
+
+        ``oauth_client_credentials`` is the dedicated field. Older API clients
+        sent the client JSON in ``custom_credentials`` instead; that overload
+        is still honoured, but only on rows that declare no ``http_header``
+        credential and only when the JSON actually names a client. The
+        headers editor is shown on every OAuth row, so anything else in
+        ``custom_credentials`` stays headers.
+        """
+        if params.oauth_client_credentials is not None:
+            return params.oauth_client_credentials.get_secret_value().strip() or None
+        if params.custom_credentials is None:
+            return None
+        declares_headers = any(
+            field.target == "http_header"
+            for field in [*catalog_spec.config_fields, *catalog_spec.credentials]
+        )
+        if declares_headers:
+            return None
+        raw_credentials = params.custom_credentials.get_secret_value().strip()
+        return raw_credentials if cls._names_oauth_client(raw_credentials) else None
+
+    @classmethod
+    def _names_oauth_client(cls, raw_credentials: str) -> bool:
+        """Whether a JSON object carries a client_id / client_secret style key."""
+        try:
+            parsed = orjson.loads(raw_credentials)
+        except orjson.JSONDecodeError:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        return any(
+            isinstance(key, str)
+            and (
+                cls._oauth_client_key_matches(key, "clientid")
+                or cls._oauth_client_key_matches(key, "clientsecret")
+            )
+            for key in parsed
+        )
+
+    @staticmethod
+    def _validate_required_catalog_headers(
+        *, params: MCPHttpIntegrationCreate, catalog_spec: MCPConnectionSpec
+    ) -> None:
+        """Reject a connect that omits headers the catalog row marks required.
+
+        Header names are compared case-insensitively, matching how they are
+        sent. Raises ``ValueError`` listing every missing or blank key.
+        """
+        required_keys = [
+            credential.key
+            for credential in catalog_spec.credentials
+            if credential.target == "http_header" and credential.required
+        ]
+        if not required_keys:
+            return
+        supplied: dict[str, str] = {}
+        raw_headers = (
+            params.custom_credentials.get_secret_value().strip()
+            if params.custom_credentials is not None
+            else ""
+        )
+        if raw_headers:
+            try:
+                parsed = orjson.loads(raw_headers)
+            except orjson.JSONDecodeError as exc:
+                raise ValueError("Additional headers must be valid JSON") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("Additional headers must be a JSON object")
+            supplied = {
+                key.strip().casefold(): value
+                for key, value in parsed.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        missing = [
+            key
+            for key in required_keys
+            if not supplied.get(key.strip().casefold(), "").strip()
+        ]
+        if missing:
+            raise ValueError(f"Missing required header values: {', '.join(missing)}")
+
+    @classmethod
+    def _validate_required_oauth_client_credentials(
+        cls, *, params: MCPHttpIntegrationCreate, catalog_spec: MCPConnectionSpec
+    ) -> None:
+        """Reject a connect that omits OAuth client values the row marks required.
+
+        Building a client only needs ``client_id``, so a missing secret would
+        otherwise surface as a failed token exchange after the redirect and
+        leave an unusable row. Declared and supplied keys match under the same
+        lenient rule as the client parser (``client_id`` == ``clientId`` ==
+        ``oauth_client_id``). Public-client rows that do not require a secret
+        are unaffected.
+        """
+        required_keys = [
+            credential.key
+            for credential in catalog_spec.credentials
+            if credential.target == "oauth_client" and credential.required
+        ]
+        if not required_keys:
+            return
+        supplied: dict[str, str] = {}
+        raw_credentials = cls._mcp_oauth_client_credentials_payload(
+            params=params, catalog_spec=catalog_spec
+        )
+        if raw_credentials:
+            try:
+                parsed = orjson.loads(raw_credentials)
+            except orjson.JSONDecodeError as exc:
+                raise ValueError(
+                    "OAuth client credentials must be a JSON object"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("OAuth client credentials must be a JSON object")
+            supplied = {
+                key: value
+                for key, value in parsed.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        missing = [
+            key
+            for key in required_keys
+            if not any(
+                cls._oauth_client_key_matches(
+                    supplied_key, re.sub(r"[^a-z0-9]+", "", key.lower())
+                )
+                and value.strip()
+                for supplied_key, value in supplied.items()
+            )
+        ]
+        if missing:
+            raise ValueError(
+                f"Missing required OAuth client values: {', '.join(missing)}"
+            )
 
     @classmethod
     def _mcp_oauth_client_registration_from_credentials(
@@ -1093,7 +1615,6 @@ class IntegrationService(BaseWorkspaceService):
             catalog_spec is None
             or catalog_spec.server_type != "http"
             or catalog_spec.auth_type != MCPAuthType.OAUTH2
-            or not params.custom_credentials
         ):
             return None
         if not any(
@@ -1102,7 +1623,9 @@ class IntegrationService(BaseWorkspaceService):
         ):
             return None
 
-        raw_credentials = params.custom_credentials.get_secret_value().strip()
+        raw_credentials = cls._mcp_oauth_client_credentials_payload(
+            params=params, catalog_spec=catalog_spec
+        )
         if not raw_credentials:
             return None
         try:
@@ -1188,6 +1711,9 @@ class IntegrationService(BaseWorkspaceService):
         endpoints = await self._resolve_mcp_oauth_endpoints(
             server_uri=mcp_integration.server_uri,
             provider_config=provider_config,
+            oauth_resource=self._catalog_mcp_oauth_resource(
+                mcp_integration.catalog_slug
+            ),
         )
         client_secret = (
             provider_config.client_secret.get_secret_value()
@@ -1222,6 +1748,13 @@ class IntegrationService(BaseWorkspaceService):
             raise ValueError(
                 "MCP OAuth token response did not include access_token"
             ) from exc
+        self.logger.info(
+            "Completed custom MCP OAuth authorization",
+            provider_id=provider_id,
+            granted_scope=token.scope,
+            has_refresh_token=token.refresh_token is not None,
+            expires_in=token.expires_in,
+        )
         return await self.store_integration(
             provider_key=provider_key,
             user_id=self.role.user_id,
@@ -1255,6 +1788,9 @@ class IntegrationService(BaseWorkspaceService):
         endpoints = await self._resolve_mcp_oauth_endpoints(
             server_uri=mcp_integration.server_uri,
             provider_config=provider_config,
+            oauth_resource=self._catalog_mcp_oauth_resource(
+                mcp_integration.catalog_slug
+            ),
         )
         client_secret = (
             provider_config.client_secret.get_secret_value()
@@ -1274,34 +1810,49 @@ class IntegrationService(BaseWorkspaceService):
         )
         token_endpoint = provider_config.token_endpoint or endpoints.token_endpoint
         await validate_oauth_endpoint_resolves_public_async(token_endpoint)
+        oauth_response = await client.refresh_token(
+            token_endpoint,
+            refresh_token=refresh_token,
+            resource=endpoints.resource,
+        )
         try:
             token = TokenResponse.from_oauth_response(
-                await client.refresh_token(
-                    token_endpoint,
-                    refresh_token=refresh_token,
-                    resource=endpoints.resource,
-                ),
+                oauth_response,
                 default_refresh_token=refresh_token,
                 default_expires_in=None,
                 default_scope=integration.scope or "",
             )
         except ValueError:
+            # A malformed response does not prove that the server spent or
+            # rotated the refresh token. Keep it until an explicit terminal
+            # OAuth error such as invalid_grant confirms it is unusable.
+            self.logger.warning(
+                "MCP OAuth refresh response could not be parsed",
+                provider_id=integration.provider_id,
+            )
             return integration
         integration.encrypted_access_token = self._encrypt_token(
             token.access_token.get_secret_value()
         )
-        if token.refresh_token:
-            integration.encrypted_refresh_token = self._encrypt_token(
-                token.refresh_token.get_secret_value()
-            )
+        new_refresh_token = (
+            token.refresh_token.get_secret_value() if token.refresh_token else None
+        )
+        rotated = new_refresh_token is not None and new_refresh_token != refresh_token
+        if new_refresh_token:
+            integration.encrypted_refresh_token = self._encrypt_token(new_refresh_token)
         if token.expires_in is not None:
-            integration.expires_at = datetime.now() + timedelta(
+            integration.expires_at = datetime.now(UTC) + timedelta(
                 seconds=token.expires_in
             )
         if token.scope:
             integration.scope = token.scope
-        await self.session.commit()
-        await self.session.refresh(integration)
+        self.logger.info(
+            "Refreshed MCP OAuth integration",
+            provider_id=integration.provider_id,
+            refresh_token_rotated=rotated,
+            expires_in=token.expires_in,
+            granted_scope=token.scope,
+        )
         return integration
 
     @staticmethod
@@ -1493,52 +2044,140 @@ class IntegrationService(BaseWorkspaceService):
 
     @require_scope("integration:delete")
     async def remove_integration(self, *, integration: OAuthIntegration) -> None:
-        """Remove a user's integration for a specific provider."""
+        """Remove a user's integration and MCP rows owned by its provider."""
         # Capture provider info before deleting
         provider_key = ProviderKey(
             id=integration.provider_id, grant_type=integration.grant_type
         )
         is_custom_provider = integration.provider_id.startswith("custom_")
 
-        # Delete the integration record
-        await self.session.delete(integration)
-        await self.session.commit()
+        try:
+            if await self._is_mcp_lifecycle_owned_oauth_integration(
+                integration=integration
+            ):
+                await self._delete_mcp_integrations_for_oauth_integration(
+                    integration=integration
+                )
+            await self.session.delete(integration)
+            await self.session.commit()
+        except Exception:
+            await self.session.rollback()
+            raise
 
         # If this is a custom provider, also delete the custom provider definition
         if is_custom_provider:
             await self.delete_custom_provider(provider_key=provider_key)
 
     async def refresh_token_if_needed(
-        self, integration: OAuthIntegration
+        self,
+        integration: OAuthIntegration,
     ) -> OAuthIntegration:
-        """Refresh the access token if it's expired or about to expire."""
+        """Refresh the access token if it's expired or about to expire.
+
+        Fresh caller state returns without opening another database session.
+        Stale caller state is reloaded under the refresh transaction's row lock
+        before deciding whether to call the OAuth provider.
+
+        Each attempt owns a separate transaction. A contending refresher uses
+        NOWAIT, rolls back and closes its session before sleeping, then retries
+        with jitter. The caller's session is never committed or rolled back.
+
+        The row lock prevents concurrent database readers from presenting the
+        same refresh token. It cannot make refresh-token rotation atomic with
+        persisting the OAuth response, so a lost response or failed commit
+        after server-side rotation remains unrecoverable here.
+        """
         if not integration.needs_refresh:
             return integration
 
+        integration_id = integration.id
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + OAUTH_REFRESH_RETRY_TIMEOUT_SECONDS
+        role_token = ctx_role.set(self.role)
         try:
-            if integration.grant_type == OAuthGrantType.AUTHORIZATION_CODE:
-                integration = await self._refresh_ac_integration(integration)
-            elif integration.grant_type == OAuthGrantType.CLIENT_CREDENTIALS:
-                integration = await self._refresh_cc_integration(integration)
-            else:
-                self.logger.warning(
-                    "Unsupported grant type for refresh",
-                    grant_type=integration.grant_type,
-                    provider=integration.provider_id,
-                )
-                return integration
-        except Exception as e:
-            self.logger.error(
-                "Failed to refresh token, continuing with current token",
-                error=str(e),
-                provider=integration.provider_id,
-                expires_at=integration.expires_at,
-            )
-            # Return unchanged - let it fail naturally when token expires
-            return integration
+            while True:
+                try:
+                    async with get_async_session_context_manager() as refresh_session:
+                        refresh_service = IntegrationService(
+                            session=refresh_session,
+                            role=self.role,
+                        )
+                        locked = await refresh_session.scalar(
+                            select(OAuthIntegration)
+                            .where(
+                                OAuthIntegration.id == integration_id,
+                                OAuthIntegration.workspace_id == self.workspace_id,
+                            )
+                            .with_for_update(nowait=True)
+                        )
+                        if locked is None:
+                            raise ValueError("OAuth integration not found")
 
-        await self.session.refresh(integration)
-        return integration
+                        if locked.needs_refresh:
+                            refresh_error: Exception | None = None
+                            try:
+                                async with refresh_session.begin_nested():
+                                    if (
+                                        locked.grant_type
+                                        == OAuthGrantType.AUTHORIZATION_CODE
+                                    ):
+                                        await refresh_service._refresh_ac_integration(
+                                            locked
+                                        )
+                                    elif (
+                                        locked.grant_type
+                                        == OAuthGrantType.CLIENT_CREDENTIALS
+                                    ):
+                                        await refresh_service._refresh_cc_integration(
+                                            locked
+                                        )
+                                    else:
+                                        refresh_service.logger.warning(
+                                            "Unsupported grant type for refresh",
+                                            grant_type=locked.grant_type,
+                                            provider=locked.provider_id,
+                                        )
+                            except Exception as e:
+                                refresh_error = e
+                                await refresh_session.refresh(locked)
+                                if (
+                                    isinstance(e, OAuthError)
+                                    and e.error == "invalid_grant"
+                                ):
+                                    locked.encrypted_refresh_token = None
+                                    refresh_service.logger.warning(
+                                        "Authorization server rejected the refresh "
+                                        "token; re-authorization required",
+                                        provider=locked.provider_id,
+                                        user_id=locked.user_id,
+                                    )
+
+                            await refresh_session.commit()
+                            if refresh_error is not None:
+                                refresh_service.logger.error(
+                                    "Failed to refresh token, continuing with current token",
+                                    error=str(refresh_error),
+                                    provider=locked.provider_id,
+                                )
+                        else:
+                            await refresh_session.commit()
+                        return locked
+                except DBAPIError as e:
+                    sqlstate = getattr(e.orig, "sqlstate", None)
+                    if sqlstate != OAUTH_REFRESH_LOCK_NOT_AVAILABLE:
+                        raise
+                    if loop.time() >= deadline:
+                        raise OAuthRefreshBusyError(
+                            f"OAuth integration {integration_id} is busy refreshing"
+                        ) from e
+                    await asyncio.sleep(
+                        random.uniform(
+                            OAUTH_REFRESH_RETRY_MIN_SECONDS,
+                            OAUTH_REFRESH_RETRY_MAX_SECONDS,
+                        )
+                    )
+        finally:
+            ctx_role.reset(role_token)
 
     async def _provider_from_integration(
         self, integration: OAuthIntegration
@@ -1629,7 +2268,7 @@ class IntegrationService(BaseWorkspaceService):
 
         # Update expiry time
         integration.expires_at = (
-            datetime.now() + timedelta(seconds=token_response.expires_in)
+            datetime.now(UTC) + timedelta(seconds=token_response.expires_in)
             if token_response.expires_in is not None
             else None
         )
@@ -1637,29 +2276,17 @@ class IntegrationService(BaseWorkspaceService):
         # Update scope if changed
         integration.scope = token_response.scope
 
-        await self.session.commit()
-        await self.session.refresh(integration)
         return integration
 
     async def _refresh_ac_integration(
         self, integration: OAuthIntegration
     ) -> OAuthIntegration:
-        """Refresh an integration using the refresh token for authorization code grant type."""
-        # Check if refresh token exists by attempting to decrypt
-        try:
-            refresh_token = (
-                self._decrypt_token(integration.encrypted_refresh_token)
-                if integration.encrypted_refresh_token
-                else None
-            )
-        except Exception as e:
-            self.logger.error(
-                "Failed to decrypt refresh token",
-                user_id=integration.user_id,
-                provider=integration.provider_id,
-                error=str(e),
-            )
-            return integration
+        """Apply an authorization-code refresh without ending the transaction."""
+        refresh_token = (
+            self._decrypt_token(integration.encrypted_refresh_token)
+            if integration.encrypted_refresh_token
+            else None
+        )
 
         if not refresh_token:
             self.logger.warning(
@@ -1670,19 +2297,10 @@ class IntegrationService(BaseWorkspaceService):
             return integration
 
         if self._is_custom_mcp_oauth_provider(integration.provider_id):
-            try:
-                return await self._refresh_custom_mcp_integration(
-                    integration=integration,
-                    refresh_token=refresh_token,
-                )
-            except Exception as e:
-                self.logger.error(
-                    "Failed to refresh generic MCP OAuth token",
-                    user_id=integration.user_id,
-                    provider=integration.provider_id,
-                    error=str(e),
-                )
-                return integration
+            return await self._refresh_custom_mcp_integration(
+                integration=integration,
+                refresh_token=refresh_token,
+            )
 
         provider = await self._provider_from_integration(integration)
         if not provider:
@@ -1701,48 +2319,26 @@ class IntegrationService(BaseWorkspaceService):
             )
             return integration
 
-        # Refresh the access token
-        try:
-            token_response = await provider.refresh_access_token(refresh_token)
+        token_response = await provider.refresh_access_token(refresh_token)
 
-            # Update integration with new tokens
-            integration.encrypted_access_token = self._encrypt_token(
-                token_response.access_token.get_secret_value()
+        integration.encrypted_access_token = self._encrypt_token(
+            token_response.access_token.get_secret_value()
+        )
+        if token_response.refresh_token:
+            integration.encrypted_refresh_token = self._encrypt_token(
+                token_response.refresh_token.get_secret_value()
             )
-
-            # Update refresh token if provider rotated it
-            if token_response.refresh_token:
-                integration.encrypted_refresh_token = self._encrypt_token(
-                    token_response.refresh_token.get_secret_value()
-                )
-
-            # Update expiry time
-            if token_response.expires_in is not None:
-                integration.expires_at = datetime.now() + timedelta(
-                    seconds=token_response.expires_in
-                )
-
-            # Update scope if changed
-            integration.scope = token_response.scope
-
-            await self.session.commit()
-            await self.session.refresh(integration)
-
-            self.logger.info(
-                "Successfully updated integration with refreshed tokens",
-                user_id=integration.user_id,
-                provider=integration.provider_id,
+        if token_response.expires_in is not None:
+            integration.expires_at = datetime.now(UTC) + timedelta(
+                seconds=token_response.expires_in
             )
+        integration.scope = token_response.scope
 
-        except Exception as e:
-            self.logger.error(
-                "Failed to refresh access token",
-                user_id=integration.user_id,
-                provider=integration.provider_id,
-                error=str(e),
-            )
-            # Return unchanged integration instead of raising
-            return integration
+        self.logger.info(
+            "Successfully updated integration with refreshed tokens",
+            user_id=integration.user_id,
+            provider=integration.provider_id,
+        )
 
         return integration
 
@@ -1952,6 +2548,9 @@ class IntegrationService(BaseWorkspaceService):
                 configured_authorization=integration.authorization_endpoint,
                 configured_token=integration.token_endpoint,
             )
+            # Fall back to defaults only when scopes were never configured; an
+            # explicitly empty stored set (DCR granted nothing) stays empty.
+            parsed_scopes = self.parse_scopes(integration.requested_scopes)
             return ProviderConfig(
                 client_id=client_id,
                 client_secret=SecretStr(client_secret)
@@ -1959,8 +2558,7 @@ class IntegrationService(BaseWorkspaceService):
                 else None,
                 authorization_endpoint=authorization_endpoint,
                 token_endpoint=token_endpoint,
-                scopes=self.parse_scopes(integration.requested_scopes)
-                or default_scopes,
+                scopes=parsed_scopes if parsed_scopes is not None else default_scopes,
             )
         except InsecureOAuthEndpointError as e:
             self.logger.error(
@@ -2015,8 +2613,14 @@ class IntegrationService(BaseWorkspaceService):
         return True
 
     def parse_scopes(self, scopes: str | None) -> list[str] | None:
-        """Parse a space-separated string of scopes into a list of scopes."""
-        return scopes.split(" ") if scopes else None
+        """Parse a space-separated string of scopes into a list of scopes.
+
+        ``""`` is an explicit empty scope set (e.g. narrowed by a DCR echo)
+        and parses to ``[]``; only ``None`` means unconfigured.
+        """
+        if scopes is None:
+            return None
+        return scopes.split(" ") if scopes else []
 
     async def _auto_create_mcp_integration_if_needed(
         self,
@@ -2072,14 +2676,6 @@ class IntegrationService(BaseWorkspaceService):
             mcp_integration = existing_mcp.scalars().first()
 
         if mcp_integration is None:
-            if not await self.has_entitlement(Entitlement.AGENT_ADDONS):
-                self.logger.info(
-                    "Skipped MCP provider auto-create due to missing entitlement",
-                    provider=provider_key.id,
-                    workspace_id=self.workspace_id,
-                )
-                return
-
             # Create new MCP integration
             metadata = mcp_provider_impl.metadata
 
@@ -2164,6 +2760,9 @@ class IntegrationService(BaseWorkspaceService):
             }
             if slug in catalog_slugs:
                 slug = f"{slug}-custom"
+
+        if is_tracecat_registry_server_name(slug):
+            slug = f"user-{slug}"
 
         # Truncate to max length, leaving room for suffix if needed
         max_base_length = MAX_SERVER_NAME_LENGTH - 4  # Reserve space for "-999"
@@ -2251,6 +2850,7 @@ class IntegrationService(BaseWorkspaceService):
                 update(AgentPreset)
                 .where(
                     AgentPreset.workspace_id == self.workspace_id,
+                    AgentPreset.deleted_at.is_(None),
                     AgentPreset.mcp_integrations.isnot(None),
                     candidate_exists,
                     AgentPreset.mcp_integrations.op("?|")(candidate_ids),
@@ -2300,6 +2900,7 @@ class IntegrationService(BaseWorkspaceService):
             select(AgentPreset)
             .where(
                 AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.deleted_at.is_(None),
                 AgentPreset.id.in_(preset_ids),
             )
             .order_by(AgentPreset.id)
@@ -2324,65 +2925,133 @@ class IntegrationService(BaseWorkspaceService):
         result = await self.session.execute(statement)
         return result.scalars().first() is not None
 
-    async def _resolve_create_platform_mcp_catalog(
-        self, *, params: MCPIntegrationCreate
-    ) -> PlatformMCPCatalogEntry | None:
-        """Resolve the catalog row for catalog-backed create payloads."""
-        if params.catalog_slug is None:
-            return None
-
-        catalog_entry = get_platform_mcp_catalog_entry_by_slug(
-            params.catalog_slug,
-            include_private=True,
-        )
-        if catalog_entry is None:
-            raise ValueError("Platform MCP catalog row not found")
-        if catalog_entry.status != "available":
-            raise ValueError(f"{catalog_entry.name} is not available to connect")
-        if not self._params_match_catalog_connection_specs(
-            params=params, catalog_entry=catalog_entry
-        ):
-            raise ValueError(
-                f"Requested server and auth configuration does not match any "
-                f"connection option for {catalog_entry.name}"
+    @staticmethod
+    def _resolve_catalog_connection_for_update(
+        *,
+        catalog_slug: str,
+        server_type: MCPServerType,
+        auth_type: MCPAuthType | None = None,
+        server_uri: str | None = None,
+    ) -> ResolvedCatalogConnection:
+        """Rebind a changed connection on a catalog-backed row to its recipe."""
+        entry = resolve_available_catalog_entry(catalog_slug)
+        try:
+            return resolve_catalog_connection(
+                entry,
+                server_type=server_type,
+                auth_type=auth_type,
+                server_uri=server_uri,
             )
-
-        await self.require_entitlement(Entitlement.AGENT_ADDONS)
-        return catalog_entry
+        except CatalogConnectionError as exc:
+            raise CatalogConnectionError(
+                f"{exc} Disconnect and reconnect this server to pick a "
+                f"currently supported {entry.name} connection option."
+            ) from exc
 
     @staticmethod
-    def _params_match_catalog_connection_specs(
-        *,
+    def _resolve_catalog_connection_for_create(
         params: MCPIntegrationCreate,
-        catalog_entry: PlatformMCPCatalogEntry,
-    ) -> bool:
-        """Whether create params match one of a catalog row's connect recipes.
+    ) -> ResolvedCatalogConnection | None:
+        """Bind catalog-backed create params to one catalog connect recipe."""
+        if params.catalog_slug is None:
+            return None
+        entry = resolve_available_catalog_entry(params.catalog_slug)
+        return resolve_catalog_connection(
+            entry,
+            server_type=params.server_type,
+            auth_type=(
+                params.auth_type
+                if isinstance(params, MCPHttpIntegrationCreate)
+                else None
+            ),
+            server_uri=(
+                params.server_uri
+                if isinstance(params, MCPHttpIntegrationCreate)
+                else None
+            ),
+        )
 
-        Guards against binding an arbitrary payload to a platform catalog row
-        (e.g. an auth-less row spoofing an OAuth-only connector as connected).
-        HTTP params must match a spec's server and auth type; stdio create
-        params carry no auth type (credentials ride in ``stdio_env``), so any
-        stdio spec the row offers is accepted.
+    @staticmethod
+    def _validate_catalog_url_credentials(
+        *, params: MCPIntegrationCreate, spec: MCPConnectionSpec
+    ) -> None:
+        """Enforce http(s):// on stdio_env values the catalog marks ``type: url``.
+
+        The catalog row is the single source of truth for which values are
+        URLs; only credentials it declares ``type: "url"`` are checked.
         """
-        specs: list[MCPConnectionSpec] = []
+        if not isinstance(params, MCPStdioIntegrationCreate) or not params.stdio_env:
+            return
+        IntegrationService._validate_stdio_env_url_keys(
+            spec=spec, stdio_env=params.stdio_env
+        )
+
+    @staticmethod
+    def _stdio_env_url_keys(specs: Iterable[MCPConnectionSpec]) -> set[str]:
+        """Collect stdio_env keys any of ``specs`` declares ``type: url``."""
+        return {
+            cred.key
+            for spec in specs
+            for cred in spec.credentials
+            if cred.type == "url" and cred.target == "stdio_env"
+        }
+
+    @staticmethod
+    def _validate_stdio_env_url_keys(
+        *, spec: MCPConnectionSpec, stdio_env: dict[str, str]
+    ) -> None:
+        """Validate stdio_env values for keys the catalog marks ``type: url``."""
+        url_keys = IntegrationService._stdio_env_url_keys([spec])
+        if url_keys:
+            validate_url_credential_values(stdio_env, url_keys)
+
+    def _validate_stdio_env_against_catalog(
+        self, *, catalog_slug: str | None, stdio_env: dict[str, str]
+    ) -> None:
+        """Validate stdio_env URLs against the bound catalog row, if any.
+
+        BYO rows (no ``catalog_slug``) declare no credential types, so there is
+        nothing to validate. URL-typed keys are unioned across every spec the
+        row offers (``connection_spec`` plus each ``connection_options`` spec):
+        the update payload carries no server/auth discriminator to pin a single
+        option, and a key the row marks ``type: url`` in any option must stay a
+        URL on update.
+        """
+        if not catalog_slug:
+            return
+        catalog_entry = get_platform_mcp_catalog_entry_by_slug(
+            catalog_slug, include_private=True
+        )
+        if catalog_entry is None:
+            return
+        specs: list[MCPConnectionSpec] = [
+            option.connection_spec for option in catalog_entry.connection_options or []
+        ]
         if catalog_entry.connection_spec is not None:
             specs.append(catalog_entry.connection_spec)
-        specs.extend(
-            option.connection_spec for option in catalog_entry.connection_options or []
-        )
-        for spec in specs:
-            if spec.server_type != params.server_type:
-                continue
-            if params.server_type == "stdio" or spec.auth_type == params.auth_type:
-                return True
-        return False
+        url_keys = self._stdio_env_url_keys(specs)
+        if url_keys:
+            validate_url_credential_values(stdio_env, url_keys)
 
-    @require_scope("integration:create")
+    @require_scope("integration:create", "integration:read")
     async def create_mcp_integration(
-        self, *, params: MCPIntegrationCreate
+        self,
+        *,
+        params: MCPIntegrationCreate,
+        resolved_catalog: ResolvedCatalogConnection | None = None,
     ) -> MCPIntegration:
-        """Create a new MCP integration."""
-        catalog_row = await self._resolve_create_platform_mcp_catalog(params=params)
+        """Create a new MCP integration.
+
+        ``resolved_catalog`` lets a caller that already bound the request to a
+        catalog recipe pass it through, so one request resolves the catalog once.
+        """
+        if resolved_catalog is None:
+            resolved_catalog = self._resolve_catalog_connection_for_create(params)
+        if resolved_catalog is not None:
+            self._validate_catalog_url_credentials(
+                params=params, spec=resolved_catalog.spec
+            )
+        catalog_row = resolved_catalog.entry if resolved_catalog else None
         slug = await self._generate_mcp_integration_slug(
             name=params.name,
             requested_slug=catalog_row.slug if catalog_row else None,
@@ -2429,7 +3098,7 @@ class IntegrationService(BaseWorkspaceService):
                         custom_credentials
                     )
         else:
-            self._validate_stdio_server_config(
+            self.validate_stdio_server_config(
                 command=params.stdio_command,
                 args=params.stdio_args,
                 env=params.stdio_env,
@@ -2480,10 +3149,13 @@ class IntegrationService(BaseWorkspaceService):
         oauth_integration = await self.session.get(
             OAuthIntegration, mcp_integration.oauth_integration_id
         )
+        # CONNECTED covers "token present and alive (or refreshable)"; a
+        # reauth_required row must fall through to the reconnect redirect.
         return bool(
             oauth_integration
             and oauth_integration.workspace_id == self.workspace_id
             and is_set(oauth_integration.encrypted_access_token)
+            and oauth_integration.status == IntegrationStatus.CONNECTED
         )
 
     async def _start_existing_custom_mcp_oauth(
@@ -2510,11 +3182,27 @@ class IntegrationService(BaseWorkspaceService):
         endpoints = await self._resolve_mcp_oauth_endpoints(
             server_uri=mcp_integration.server_uri,
             provider_config=provider_config,
+            oauth_resource=self._catalog_mcp_oauth_resource(
+                mcp_integration.catalog_slug
+            ),
         )
         client_secret = (
             provider_config.client_secret.get_secret_value()
             if provider_config.client_secret
             else None
+        )
+        # Reconnect reuses the registered client, so stored scopes go out
+        # verbatim; legacy NULL rows still expand with offline_access.
+        requested_scopes = mcp_requested_scopes(
+            scopes=provider_config.scopes,
+            scopes_supported=endpoints.scopes_supported,
+            expand=provider_config.scopes is None,
+        )
+        self.logger.info(
+            "Reconnecting custom MCP OAuth integration",
+            provider_id=oauth_integration.provider_id,
+            scopes_supported=endpoints.scopes_supported,
+            requested_scopes=requested_scopes,
         )
         oauth_connect = await self._start_custom_mcp_oauth_authorization(
             integration=oauth_integration,
@@ -2525,29 +3213,35 @@ class IntegrationService(BaseWorkspaceService):
                 client_secret=client_secret,
                 auth_method=None,
             ),
+            requested_scopes=requested_scopes,
+            authorize_params=self._catalog_mcp_authorize_params(
+                mcp_integration.catalog_slug
+            ),
         )
         return PlatformMCPCatalogConnectResult(
             mcp_integration=mcp_integration,
             oauth_connect=oauth_connect,
         )
 
-    @require_scope("integration:create")
+    @require_scope("integration:create", "integration:read")
     async def connect_platform_mcp_catalog(
-        self, *, catalog_slug: str
+        self, *, catalog_slug: str, connection_option_id: str | None = None
     ) -> PlatformMCPCatalogConnectResult:
         """Create or return the workspace MCP row for a catalog entry.
 
         Runtime catalog recipes are the primary path. Provider-backed OAuth is
         retained as an exception/legacy fallback for rows without a generic
         connection spec.
+
+        This request carries no connection fields, so the recipe cannot be
+        inferred: the caller names the option it offered, else the catalog's
+        declared default applies.
         """
-        catalog = get_platform_mcp_catalog_entry_by_slug(
-            catalog_slug, include_private=True
+        catalog = resolve_available_catalog_entry(catalog_slug)
+        connection = self._resolve_catalog_connect_option(
+            catalog, connection_option_id=connection_option_id
         )
-        if catalog is None:
-            raise ValueError("Platform MCP catalog row not found")
-        if catalog.status != "available":
-            raise ValueError(f"{catalog.name} is not available to connect")
+        spec = connection.spec if connection else None
 
         existing = await self._get_mcp_integration_by_catalog(catalog)
         if existing is not None:
@@ -2556,16 +3250,10 @@ class IntegrationService(BaseWorkspaceService):
                     mcp_integration=existing
                 ):
                     return PlatformMCPCatalogConnectResult(mcp_integration=existing)
-                # Re-establishing auth on an existing (e.g. migrated) catalog row
-                # is a reconnect, gated the same as a fresh catalog connect.
-                # Unentitled workspaces keep connected rows and may disconnect,
-                # but must reconnect as a custom MCP server.
-                await self.require_entitlement(Entitlement.AGENT_ADDONS)
                 if custom_connect := await self._start_existing_custom_mcp_oauth(
                     mcp_integration=existing
                 ):
                     return custom_connect
-                spec = self._catalog_connection_spec(catalog)
                 if spec and spec.server_type == "http" and existing.server_uri:
                     return await self.connect_mcp_oauth_discovery(
                         params=MCPHttpIntegrationCreate(
@@ -2577,7 +3265,7 @@ class IntegrationService(BaseWorkspaceService):
                             server_uri=existing.server_uri,
                             auth_type=MCPAuthType.OAUTH2,
                         ),
-                        catalog_spec=spec,
+                        resolved_catalog=connection,
                         existing_mcp_integration=existing,
                     )
                 if provider_connect := await self._start_catalog_provider_oauth(
@@ -2587,10 +3275,12 @@ class IntegrationService(BaseWorkspaceService):
                     return provider_connect
             return PlatformMCPCatalogConnectResult(mcp_integration=existing)
 
-        await self.require_entitlement(Entitlement.AGENT_ADDONS)
-
-        spec = self._catalog_connection_spec(catalog)
-        if spec and spec.server_type == "http" and spec.auth_type == MCPAuthType.OAUTH2:
+        if (
+            connection is not None
+            and spec is not None
+            and spec.server_type == "http"
+            and spec.auth_type == MCPAuthType.OAUTH2
+        ):
             if self._catalog_requires_user_config(spec):
                 raise ValueError(
                     f"{catalog.name} requires configuration before connect"
@@ -2605,13 +3295,16 @@ class IntegrationService(BaseWorkspaceService):
                     server_uri=spec.server_uri,
                     auth_type=MCPAuthType.OAUTH2,
                 ),
-                catalog_spec=spec,
+                resolved_catalog=connection,
             )
 
-        if spec is not None:
+        if connection is not None and spec is not None:
             params = self._catalog_connect_create_params(catalog=catalog, spec=spec)
             return PlatformMCPCatalogConnectResult(
-                mcp_integration=await self.create_mcp_integration(params=params)
+                mcp_integration=await self.create_mcp_integration(
+                    params=params, resolved_catalog=connection
+                ),
+                created=True,
             )
 
         if provider_connect := await self._start_catalog_provider_oauth(
@@ -2657,15 +3350,22 @@ class IntegrationService(BaseWorkspaceService):
             MCPIntegration.catalog_slug == catalog.slug,
         )
         result = await self.session.execute(statement)
-        if mcp_integration := result.scalars().first():
-            return mcp_integration
+        # A row bound during a rolling deploy may carry a recipe this entry no
+        # longer offers (e.g. stdio on a now HTTP-only slug). Such a row is a
+        # custom server and must not shadow the hosted replacement.
+        for mcp_integration in result.scalars():
+            if catalog_binding_is_current(
+                catalog_slug=catalog.slug, server_type=mcp_integration.server_type
+            ):
+                return mcp_integration
 
         # Legacy rows predate the ``catalog_slug`` column, so they carry no
         # marker. Adopt a null-slug row only when its slug matches the catalog
         # slug AND its server config matches the catalog recipe, then heal it
         # in place. The recipe check prevents a coincidentally same-named custom
         # integration from being hijacked as a platform row.
-        spec = self._catalog_connection_spec(catalog)
+        connection = self._resolve_catalog_connect_option(catalog)
+        spec = connection.spec if connection else None
         if spec is not None:
             legacy = (
                 (
@@ -2697,12 +3397,13 @@ class IntegrationService(BaseWorkspaceService):
         provider_id = catalog.provider_id
         if not provider_id:
             return None
-        provider_impl = get_provider_class(
+        mcp_provider_impl = get_provider_class(
             ProviderKey(id=provider_id, grant_type=OAuthGrantType.AUTHORIZATION_CODE)
         )
-        if provider_impl is None or not issubclass(provider_impl, MCPAuthProvider):
+        if mcp_provider_impl is None or not issubclass(
+            mcp_provider_impl, MCPAuthProvider
+        ):
             return None
-        mcp_provider_impl = cast(type[MCPAuthProvider], provider_impl)
         statement = (
             select(MCPIntegration)
             .join(
@@ -2732,11 +3433,81 @@ class IntegrationService(BaseWorkspaceService):
         )
 
     @staticmethod
-    def _catalog_connection_spec(
+    def _resolve_catalog_connect_option(
         catalog: PlatformMCPCatalogEntry,
-    ) -> MCPConnectionSpec | None:
-        """Return the validated runtime catalog connection spec."""
-        return catalog.connection_spec
+        *,
+        connection_option_id: str | None = None,
+    ) -> ResolvedCatalogConnection | None:
+        """Bind a catalog row to the recipe one-click Connect uses.
+
+        The request carries no connection fields, so the recipe is either the
+        option the caller names or the catalog's declared default.
+        """
+        options = connect_options(catalog)
+        if connection_option_id:
+            option = next(
+                (option for option in options if option.id == connection_option_id),
+                None,
+            )
+            if option is None:
+                raise CatalogConnectionError(
+                    f"Connection option {connection_option_id!r} does not exist "
+                    f"for {catalog.name}"
+                )
+            return ResolvedCatalogConnection(entry=catalog, option=option)
+
+        default_option = next(
+            (
+                option
+                for option in options
+                if option.connection_spec == catalog.connection_spec
+            ),
+            None,
+        )
+        if default_option is None:
+            return None
+        return ResolvedCatalogConnection(entry=catalog, option=default_option)
+
+    @classmethod
+    def _catalog_mcp_oauth_resource(cls, catalog_slug: str | None) -> str | None:
+        """Return a catalog-pinned OAuth resource for a saved MCP integration."""
+        if catalog_slug is None:
+            return None
+        catalog = get_platform_mcp_catalog_entry_by_slug(
+            catalog_slug, include_private=True
+        )
+        if catalog is None:
+            return None
+        if not isinstance(catalog.connection_spec, MCPHTTPOAuth2ConnectionSpec):
+            return None
+        return catalog.connection_spec.oauth_resource
+
+    @classmethod
+    def _catalog_mcp_authorize_params(cls, catalog_slug: str | None) -> dict[str, str]:
+        """Return catalog-pinned authorize parameters for a saved MCP integration.
+
+        A saved row does not record which connection option it came from, so
+        the default spec and every option spec are scanned; the first OAuth
+        spec that pins parameters wins.
+        """
+        if catalog_slug is None:
+            return {}
+        catalog = get_platform_mcp_catalog_entry_by_slug(
+            catalog_slug, include_private=True
+        )
+        if catalog is None:
+            return {}
+        specs = [
+            catalog.connection_spec,
+            *(option.connection_spec for option in catalog.connection_options or []),
+        ]
+        for spec in specs:
+            if (
+                isinstance(spec, MCPHTTPOAuth2ConnectionSpec)
+                and spec.oauth_authorize_params
+            ):
+                return spec.oauth_authorize_params
+        return {}
 
     @staticmethod
     def _catalog_requires_user_config(spec: MCPConnectionSpec) -> bool:
@@ -2863,9 +3634,14 @@ class IntegrationService(BaseWorkspaceService):
 
         Platform-managed rows are auto-created by ``MCPAuthProvider`` flows in
         ``_auto_create_mcp_integration_if_needed`` or created from catalog
-        recipes carrying a ``catalog_slug`` marker.
+        recipes carrying a ``catalog_slug`` marker. A marker whose recipe no
+        longer exists for the row's transport is stale and does not count,
+        so the row surfaces as a custom server instead of disappearing.
         """
-        if mcp_integration.catalog_slug is not None:
+        if mcp_integration.catalog_slug is not None and catalog_binding_is_current(
+            catalog_slug=mcp_integration.catalog_slug,
+            server_type=mcp_integration.server_type,
+        ):
             return True
 
         oauth_integration = mcp_integration.oauth_integration
@@ -2909,20 +3685,34 @@ class IntegrationService(BaseWorkspaceService):
         ]
 
     @staticmethod
-    def _mcp_integration_state_from_access_token(
+    def _mcp_integration_state_from_token(
         *,
         mcp_integration: MCPIntegration,
-        encrypted_access_token: bytes | None,
+        token_state: OAuthTokenState | None,
+        oauth_grant_type: OAuthGrantType | None,
     ) -> PlatformMCPCatalogState:
-        if mcp_integration.auth_type != MCPAuthType.OAUTH2:
-            return "connected"
-        if encrypted_access_token is not None and is_set(encrypted_access_token):
-            return "connected"
-        return "configured"
+        if mcp_integration.auth_type == MCPAuthType.OAUTH2:
+            if token_state is None or not (
+                token_state.encrypted_access_token is not None
+                and is_set(token_state.encrypted_access_token)
+            ):
+                return "configured"
+            if (
+                oauth_grant_type == OAuthGrantType.AUTHORIZATION_CODE
+                and credential_reauth_required(
+                    has_refresh_token=token_state.encrypted_refresh_token is not None
+                    and is_set(token_state.encrypted_refresh_token),
+                    expires_at=token_state.expires_at,
+                )
+            ):
+                return "reauth_required"
+        if mcp_integration.tools is None:
+            return "configured"
+        return "connected"
 
-    async def _mcp_oauth_access_tokens_by_id(
+    async def _mcp_oauth_states_by_id(
         self, mcp_integrations: Sequence[MCPIntegration]
-    ) -> dict[uuid.UUID, bytes | None]:
+    ) -> dict[uuid.UUID, MCPOAuthConnectionState]:
         oauth_integration_ids = {
             oauth_integration_id
             for mcp_integration in mcp_integrations
@@ -2934,27 +3724,69 @@ class IntegrationService(BaseWorkspaceService):
             return {}
 
         result = await self.session.execute(
-            select(OAuthIntegration.id, OAuthIntegration.encrypted_access_token).where(
+            select(
+                OAuthIntegration.id,
+                OAuthIntegration.encrypted_access_token,
+                OAuthIntegration.encrypted_refresh_token,
+                OAuthIntegration.expires_at,
+                OAuthIntegration.grant_type,
+            ).where(
                 OAuthIntegration.workspace_id == self.workspace_id,
                 OAuthIntegration.id.in_(oauth_integration_ids),
             )
         )
-        rows = result.tuples().all()
-        return dict(rows)
+        return {
+            row_id: MCPOAuthConnectionState(
+                token_state=OAuthTokenState(access_token, refresh_token, expires_at),
+                grant_type=grant_type,
+            )
+            for (
+                row_id,
+                access_token,
+                refresh_token,
+                expires_at,
+                grant_type,
+            ) in result.tuples().all()
+        }
+
+    async def mcp_oauth_authorization_pending(
+        self, *, mcp_integration: MCPIntegration
+    ) -> bool:
+        """Whether an OAUTH2 MCP integration is still awaiting its OAuth callback.
+
+        True when the linked OAuth integration has no stored access token yet,
+        i.e. the user has not completed the authorization redirect. Used to skip
+        connect/save verification until a token exists; the OAuth callback runs
+        its own verification after the token exchange.
+        """
+        if mcp_integration.auth_type != MCPAuthType.OAUTH2:
+            return False
+        oauth_integration_id = mcp_integration.oauth_integration_id
+        if oauth_integration_id is None:
+            return True
+        oauth_states_by_id = await self._mcp_oauth_states_by_id([mcp_integration])
+        oauth_state = oauth_states_by_id.get(oauth_integration_id)
+        encrypted_access_token = (
+            oauth_state.token_state.encrypted_access_token if oauth_state else None
+        )
+        return not (
+            encrypted_access_token is not None and is_set(encrypted_access_token)
+        )
 
     async def mcp_integration_state(
         self, *, mcp_integration: MCPIntegration
     ) -> PlatformMCPCatalogState:
-        tokens_by_id = await self._mcp_oauth_access_tokens_by_id([mcp_integration])
+        oauth_states_by_id = await self._mcp_oauth_states_by_id([mcp_integration])
         oauth_integration_id = mcp_integration.oauth_integration_id
-        encrypted_access_token = (
-            tokens_by_id.get(oauth_integration_id)
+        oauth_state = (
+            oauth_states_by_id.get(oauth_integration_id)
             if oauth_integration_id is not None
             else None
         )
-        return self._mcp_integration_state_from_access_token(
+        return self._mcp_integration_state_from_token(
             mcp_integration=mcp_integration,
-            encrypted_access_token=encrypted_access_token,
+            token_state=oauth_state.token_state if oauth_state else None,
+            oauth_grant_type=oauth_state.grant_type if oauth_state else None,
         )
 
     async def list_mcp_integrations_with_state(
@@ -2962,49 +3794,664 @@ class IntegrationService(BaseWorkspaceService):
     ) -> Sequence[MCPIntegrationWithState]:
         """List MCP integrations with OAuth-backed connection state."""
         integrations = await self.list_mcp_integrations(source=source)
-        tokens_by_id = await self._mcp_oauth_access_tokens_by_id(integrations)
+        oauth_states_by_id = await self._mcp_oauth_states_by_id(integrations)
         items: list[MCPIntegrationWithState] = []
         for integration in integrations:
             oauth_integration_id = integration.oauth_integration_id
-            encrypted_access_token = (
-                tokens_by_id.get(oauth_integration_id)
+            oauth_state = (
+                oauth_states_by_id.get(oauth_integration_id)
                 if oauth_integration_id is not None
                 else None
             )
             items.append(
                 MCPIntegrationWithState(
                     integration=integration,
-                    state=self._mcp_integration_state_from_access_token(
+                    state=self._mcp_integration_state_from_token(
                         mcp_integration=integration,
-                        encrypted_access_token=encrypted_access_token,
+                        token_state=oauth_state.token_state if oauth_state else None,
+                        oauth_grant_type=(
+                            oauth_state.grant_type if oauth_state else None
+                        ),
                     ),
                 )
             )
         return items
 
     async def get_mcp_integration(
-        self, *, mcp_integration_id: uuid.UUID
+        self, *, mcp_integration_id: uuid.UUID, for_update: bool = False
     ) -> MCPIntegration | None:
-        """Get an MCP integration by ID."""
+        """Get an MCP integration by ID.
+
+        Pass ``for_update=True`` to lock the row (``SELECT ... FOR UPDATE``)
+        before a read-modify-write of the ``tools`` JSON blob. The blob is
+        rewritten wholesale, so concurrent writers (e.g. a policy toggle racing
+        connection verification) must serialize or one commit silently drops the
+        other's changes to unrelated tools.
+        """
         statement = select(MCPIntegration).where(
             MCPIntegration.id == mcp_integration_id,
             MCPIntegration.workspace_id == self.workspace_id,
         )
+        if for_update:
+            statement = statement.with_for_update()
         result = await self.session.execute(statement)
         return result.scalars().first()
 
+    async def _probe_mcp_http_server(
+        self, mcp_integration: MCPIntegration
+    ) -> list[MCPToolSummary]:
+        """Resolve an HTTP MCP config and list the server's tools.
+
+        Side-effect free.
+
+        Raises:
+            MCPConnectionVerificationError: If the config cannot be resolved,
+                the connection times out, or the server is unreachable.
+        """
+        # Imported lazily: fastmcp's dependencies install a global beartype
+        # import hook that breaks Temporal's workflow sandbox in processes
+        # that import this module (e.g. the executor worker).
+        from tracecat.agent.mcp.user_client import list_remote_mcp_tools
+
+        try:
+            server_config = await self.resolve_mcp_http_server_config(mcp_integration)
+            timeout = mcp_integration.timeout or MCP_TEST_CONNECTION_TIMEOUT_CAP
+            server_config["timeout"] = min(timeout, MCP_TEST_CONNECTION_TIMEOUT_CAP)
+            # The transport timeout only covers reads; the outer timeout guards
+            # connect-phase hangs as well.
+            async with asyncio.timeout(MCP_TEST_CONNECTION_TIMEOUT_CAP + 5):
+                return await list_remote_mcp_tools(server_config)
+        except MCPConfigurationError as e:
+            raise MCPConnectionVerificationError(
+                "MCP integration is not configured correctly",
+                sanitize_urls_in_text(str(e)),
+            ) from e
+        except TimeoutError as e:
+            raise MCPConnectionVerificationError(
+                "Connection to the MCP server timed out",
+                sanitize_urls_in_text(str(e)) or "Timed out",
+            ) from e
+        except Exception as e:
+            # Transport errors can echo the full request URL, including
+            # userinfo or query-string secrets — sanitize before this text
+            # reaches logs or API error responses.
+            raise MCPConnectionVerificationError(
+                "Failed to connect to the MCP server",
+                sanitize_urls_in_text(str(e)),
+            ) from e
+
+    async def _probe_mcp_stdio_server(
+        self, mcp_integration: MCPIntegration
+    ) -> list[MCPToolSummary]:
+        """Run a saved stdio MCP integration probe on the executor sandbox."""
+        if mcp_integration.server_type != "stdio":
+            raise MCPConnectionVerificationError(
+                "Only stdio MCP servers can be probed with the stdio verifier"
+            )
+        if mcp_integration.id is None:
+            raise MCPConnectionVerificationError("MCP integration must be saved first")
+
+        client = await get_temporal_client()
+        workflow_id = build_stdio_mcp_probe_workflow_id(
+            workspace_id=self.workspace_id,
+            mcp_integration_id=mcp_integration.id,
+        )
+        try:
+            result = await client.execute_workflow(
+                StdioMCPProbeWorkflow.run,
+                StdioMCPProbeWorkflowInput(
+                    mcp_integration_id=mcp_integration.id,
+                    role=self.role,
+                ),
+                id=workflow_id,
+                task_queue=config.TRACECAT__AGENT_QUEUE,
+                run_timeout=timedelta(seconds=MCP_STDIO_PROBE_TIMEOUT_CAP + 90),
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                id_conflict_policy=WorkflowIDConflictPolicy.TERMINATE_EXISTING,
+            )
+        except WorkflowFailureError as exc:
+            if self._exception_chain_contains(exc, TerminatedError):
+                raise MCPConnectionVerificationError(
+                    "Stdio MCP verification was superseded by a newer verification",
+                    "Superseded by a newer verification",
+                ) from exc
+            raise MCPConnectionVerificationError(
+                "Failed to run stdio MCP probe",
+                sanitize_urls_in_text(str(exc)),
+            ) from exc
+        except Exception as exc:
+            raise MCPConnectionVerificationError(
+                "Failed to start stdio MCP probe",
+                sanitize_urls_in_text(str(exc)),
+            ) from exc
+
+        if not result.success:
+            raise MCPConnectionVerificationError(
+                result.message,
+                sanitize_urls_in_text(result.error or result.message),
+            )
+        return result.tools
+
+    async def persist_mcp_integration_tools(
+        self,
+        *,
+        mcp_integration_id: uuid.UUID,
+        discovered_tools: Sequence[MCPToolSummary],
+        previous_tools: list[dict[str, Any]] | None = None,
+    ) -> list[MCPToolSummary]:
+        """Persist discovered MCP tools while preserving stored per-tool policy.
+
+        The probe runs unlocked. This method takes the row lock before rewriting
+        the tools blob so policy updates and verification commits serialize.
+        """
+        mcp_integration = await self.get_mcp_integration(
+            mcp_integration_id=mcp_integration_id,
+            for_update=True,
+        )
+        if mcp_integration is None:
+            raise ValueError("MCP integration not found")
+
+        merge_base_tools = (
+            previous_tools if previous_tools is not None else mcp_integration.tools
+        )
+        merged_tools = self._merge_mcp_tool_summaries(
+            discovered_tools,
+            merge_base_tools,
+            mcp_integration_id=mcp_integration.id,
+        )
+        mcp_integration.tools = [tool.model_dump() for tool in merged_tools]
+        self.session.add(mcp_integration)
+        await self.session.commit()
+        await self.session.refresh(mcp_integration)
+        self.logger.info(
+            "MCP integration tools persisted",
+            mcp_integration_id=str(mcp_integration.id),
+            tool_count=len(discovered_tools),
+        )
+        return merged_tools
+
+    async def test_mcp_http_connection(
+        self, *, params: MCPHttpIntegrationTestConnectionRequest
+    ) -> MCPIntegrationTestConnectionResponse:
+        """Test connectivity against an unsaved HTTP MCP configuration.
+
+        Fully ephemeral: nothing is persisted and a failure never touches the
+        stored verification state of any existing integration. When
+        ``params.mcp_integration_id`` references an existing row, its stored
+        secrets back-fill fields the caller left blank — but only for callers
+        with ``integration:update``. This route is reachable with
+        ``integration:create`` alone; without the back-fill guard a create-only
+        caller could pair a saved integration id with an attacker-controlled
+        ``server_uri`` and have the probe send the stored API key or OAuth
+        bearer token to that host if this route is ever exposed without the
+        update permission that currently guards stored credential reuse.
+        """
+        existing: MCPIntegration | None = None
+        if params.mcp_integration_id is not None:
+            existing = await self.get_mcp_integration(
+                mcp_integration_id=params.mcp_integration_id
+            )
+
+        # Reusing a saved integration's stored secrets is an update-scoped
+        # operation. Without integration:update, ignore the existing row's
+        # secrets so the probe runs with only caller-supplied credentials.
+        can_reuse_stored_secrets = (
+            existing is not None
+            and self.role.scopes is not None
+            and has_scope(self.role.scopes, "integration:update")
+        )
+        reusable = existing if can_reuse_stored_secrets else None
+
+        if params.custom_credentials is not None:
+            # An explicit empty string means "test without stored headers"
+            # (the user cleared the credentials editor) — mirror the update
+            # path, which maps "" to no headers rather than back-filling.
+            raw_credentials = params.custom_credentials.get_secret_value()
+            encrypted_headers = (
+                self._encrypt_token(raw_credentials) if raw_credentials else None
+            )
+        else:
+            encrypted_headers = reusable.encrypted_headers if reusable else None
+        oauth_integration_id = params.oauth_integration_id or (
+            reusable.oauth_integration_id if reusable else None
+        )
+        # Transient row used purely for config resolution — never added to the
+        # session, so it is never persisted.
+        transient = MCPIntegration(
+            id=uuid4(),
+            workspace_id=self.workspace_id,
+            name=existing.name if existing else "MCP connection test",
+            slug=existing.slug if existing else "mcp-connection-test",
+            server_type="http",
+            server_uri=params.server_uri,
+            auth_type=params.auth_type,
+            oauth_integration_id=oauth_integration_id,
+            encrypted_headers=encrypted_headers,
+            timeout=params.timeout,
+        )
+
+        try:
+            tools = await self._probe_mcp_http_server(transient)
+        except MCPConnectionVerificationError as e:
+            return MCPIntegrationTestConnectionResponse(
+                success=False,
+                mcp_integration_id=params.mcp_integration_id,
+                message=e.message,
+                error=e.error,
+            )
+
+        return MCPIntegrationTestConnectionResponse(
+            success=True,
+            mcp_integration_id=params.mcp_integration_id,
+            tools=tools,
+            message=f"Connected successfully — {len(tools)} tools available",
+        )
+
+    async def test_mcp_stdio_connection(
+        self, *, params: MCPStdioIntegrationTestConnectionRequest
+    ) -> MCPIntegrationTestConnectionResponse:
+        """Test connectivity against a saved stdio MCP integration."""
+        existing = await self.get_mcp_integration(
+            mcp_integration_id=params.mcp_integration_id
+        )
+        if existing is None:
+            return MCPIntegrationTestConnectionResponse(
+                success=False,
+                mcp_integration_id=params.mcp_integration_id,
+                message="MCP integration not found",
+                error="MCP integration not found",
+            )
+        if existing.server_type != "stdio":
+            return MCPIntegrationTestConnectionResponse(
+                success=False,
+                mcp_integration_id=params.mcp_integration_id,
+                message="MCP integration is not a stdio server",
+                error="MCP integration is not a stdio server",
+            )
+        return await self.verify_mcp_integration(mcp_integration=existing)
+
+    async def test_mcp_connection(
+        self, *, params: MCPIntegrationTestConnectionRequest
+    ) -> MCPIntegrationTestConnectionResponse:
+        """Test connectivity against an unsaved MCP configuration."""
+        if isinstance(params, MCPStdioIntegrationTestConnectionRequest):
+            return await self.test_mcp_stdio_connection(params=params)
+        return await self.test_mcp_http_connection(params=params)
+
+    async def verify_mcp_integration(
+        self,
+        *,
+        mcp_integration: MCPIntegration,
+        previous_tools: list[dict[str, Any]] | None = None,
+    ) -> MCPIntegrationTestConnectionResponse:
+        """Verify connectivity to an MCP server and persist its tools.
+
+        A successful verification refreshes the discovered tool set while
+        preserving stored per-tool policy. A failed verification is reported to
+        the caller without mutating the last known tool snapshot.
+        """
+        try:
+            if mcp_integration.server_type == "stdio":
+                tools = await self._probe_mcp_stdio_server(mcp_integration)
+            else:
+                tools = await self._probe_mcp_http_server(mcp_integration)
+        except MCPConnectionVerificationError as e:
+            return await self._record_mcp_verification_failure(
+                mcp_integration,
+                message=e.message,
+                error=e.error or e.message,
+            )
+
+        merged_tools = await self.persist_mcp_integration_tools(
+            mcp_integration_id=mcp_integration.id,
+            discovered_tools=tools,
+            previous_tools=previous_tools,
+        )
+        self.logger.info(
+            "MCP integration verified",
+            mcp_integration_id=str(mcp_integration.id),
+            tool_count=len(tools),
+        )
+        return MCPIntegrationTestConnectionResponse(
+            success=True,
+            mcp_integration_id=mcp_integration.id,
+            tools=merged_tools,
+            message=f"Connected successfully — {len(tools)} tools available",
+        )
+
+    async def _record_mcp_verification_failure(
+        self,
+        mcp_integration: MCPIntegration,
+        *,
+        message: str,
+        error: str,
+    ) -> MCPIntegrationTestConnectionResponse:
+        """Record a failed verification response without mutating stored policy."""
+        self.logger.warning(
+            "MCP integration verification failed",
+            mcp_integration_id=str(mcp_integration.id),
+            message=message,
+            error=error,
+        )
+        return MCPIntegrationTestConnectionResponse(
+            success=False,
+            mcp_integration_id=mcp_integration.id,
+            message=message,
+            error=error,
+        )
+
+    @require_scope("integration:read")
+    async def start_mcp_stdio_verification(
+        self, *, mcp_integration: MCPIntegration
+    ) -> None:
+        """Launch saved stdio MCP verification without blocking the request."""
+        if mcp_integration.server_type != "stdio":
+            raise ValueError(
+                "Only stdio MCP integrations can be verified asynchronously"
+            )
+        if mcp_integration.id is None:
+            raise ValueError("MCP integration must be saved first")
+
+        workflow_id = build_stdio_mcp_probe_workflow_id(
+            workspace_id=self.workspace_id,
+            mcp_integration_id=mcp_integration.id,
+        )
+        client = await get_temporal_client()
+        # Running probes may be bound to older config snapshots; latest saves
+        # must supersede them.
+        await client.start_workflow(
+            StdioMCPProbeWorkflow.run,
+            StdioMCPProbeWorkflowInput(
+                mcp_integration_id=mcp_integration.id,
+                role=self.role,
+                persist_result=True,
+            ),
+            id=workflow_id,
+            task_queue=config.TRACECAT__AGENT_QUEUE,
+            run_timeout=timedelta(seconds=MCP_STDIO_PROBE_TIMEOUT_CAP + 90),
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+            id_conflict_policy=WorkflowIDConflictPolicy.TERMINATE_EXISTING,
+        )
+
+        self.logger.info(
+            "Started stdio MCP verification workflow",
+            mcp_integration_id=str(mcp_integration.id),
+            workflow_id=workflow_id,
+        )
+
+    async def get_stdio_mcp_verification_status(
+        self, *, mcp_integration: MCPIntegration
+    ) -> MCPVerificationStatusRead:
+        """Return the durable stdio verification workflow status."""
+        if mcp_integration.server_type != "stdio" or mcp_integration.id is None:
+            return MCPVerificationStatusRead(status="idle")
+
+        workflow_id = build_stdio_mcp_probe_workflow_id(
+            workspace_id=self.workspace_id,
+            mcp_integration_id=mcp_integration.id,
+        )
+        client = await get_temporal_client()
+        handle = client.get_workflow_handle(
+            workflow_id,
+            result_type=StdioMCPProbeResult,
+        )
+        try:
+            description = await handle.describe()
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                return MCPVerificationStatusRead(status="idle")
+            raise
+
+        match description.status:
+            case WorkflowExecutionStatus.RUNNING:
+                return MCPVerificationStatusRead(status="verifying")
+            case WorkflowExecutionStatus.COMPLETED:
+                try:
+                    result = StdioMCPProbeResult.model_validate(await handle.result())
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to fetch completed stdio MCP verification result",
+                        mcp_integration_id=str(mcp_integration.id),
+                        workflow_id=workflow_id,
+                        error=sanitize_stdio_probe_error(str(exc)),
+                    )
+                    return MCPVerificationStatusRead(
+                        status="failed",
+                        error=sanitize_stdio_probe_error(
+                            "Stdio MCP verification failed"
+                        ),
+                    )
+                if result.success:
+                    return MCPVerificationStatusRead(status="succeeded")
+                return MCPVerificationStatusRead(
+                    status="failed",
+                    error=sanitize_stdio_probe_error(result.error or result.message),
+                )
+            case WorkflowExecutionStatus.TERMINATED:
+                return MCPVerificationStatusRead(status="superseded")
+            case (
+                WorkflowExecutionStatus.FAILED
+                | WorkflowExecutionStatus.TIMED_OUT
+                | WorkflowExecutionStatus.CANCELED
+            ):
+                return MCPVerificationStatusRead(
+                    status="failed",
+                    error=sanitize_stdio_probe_error("Stdio MCP verification failed"),
+                )
+            case _:
+                return MCPVerificationStatusRead(
+                    status="failed",
+                    error=sanitize_stdio_probe_error("Stdio MCP verification failed"),
+                )
+
+    def _decrypt_mcp_custom_headers(
+        self, mcp_integration: MCPIntegration
+    ) -> dict[str, str]:
+        """Decrypt and validate custom headers stored on an MCP integration.
+
+        Raises:
+            MCPConfigurationError: If headers are missing, malformed, or not a
+                JSON object of string keys to string values.
+        """
+        if not mcp_integration.encrypted_headers:
+            raise MCPConfigurationError(
+                "MCP integration has no custom headers configured"
+            )
+        encryption_key = get_db_encryption_key()
+        try:
+            decrypted = decrypt_value(
+                mcp_integration.encrypted_headers, key=encryption_key
+            )
+            parsed = orjson.loads(decrypted)
+        except (orjson.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+            raise MCPConfigurationError("Custom headers are malformed") from e
+        if not isinstance(parsed, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in parsed.items()
+        ):
+            raise MCPConfigurationError(
+                "Custom headers must be a JSON object of string header values"
+            )
+        return cast(dict[str, str], parsed)
+
+    async def resolve_mcp_http_server_config(
+        self, mcp_integration: MCPIntegration
+    ) -> MCPHttpServerConfig:
+        """Resolve an HTTP MCP integration into a connectable server config.
+
+        Decrypts custom headers and refreshes/attaches the OAuth access token
+        as needed. Secrets are resolved at call time — never persist or send
+        the result across a Temporal boundary.
+
+        Raises:
+            MCPConfigurationError: If the integration is stdio-type or its
+                configuration/credentials cannot be resolved.
+        """
+        if mcp_integration.server_type != "http":
+            raise MCPConfigurationError(
+                "Only HTTP MCP servers can be resolved into an HTTP config"
+            )
+        if is_tracecat_registry_server_name(mcp_integration.slug):
+            raise MCPConfigurationError(
+                "MCP integration slug conflicts with the built-in registry. "
+                "Recreate the integration to assign a safe slug."
+            )
+        if not mcp_integration.server_uri:
+            raise MCPConfigurationError("HTTP MCP integration has no server URI")
+
+        headers: dict[str, str] = {}
+        if mcp_integration.auth_type == MCPAuthType.OAUTH2:
+            if not mcp_integration.oauth_integration_id:
+                raise MCPConfigurationError(
+                    "OAuth MCP integration has no linked OAuth integration"
+                )
+            stmt = select(OAuthIntegration).where(
+                OAuthIntegration.id == mcp_integration.oauth_integration_id,
+                OAuthIntegration.workspace_id == self.workspace_id,
+            )
+            result = await self.session.execute(stmt)
+            oauth_integration = result.scalars().first()
+            if not oauth_integration:
+                raise MCPConfigurationError("Linked OAuth integration not found")
+            try:
+                oauth_integration = await self.refresh_token_if_needed(
+                    oauth_integration
+                )
+            except OAuthRefreshBusyError as e:
+                raise MCPConfigurationError(
+                    "OAuth integration is busy refreshing"
+                ) from e
+            access_token = await self.get_access_token(oauth_integration)
+            if not access_token:
+                raise MCPConfigurationError(
+                    "OAuth integration has no access token (likely disconnected)"
+                )
+            token_type = oauth_integration.token_type or "Bearer"
+            headers["Authorization"] = f"{token_type} {access_token.get_secret_value()}"
+            if mcp_integration.encrypted_headers:
+                try:
+                    custom_headers = self._decrypt_mcp_custom_headers(mcp_integration)
+                except MCPConfigurationError:
+                    # Extra headers are optional for OAuth2; malformed values must
+                    # not disable an integration that has a valid access token.
+                    self.logger.warning(
+                        "Ignoring malformed custom headers for OAUTH2 MCP integration",
+                        mcp_integration_id=str(mcp_integration.id),
+                    )
+                    custom_headers = {}
+                for key in list(custom_headers):
+                    # The OAuth Authorization header always wins.
+                    if key.strip().casefold() == "authorization":
+                        custom_headers.pop(key, None)
+                headers.update(custom_headers)
+        elif mcp_integration.auth_type == MCPAuthType.CUSTOM:
+            headers.update(self._decrypt_mcp_custom_headers(mcp_integration))
+        elif mcp_integration.auth_type == MCPAuthType.NONE:
+            pass
+        else:
+            raise MCPConfigurationError(
+                f"Unsupported MCP auth type: {mcp_integration.auth_type}"
+            )
+
+        server_config: MCPHttpServerConfig = {
+            "type": "http",
+            # Display names need not be unique; route by the workspace-unique slug.
+            "name": mcp_integration.slug,
+            "url": mcp_integration.server_uri,
+            "headers": headers,
+            "id": str(mcp_integration.id),
+        }
+        if mcp_integration.timeout is not None:
+            server_config["timeout"] = mcp_integration.timeout
+        return server_config
+
+    def _build_mcp_update_target(
+        self,
+        *,
+        mcp_integration: MCPIntegration,
+        params: MCPIntegrationUpdate,
+        previous_auth_type: MCPAuthType,
+        target_server_uri: str,
+        target_auth_type: MCPAuthType,
+        target_oauth_integration_id: uuid.UUID | None,
+    ) -> MCPIntegration:
+        """Build a transient row representing the merged (post-update) HTTP config.
+
+        Never added to the session; mirrors the credential-merge rules applied
+        later in ``update_mcp_integration``.
+        """
+        if params.custom_credentials is not None:
+            raw_credentials = params.custom_credentials.get_secret_value()
+            target_encrypted_headers = (
+                self._encrypt_token(raw_credentials) if raw_credentials else None
+            )
+        elif params.auth_type == MCPAuthType.NONE:
+            target_encrypted_headers = None
+        elif (
+            previous_auth_type == MCPAuthType.CUSTOM
+            and params.auth_type == MCPAuthType.OAUTH2
+        ):
+            target_encrypted_headers = None
+        else:
+            target_encrypted_headers = mcp_integration.encrypted_headers
+
+        return MCPIntegration(
+            id=mcp_integration.id,
+            workspace_id=self.workspace_id,
+            name=mcp_integration.name,
+            slug=mcp_integration.slug,
+            server_type="http",
+            server_uri=target_server_uri,
+            auth_type=target_auth_type,
+            oauth_integration_id=target_oauth_integration_id,
+            encrypted_headers=target_encrypted_headers,
+            timeout=(
+                params.timeout
+                if params.timeout is not None
+                else mcp_integration.timeout
+            ),
+        )
+
     @require_scope("integration:update")
     async def update_mcp_integration(
-        self, *, mcp_integration_id: uuid.UUID, params: MCPIntegrationUpdate
+        self,
+        *,
+        mcp_integration_id: uuid.UUID,
+        params: MCPIntegrationUpdate,
+        verify_connection: bool = False,
     ) -> MCPIntegration | None:
-        """Update an MCP integration."""
+        """Update an MCP integration.
+
+        With ``verify_connection``, HTTP targets are probed with the merged
+        (post-update) configuration BEFORE anything is persisted: a failed
+        probe raises ``MCPConnectionVerificationError`` and leaves the stored
+        configuration and verification state untouched. Stdio targets are saved
+        first, then verified by saved row ID so env never crosses the Temporal
+        workflow boundary in request input.
+        """
         mcp_integration = await self.get_mcp_integration(
             mcp_integration_id=mcp_integration_id
         )
         if not mcp_integration:
             return None
+        verified_tools: list[MCPToolSummary] | None = None
+        stdio_connection_changed = False
+        previous_stdio_tools: list[dict[str, Any]] | None = None
         previous_auth_type = mcp_integration.auth_type
         previous_server_type = cast(MCPServerType, mcp_integration.server_type)
+        # A binding left behind by a retired or re-transported recipe makes the
+        # row a custom server: skip catalog validation for it. The marker is
+        # left in place; every read path already ignores a stale binding.
+        binding_is_current = (
+            mcp_integration.catalog_slug is None
+            or catalog_binding_is_current(
+                catalog_slug=mcp_integration.catalog_slug,
+                server_type=previous_server_type,
+            )
+        )
+        bound_catalog_slug = (
+            mcp_integration.catalog_slug if binding_is_current else None
+        )
         target_server_type = params.server_type or previous_server_type
         server_type_changed = (
             params.server_type is not None
@@ -3013,6 +4460,10 @@ class IntegrationService(BaseWorkspaceService):
         oauth_integration_id_was_provided = (
             "oauth_integration_id" in params.model_fields_set
         )
+        # Match the persistence semantics below: null is treated as omitted,
+        # while an empty object explicitly clears the stored environment.
+        stdio_env_was_provided = params.stdio_env is not None
+        target_oauth_integration_id = mcp_integration.oauth_integration_id
 
         if target_server_type == "http":
             target_server_uri = params.server_uri or mcp_integration.server_uri
@@ -3028,12 +4479,47 @@ class IntegrationService(BaseWorkspaceService):
             else:
                 target_auth_type = mcp_integration.auth_type
 
-            if oauth_integration_id_was_provided:
-                target_oauth_integration_id = params.oauth_integration_id
-            elif server_type_changed:
+            if target_auth_type != MCPAuthType.OAUTH2 or server_type_changed:
+                # Auth type decides, not field presence: a grant named on a
+                # non-OAuth update would otherwise persist and be reused when
+                # the row switches back to OAUTH2, by which point the URI guard
+                # below sees no change and lets its token reach the new host.
                 target_oauth_integration_id = None
+            elif oauth_integration_id_was_provided:
+                target_oauth_integration_id = params.oauth_integration_id
             else:
                 target_oauth_integration_id = mcp_integration.oauth_integration_id
+
+            # A grant is bound to the URI it was authorized for, so no OAuth
+            # target may carry one to a different URI -- including a grant the
+            # request names explicitly, which is what the edit form resubmits.
+            # Verification below runs before persistence, so an unauthorized
+            # pairing must be rejected here rather than rolled back after the
+            # token has already been sent.
+            if (
+                target_auth_type == MCPAuthType.OAUTH2
+                and target_oauth_integration_id is not None
+                and target_server_uri != mcp_integration.server_uri
+            ):
+                raise ValueError(
+                    "Changing the server URI of an OAuth MCP server requires "
+                    "reauthorizing. Reconnect the server to authorize the new URI."
+                )
+
+            connection_changed = (
+                target_server_uri != mcp_integration.server_uri
+                or target_auth_type != mcp_integration.auth_type
+                or target_oauth_integration_id != mcp_integration.oauth_integration_id
+            )
+            # Only revalidate against the catalog when the connection itself
+            # moved; a drifted recipe must never block a rename or timeout edit.
+            if connection_changed and bound_catalog_slug:
+                self._resolve_catalog_connection_for_update(
+                    catalog_slug=bound_catalog_slug,
+                    server_type="http",
+                    auth_type=target_auth_type,
+                    server_uri=target_server_uri,
+                )
 
             # Validate OAuth integration if auth_type is, or remains, oauth2.
             if target_auth_type == MCPAuthType.OAUTH2 and target_oauth_integration_id:
@@ -3051,25 +4537,74 @@ class IntegrationService(BaseWorkspaceService):
                 raise ValueError(
                     "oauth_integration_id is required for OAuth 2.0 authentication"
                 )
+
+            if verify_connection:
+                update_target = self._build_mcp_update_target(
+                    mcp_integration=mcp_integration,
+                    params=params,
+                    previous_auth_type=previous_auth_type,
+                    target_server_uri=target_server_uri,
+                    target_auth_type=target_auth_type,
+                    target_oauth_integration_id=target_oauth_integration_id,
+                )
+                # Skip the probe while an OAuth2 target still lacks an access
+                # token: the user hasn't completed (or has lost) authorization,
+                # so a benign edit must not be rejected. Mirrors the connect/save
+                # gate (_gate_mcp_connect_verification); the OAuth callback runs
+                # its own verification after token exchange.
+                if not await self.mcp_oauth_authorization_pending(
+                    mcp_integration=update_target
+                ):
+                    verified_tools = await self._probe_mcp_http_server(update_target)
         elif target_server_type == "stdio" and (
             server_type_changed
             or params.stdio_command is not None
             or params.stdio_args is not None
-            or params.stdio_env is not None
+            or stdio_env_was_provided
+            or params.timeout is not None
         ):
-            self._validate_stdio_server_config(
-                command=(
-                    params.stdio_command
-                    if params.stdio_command is not None
-                    else mcp_integration.stdio_command
-                ),
-                args=(
-                    params.stdio_args
-                    if params.stdio_args is not None
-                    else mcp_integration.stdio_args
-                ),
-                env=params.stdio_env,
+            target_stdio_command = (
+                params.stdio_command
+                if params.stdio_command is not None
+                else mcp_integration.stdio_command
             )
+            target_stdio_args = (
+                params.stdio_args
+                if params.stdio_args is not None
+                else mcp_integration.stdio_args
+            )
+            target_stdio_env = params.stdio_env if stdio_env_was_provided else None
+            target_timeout = (
+                params.timeout
+                if params.timeout is not None
+                else mcp_integration.timeout
+            )
+            self.validate_stdio_server_config(
+                command=target_stdio_command,
+                args=target_stdio_args,
+                env=target_stdio_env,
+            )
+            if target_stdio_env is not None:
+                self._validate_stdio_env_against_catalog(
+                    catalog_slug=bound_catalog_slug,
+                    stdio_env=target_stdio_env,
+                )
+            stdio_connection_changed = server_type_changed or (
+                self._stdio_connection_values_changed(
+                    existing=mcp_integration,
+                    target_command=target_stdio_command,
+                    target_args=target_stdio_args,
+                    target_timeout=target_timeout,
+                    stdio_env_was_provided=stdio_env_was_provided,
+                )
+            )
+            if stdio_connection_changed and verify_connection:
+                previous_stdio_tools = (
+                    list(mcp_integration.tools)
+                    if previous_server_type == "stdio"
+                    and mcp_integration.tools is not None
+                    else None
+                )
 
         # Update fields
         if params.name is not None:
@@ -3085,22 +4620,26 @@ class IntegrationService(BaseWorkspaceService):
 
         if params.server_type is not None:
             mcp_integration.server_type = params.server_type
-            if params.server_type == "http":
+            if server_type_changed:
+                # Transport-specific tool names and availability must never be
+                # merged across transport changes.
+                mcp_integration.tools = None
+            if params.server_type == "http" and server_type_changed:
                 mcp_integration.stdio_command = None
                 mcp_integration.stdio_args = None
                 mcp_integration.encrypted_stdio_env = None
-            else:
+            elif params.server_type == "stdio" and server_type_changed:
                 mcp_integration.server_uri = None
                 mcp_integration.auth_type = MCPAuthType.NONE
                 mcp_integration.oauth_integration_id = None
                 mcp_integration.encrypted_headers = None
 
-        if target_server_type == "http" and params.server_uri is not None:
-            mcp_integration.server_uri = params.server_uri.strip()
-        if target_server_type == "http" and params.auth_type is not None:
-            mcp_integration.auth_type = params.auth_type
-        if target_server_type == "http" and oauth_integration_id_was_provided:
-            mcp_integration.oauth_integration_id = params.oauth_integration_id
+        if target_server_type == "http":
+            if params.server_uri is not None:
+                mcp_integration.server_uri = params.server_uri.strip()
+            if params.auth_type is not None:
+                mcp_integration.auth_type = params.auth_type
+            mcp_integration.oauth_integration_id = target_oauth_integration_id
 
         # Update stdio-type server fields
         if target_server_type == "stdio" and params.stdio_command is not None:
@@ -3119,6 +4658,10 @@ class IntegrationService(BaseWorkspaceService):
                 mcp_integration.encrypted_stdio_env = None
         if params.timeout is not None:
             mcp_integration.timeout = params.timeout
+        if stdio_connection_changed:
+            # The saved row now points at a different stdio process/config. Clear
+            # stale tools before saved-row verification repopulates them.
+            mcp_integration.tools = None
 
         # Handle encrypted header credentials for CUSTOM/OAUTH2 auth types.
         if target_server_type == "http" and params.custom_credentials is not None:
@@ -3141,13 +4684,121 @@ class IntegrationService(BaseWorkspaceService):
                 # Avoid carrying CUSTOM credentials into OAuth unless explicitly set.
                 mcp_integration.encrypted_headers = None
 
+        if verified_tools is not None:
+            # Lock the row and read its latest committed tools before merging: the
+            # verify probe ran unlocked (network call), so merging against the
+            # in-memory snapshot would clobber policy toggles committed since.
+            # Fetch just the tools column FOR UPDATE — a full refresh() would
+            # discard this method's pending field mutations on mcp_integration.
+            current_tools_result = await self.session.execute(
+                select(MCPIntegration.tools)
+                .where(
+                    MCPIntegration.id == mcp_integration.id,
+                    MCPIntegration.workspace_id == self.workspace_id,
+                )
+                .with_for_update()
+            )
+            current_tools = current_tools_result.scalar_one_or_none()
+            merge_base_tools = None if server_type_changed else current_tools
+            merged_tools = self._merge_mcp_tool_summaries(
+                verified_tools,
+                merge_base_tools,
+                mcp_integration_id=mcp_integration.id,
+            )
+            mcp_integration.tools = [tool.model_dump() for tool in merged_tools]
+
+        self.session.add(mcp_integration)
+        await self.session.commit()
+        await self.session.refresh(mcp_integration)
+
+        if stdio_connection_changed and verify_connection:
+            verification = await self.verify_mcp_integration(
+                mcp_integration=mcp_integration,
+                previous_tools=previous_stdio_tools,
+            )
+            if not verification.success:
+                raise MCPConnectionVerificationError(
+                    verification.message,
+                    verification.error,
+                )
+
+        self.logger.info(
+            "Updated MCP integration",
+            mcp_integration_id=mcp_integration.id,
+        )
+
+        return mcp_integration
+
+    @require_scope("integration:update")
+    async def update_mcp_tool_policies(
+        self,
+        *,
+        mcp_integration_id: uuid.UUID,
+        tools: Sequence[MCPToolPolicyUpdate],
+    ) -> MCPIntegration | None:
+        """Update per-tool availability and approval policy for an MCP integration."""
+        # Lock the row: this is a read-modify-write of the full tools blob, so a
+        # concurrent toggle or verification commit would otherwise clobber it.
+        mcp_integration = await self.get_mcp_integration(
+            mcp_integration_id=mcp_integration_id, for_update=True
+        )
+        if not mcp_integration:
+            return None
+        if mcp_integration.tools is None:
+            raise ValueError("MCP integration has no discovered tools to update")
+
+        stored_tools = (
+            MCPToolSummary.validate_stored(
+                mcp_integration.tools, mcp_integration_id=mcp_integration.id
+            )
+            or []
+        )
+        stored_by_name = {tool.name: tool for tool in stored_tools}
+
+        updates_by_name: dict[str, MCPToolPolicyUpdate] = {}
+        for tool in tools:
+            if tool.name in updates_by_name:
+                raise ValueError(f"Duplicate MCP tool policy update: {tool.name}")
+            if tool.name not in stored_by_name:
+                raise ValueError(f"MCP tool not found on integration: {tool.name}")
+            updates_by_name[tool.name] = tool
+
+        enables_approval = any(
+            update.requires_approval is True
+            and not stored_by_name[name].requires_approval
+            for name, update in updates_by_name.items()
+        )
+        if enables_approval:
+            # Approvals are not supported for stdio MCP servers: the stdio
+            # subprocess lives inside the per-turn sandbox and is gone by the
+            # time the approval continuation runs, so there is no execution leg
+            # to resume the approved call. Clearing approval stays allowed.
+            if mcp_integration.server_type == "stdio":
+                raise ValueError("Approvals are not supported for stdio MCP servers.")
+
+        updated_tools: list[MCPToolSummary] = []
+        for stored_tool in stored_tools:
+            policy_update = updates_by_name.get(stored_tool.name)
+            if policy_update is None:
+                updated_tools.append(stored_tool)
+                continue
+
+            update_fields: dict[str, bool] = {}
+            if policy_update.enabled is not None:
+                update_fields["enabled"] = policy_update.enabled
+            if policy_update.requires_approval is not None:
+                update_fields["requires_approval"] = policy_update.requires_approval
+            updated_tools.append(stored_tool.model_copy(update=update_fields))
+
+        mcp_integration.tools = [tool.model_dump() for tool in updated_tools]
         self.session.add(mcp_integration)
         await self.session.commit()
         await self.session.refresh(mcp_integration)
 
         self.logger.info(
-            "Updated MCP integration",
+            "Updated MCP integration tool policies",
             mcp_integration_id=mcp_integration.id,
+            tool_count=len(updates_by_name),
         )
 
         return mcp_integration
@@ -3160,8 +4811,80 @@ class IntegrationService(BaseWorkspaceService):
         )
         if not mcp_integration:
             return False
+        return await self._delete_mcp_integration_row(mcp_integration)
 
+    async def _delete_mcp_integration_row(
+        self, mcp_integration: MCPIntegration
+    ) -> bool:
+        """Delete an MCP integration row and clean up references.
+
+        Called by delete_mcp_integration (scope-checked) and by the connect/save
+        cleanup path which rolls back a freshly created row on verification failure
+        without requiring the caller to hold integration:delete.
+        """
+        mcp_integration_id = mcp_integration.id
         id_str = str(mcp_integration_id)
+
+        # Projection inserts acquire a foreign-key key-share lock. Wait for
+        # those publications before checking references, and prevent new ones
+        # from appearing between the check and deletion.
+        locked_id = await self.session.scalar(
+            select(MCPIntegration.id)
+            .where(
+                MCPIntegration.id == mcp_integration_id,
+                MCPIntegration.workspace_id == self.workspace_id,
+            )
+            .with_for_update()
+        )
+        if locked_id is None:
+            return False
+
+        current_skill_versions = select(Skill.current_version_id).where(
+            Skill.workspace_id == self.workspace_id,
+            Skill.deleted_at.is_(None),
+            Skill.archived_at.is_(None),
+            Skill.current_version_id.is_not(None),
+        )
+        live_preset_skill_versions = (
+            select(AgentPresetVersionSkill.skill_version_id)
+            .join(
+                AgentPreset,
+                AgentPreset.current_version_id
+                == AgentPresetVersionSkill.preset_version_id,
+            )
+            .where(
+                AgentPresetVersionSkill.workspace_id == self.workspace_id,
+                AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.deleted_at.is_(None),
+            )
+        )
+        referenced_tool_id = (
+            await self.session.execute(
+                select(SkillVersionMcpTool.tool_id)
+                .where(
+                    SkillVersionMcpTool.workspace_id == self.workspace_id,
+                    SkillVersionMcpTool.mcp_integration_id == mcp_integration_id,
+                    or_(
+                        SkillVersionMcpTool.skill_version_id.in_(
+                            current_skill_versions
+                        ),
+                        SkillVersionMcpTool.skill_version_id.in_(
+                            live_preset_skill_versions
+                        ),
+                    ),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if referenced_tool_id is not None:
+            raise TracecatValidationError(
+                "Cannot delete an MCP integration referenced by a live skill version",
+                detail={
+                    "code": "mcp_integration_referenced_by_skill",
+                    "mcp_integration_id": str(mcp_integration_id),
+                    "tool_id": referenced_tool_id,
+                },
+            )
 
         try:
             pruned_preset_ids = (
@@ -3170,6 +4893,7 @@ class IntegrationService(BaseWorkspaceService):
                     .where(
                         and_(
                             AgentPreset.workspace_id == self.workspace_id,
+                            AgentPreset.deleted_at.is_(None),
                             AgentPreset.mcp_integrations.isnot(None),
                             AgentPreset.mcp_integrations.contains([id_str]),
                         )

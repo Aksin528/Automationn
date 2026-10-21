@@ -11,7 +11,10 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, model_validator
 
+from tracecat.agent.common.types import read_reasoning_effort_as_enable_thinking
+from tracecat.agent.skill.types import SkillOrigin
 from tracecat.agent.subagents import AgentSubagentsConfig
+from tracecat.integrations.schemas import MCPToolStatus
 
 _LEGACY_AGENT_CONFIG_KEYS = frozenset({"deps_type", "custom_tools"})
 
@@ -45,6 +48,20 @@ class MCPHttpServerConfigPayload(BaseModel):
     """UUID of the source ``mcp_integrations`` row. Lets trusted callers
     re-resolve secrets per use without carrying them through workflow
     history."""
+    tools: list[MCPServerToolSummaryPayload] | None = Field(default=None)
+    """Explicit non-secret tool subset granted by attached skills."""
+
+
+class MCPServerToolSummaryPayload(BaseModel):
+    """Workflow-safe, non-secret summary of a verified user MCP tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str | None = Field(default=None)
+    enabled: bool = Field(default=True)
+    requires_approval: bool = Field(default=False)
+    status: MCPToolStatus = Field(default="available")
 
 
 class MCPStdioServerConfigPayload(BaseModel):
@@ -61,6 +78,9 @@ class MCPStdioServerConfigPayload(BaseModel):
     id: str | None = Field(default=None)
     """UUID of the source ``mcp_integrations`` row. See
     :class:`MCPHttpServerConfigPayload.id`."""
+    tools: list[MCPServerToolSummaryPayload] | None = Field(default=None)
+    """Latest verified stdio tool summaries. Non-secret and safe for workflow
+    history."""
 
 
 type MCPServerConfigPayload = Annotated[
@@ -74,6 +94,7 @@ class ResolvedSkillRefPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    origin: Literal[SkillOrigin.WORKSPACE] = Field(default=SkillOrigin.WORKSPACE)
     skill_id: uuid.UUID
     skill_name: str
     skill_version_id: uuid.UUID
@@ -92,15 +113,18 @@ class AgentConfigPayload(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_workflow_history(cls, value: Any) -> Any:
-        """Accept the pre-payload AgentConfig shape stored in workflow history."""
+        """Accept the pre-payload AgentConfig shape stored in workflow history,
+        and the ``reasoning_effort`` key that newer workers write."""
         if not isinstance(value, dict):
             return value
 
-        normalized = {
-            key: item
-            for key, item in value.items()
-            if key not in _LEGACY_AGENT_CONFIG_KEYS
-        }
+        normalized = read_reasoning_effort_as_enable_thinking(
+            {
+                key: item
+                for key, item in value.items()
+                if key not in _LEGACY_AGENT_CONFIG_KEYS
+            }
+        )
         if isinstance(mcp_servers := normalized.get("mcp_servers"), list):
             normalized["mcp_servers"] = [
                 _normalize_legacy_mcp_server_payload(server) for server in mcp_servers
@@ -124,3 +148,5 @@ class AgentConfigPayload(BaseModel):
     enable_thinking: bool = Field(default=True)
     enable_internet_access: bool = Field(default=False)
     resolved_skills: list[ResolvedSkillRefPayload] | None = Field(default=None)
+    builtin_skills: list[str] | None = Field(default=None)
+    library_skills: list[str] | None = Field(default=None)

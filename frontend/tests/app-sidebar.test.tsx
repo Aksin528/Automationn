@@ -6,16 +6,29 @@ import { render, screen } from "@testing-library/react"
 import type { ReactNode } from "react"
 import { AppSidebar } from "@/components/sidebar/app-sidebar"
 
-const mockUseScopeCheck = jest.fn<boolean | undefined, [string]>()
+const mockUseScopeCheck = jest.fn<
+  boolean | undefined,
+  [string | undefined, string[] | undefined]
+>()
+let mockPathname = "/workspaces/workspace-1/workflows"
 let mockScopes: Record<string, boolean | undefined> = {}
+let mockEntitlements: Record<string, boolean> = {}
+let mockEntitlementsIsLoading = false
+let mockHasEntitlementData = true
 
 jest.mock("next/navigation", () => ({
   useParams: () => ({}),
-  usePathname: () => "/workspaces/workspace-1/workflows",
+  usePathname: () => mockPathname,
 }))
 
 jest.mock("@/components/auth/scope-guard", () => ({
-  useScopeCheck: (scope: string) => mockUseScopeCheck(scope),
+  useScopeCheck: (scope: string | undefined, anyOf?: string[]) =>
+    mockUseScopeCheck(scope, anyOf),
+}))
+
+let mockFormsAccess = "hidden"
+jest.mock("@/hooks/use-forms-access", () => ({
+  useFormsAccess: () => mockFormsAccess,
 }))
 
 jest.mock("@/components/locked-feature-modal", () => ({
@@ -28,7 +41,27 @@ jest.mock("@/components/sidebar/app-menu", () => ({
 }))
 
 jest.mock("@/components/sidebar/sidebar-user-nav", () => ({
-  SidebarUserNav: () => <div>User nav</div>,
+  SidebarUserNav: ({
+    manageItems,
+  }: {
+    manageItems: {
+      title: string
+      href: string
+      isActive?: boolean
+    }[]
+  }) => (
+    <nav>
+      {manageItems.map((item) => (
+        <a
+          href={item.href}
+          data-active={item.isActive ? "true" : "false"}
+          key={item.href}
+        >
+          {item.title}
+        </a>
+      ))}
+    </nav>
+  ),
 }))
 
 jest.mock("@/components/ui/collapsible", () => ({
@@ -65,9 +98,26 @@ jest.mock("@/components/ui/sidebar", () => ({
   SidebarMenuBadge: ({ children }: { children: ReactNode }) => (
     <span>{children}</span>
   ),
-  SidebarMenuButton: ({ children }: { children: ReactNode }) => (
-    <div>{children}</div>
-  ),
+  SidebarMenuButton: ({
+    asChild,
+    children,
+    disabled,
+    isActive,
+    type,
+  }: {
+    asChild?: boolean
+    children: ReactNode
+    disabled?: boolean
+    isActive?: boolean
+    type?: "button" | "submit" | "reset"
+  }) =>
+    asChild ? (
+      <div data-active={isActive ? "true" : "false"}>{children}</div>
+    ) : (
+      <button type={type ?? "button"} disabled={disabled}>
+        {children}
+      </button>
+    ),
   SidebarMenuItem: ({ children }: { children: ReactNode }) => (
     <li>{children}</li>
   ),
@@ -86,8 +136,10 @@ jest.mock("@/components/ui/sidebar", () => ({
 
 jest.mock("@/hooks/use-entitlements", () => ({
   useEntitlements: () => ({
-    hasEntitlement: () => true,
-    isLoading: false,
+    hasEntitlement: (entitlement: string) =>
+      mockEntitlements[entitlement] ?? false,
+    isLoading: mockEntitlementsIsLoading,
+    hasEntitlementData: mockHasEntitlementData,
   }),
 }))
 
@@ -102,9 +154,46 @@ jest.mock("@/providers/workspace-id", () => ({
 describe("AppSidebar", () => {
   beforeEach(() => {
     mockUseScopeCheck.mockReset()
+    mockPathname = "/workspaces/workspace-1/workflows"
     mockScopes = {}
-    mockUseScopeCheck.mockImplementation((scope) => mockScopes[scope] ?? false)
+    mockEntitlements = {
+      agent_addons: true,
+      service_accounts: true,
+      workspace_chat: true,
+    }
+    mockEntitlementsIsLoading = false
+    mockHasEntitlementData = true
+    mockUseScopeCheck.mockImplementation((scope, anyOf) =>
+      scope
+        ? (mockScopes[scope] ?? false)
+        : (anyOf ?? []).some((candidate) => mockScopes[candidate])
+    )
+    mockFormsAccess = "hidden"
   })
+
+  it.each([
+    ["hidden", { "form:read": true, "form:update": true }, false],
+    ["loading", { "form:read": true, "form:update": true }, false],
+    ["enabled", { "form:read": true, "form:update": true }, true],
+    ["locked", { "form:read": true, "form:submission:read": true }, true],
+    ["enabled", { "form:read": true, "form:submit": true }, false],
+    // The list itself needs `form:read`.
+    ["enabled", { "form:update": true, "form:submission:read": true }, false],
+  ])(
+    "links to Forms when access is %s with %j: %p",
+    (access, scopes, shown) => {
+      mockScopes = { "workflow:read": true, ...scopes }
+      mockFormsAccess = access
+
+      render(<AppSidebar />)
+
+      const titles = screen.getAllByRole("link").map((link) => link.textContent)
+      // Right after Workflows.
+      expect(titles.indexOf("Forms")).toBe(
+        shown ? titles.indexOf("Workflows") + 1 : -1
+      )
+    }
+  )
 
   it("hides Chat when the user can execute agents but cannot read them", () => {
     mockScopes = {
@@ -128,5 +217,90 @@ describe("AppSidebar", () => {
     render(<AppSidebar />)
 
     expect(screen.getByText("Chat")).toBeInTheDocument()
+  })
+
+  it("does not show entitlement locks while entitlements are loading", () => {
+    mockScopes = {
+      "agent:execute": true,
+      "agent:read": true,
+    }
+    mockEntitlements = {}
+    mockEntitlementsIsLoading = true
+    mockHasEntitlementData = false
+
+    render(<AppSidebar />)
+
+    expect(screen.getByText("Chat")).toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /Chat/ })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /Chat/ })).toBeDisabled()
+    expect(screen.queryByText("Locked")).not.toBeInTheDocument()
+  })
+
+  it("shows entitlement locks after entitlement data confirms a feature is unavailable", () => {
+    mockScopes = {
+      "agent:execute": true,
+      "agent:read": true,
+    }
+    mockEntitlements = {
+      agent_addons: true,
+      service_accounts: true,
+      workspace_chat: false,
+    }
+
+    render(<AppSidebar />)
+
+    expect(screen.getByText("Chat")).toBeInTheDocument()
+    expect(screen.getAllByText("Locked")).toHaveLength(1)
+  })
+
+  it("keeps Git sync visible with a lock when the plan lacks it", () => {
+    mockScopes = { "workspace:update": true }
+
+    render(<AppSidebar />)
+
+    expect(screen.getByRole("link", { name: "Git sync" })).toHaveAttribute(
+      "href",
+      "/workspaces/workspace-1/git-sync"
+    )
+    expect(screen.getByText("Requires upgrade")).toBeInTheDocument()
+  })
+
+  it("shows Git sync without a lock when the plan includes it", () => {
+    mockScopes = { "workspace_sync:sync": true }
+    mockEntitlements = { git_sync: true }
+
+    render(<AppSidebar />)
+
+    expect(screen.getByRole("link", { name: "Git sync" })).toBeInTheDocument()
+    expect(screen.queryByText("Requires upgrade")).not.toBeInTheDocument()
+  })
+
+  it("hides Git sync without sync or connection access", () => {
+    mockScopes = { "workspace:read": true }
+
+    render(<AppSidebar />)
+
+    expect(
+      screen.queryByRole("link", { name: "Git sync" })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByText("Requires upgrade")).not.toBeInTheDocument()
+  })
+
+  it("only highlights MCP servers on the MCP servers page", () => {
+    mockPathname = "/workspaces/workspace-1/mcp-servers"
+    mockScopes = {
+      "integration:read": true,
+      "workspace:read": true,
+    }
+
+    render(<AppSidebar />)
+
+    expect(
+      screen.getByRole("link", { name: "MCP servers" }).closest("[data-active]")
+    ).toHaveAttribute("data-active", "true")
+    expect(screen.getByRole("link", { name: "MCP access" })).toHaveAttribute(
+      "data-active",
+      "false"
+    )
   })
 })

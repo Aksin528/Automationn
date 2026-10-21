@@ -113,6 +113,8 @@ function ExpressionInputCore({
   disabled = false,
   defaultHeight = "input",
 }: ExpressionInputProps) {
+  const { resolvedTheme } = useTheme()
+  const codeMirrorTheme = resolvedTheme === "dark" ? "dark" : "light"
   const workspaceId = useWorkspaceId()
   const { workflow } = useWorkflow()
   const { resolvedTheme } = useTheme()
@@ -276,6 +278,7 @@ function ExpressionInputCore({
         <CodeMirror
           value={safeValue}
           height="auto"
+          theme={codeMirrorTheme}
           extensions={extensions}
           onChange={handleChange}
           editable={!disabled}

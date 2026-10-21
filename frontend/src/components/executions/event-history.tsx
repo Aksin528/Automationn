@@ -1,7 +1,6 @@
 "use client"
 
-import { Repeat2Icon } from "lucide-react"
-import type { WorkflowExecutionEventStatus } from "@/client"
+import { PinIcon, Repeat2Icon, RotateCcwIcon } from "lucide-react"
 import {
   getAggregateWorkflowEventStatus,
   getWorkflowEventIcon,
@@ -10,64 +9,43 @@ import {
   WorkflowEventsList,
   type WorkflowEventsListRow,
 } from "@/components/events/workflow-events-list"
-import { CenteredSpinner, Spinner } from "@/components/loading/spinner"
-import NoContent from "@/components/no-content"
-import { AlertNotification } from "@/components/notifications"
+import { Spinner } from "@/components/loading/spinner"
+import { ContextMenuItem } from "@/components/ui/context-menu"
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import {
+  getCompactEventTimestamp,
   getLatestLoopEventMeta,
   getLoopEventMeta,
   groupEventsByActionRef,
   executionId as parseWorkflowExecutionId,
   refToLabel,
   type WorkflowExecutionEventCompact,
+  type WorkflowExecutionReadCompact,
 } from "@/lib/event-history"
-import { useCompactWorkflowExecution } from "@/lib/hooks"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 import "react18-json-view/src/style.css"
 
-const INTERMEDIATE_EVENT_STATUSES = new Set<WorkflowExecutionEventStatus>([
-  "SCHEDULED",
-  "STARTED",
-])
-
-/**
- * Events for a specific workflow execution
- */
+/** Events for a specific workflow execution. */
 export function WorkflowExecutionEventHistory({
-  executionId,
-  selectedEvent,
-  setSelectedEvent,
+  execution,
+  selectedActionRef,
+  setSelectedActionRef,
+  onRerunFrom,
 }: {
-  executionId: string
-  selectedEvent?: WorkflowExecutionEventCompact
-  setSelectedEvent: (event: WorkflowExecutionEventCompact) => void
+  execution: WorkflowExecutionReadCompact
+  selectedActionRef?: string
+  setSelectedActionRef: (actionRef: string) => void
+  /** Rerun this execution from an action; adds a right-click menu to rows. */
+  onRerunFrom?: (actionRef: string) => void
 }) {
   const workspaceId = useWorkspaceId()
-  const decodedExecutionId = decodeURIComponent(executionId)
-  const { execution, executionIsLoading, executionError } =
-    useCompactWorkflowExecution(decodedExecutionId)
 
-  if (executionIsLoading) {
-    return <CenteredSpinner />
-  }
-  if (executionError) {
-    return <AlertNotification message={executionError.message} />
-  }
-  if (!execution) {
-    return <NoContent message="No events found." />
-  }
-
-  const terminalEvents = execution.events.filter(
-    (event) => !INTERMEDIATE_EVENT_STATUSES.has(event.status)
-  )
-
-  const eventRows = Object.entries(groupEventsByActionRef(terminalEvents))
+  const eventRows = Object.entries(groupEventsByActionRef(execution.events))
     .map(([actionRef, relatedEvents]) => {
       const aggregateStatus = getAggregateWorkflowEventStatus(relatedEvents)
       const latestEvent = getLatestEvent(relatedEvents)
@@ -96,7 +74,10 @@ export function WorkflowExecutionEventHistory({
       if (!a.latestEvent || !b.latestEvent) {
         return 0
       }
-      return getEventTimestamp(a.latestEvent) - getEventTimestamp(b.latestEvent)
+      return (
+        getCompactEventTimestamp(a.latestEvent) -
+        getCompactEventTimestamp(b.latestEvent)
+      )
     })
 
   if (eventRows.length === 0) {
@@ -138,7 +119,21 @@ export function WorkflowExecutionEventHistory({
       return {
         key: actionRef,
         label: refToLabel(actionRef),
-        meta: loopBadge,
+        meta:
+          loopBadge ??
+          (latestEvent?.fixed_from_execution_id ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex items-center gap-0.5">
+                  <PinIcon className="size-2.5" />
+                  Fixed
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="top" className="font-mono tracking-tight">
+                Result reused from {latestEvent.fixed_from_execution_id}
+              </TooltipContent>
+            </Tooltip>
+          ) : undefined),
         time: latestEventTime,
         icon: isLoopAction ? (
           loopTooltip ? (
@@ -162,10 +157,23 @@ export function WorkflowExecutionEventHistory({
         ) : (
           getWorkflowEventIcon(aggregateStatus)
         ),
-        selected: selectedEvent?.action_ref === actionRef,
+        selected: selectedActionRef === actionRef,
         count: relatedEvents.length,
         subflowLink: childWorkflowRunLink,
-        onSelect: latestEvent ? () => setSelectedEvent(latestEvent) : undefined,
+        onSelect: latestEvent
+          ? () => setSelectedActionRef(actionRef)
+          : undefined,
+        contextMenu:
+          onRerunFrom && !actionRef.startsWith("__workflow_") ? (
+            <ContextMenuItem
+              className="gap-2 text-xs"
+              disabled={execution.status === "RUNNING"}
+              onSelect={() => onRerunFrom(actionRef)}
+            >
+              <RotateCcwIcon className="size-3.5" />
+              Rerun from this action
+            </ContextMenuItem>
+          ) : undefined,
       }
     }
   )
@@ -177,16 +185,11 @@ export function WorkflowExecutionEventHistory({
   )
 }
 
-function getEventTimestamp(event: WorkflowExecutionEventCompact): number {
-  const eventTime = event.close_time || event.start_time || event.schedule_time
-  return new Date(eventTime).getTime()
-}
-
 function getLatestEvent(
   relatedEvents: WorkflowExecutionEventCompact[]
 ): WorkflowExecutionEventCompact | undefined {
   return [...relatedEvents].sort(
-    (a, b) => getEventTimestamp(b) - getEventTimestamp(a)
+    (a, b) => getCompactEventTimestamp(b) - getCompactEventTimestamp(a)
   )[0]
 }
 
@@ -196,7 +199,9 @@ function getChildWorkflowRunLink(
 ): string | undefined {
   const eventWithChildRun = [...relatedEvents]
     .filter((event) => Boolean(event.child_wf_exec_id))
-    .sort((a, b) => getEventTimestamp(b) - getEventTimestamp(a))[0]
+    .sort(
+      (a, b) => getCompactEventTimestamp(b) - getCompactEventTimestamp(a)
+    )[0]
 
   if (!eventWithChildRun?.child_wf_exec_id) {
     return undefined

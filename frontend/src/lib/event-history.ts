@@ -1,19 +1,18 @@
 import type {
   AgentOutput,
   DSLRunArgs,
-  InteractionInput,
   RunActionInput,
   WorkflowEventType,
-  WorkflowExecutionEventCompact_Any__Union_AgentOutput__Any___Any_,
-  WorkflowExecutionReadCompact_Any__Union_AgentOutput__Any___Any_,
+  WorkflowExecutionEventCompact_Any_Union_AgentOutput__Any__Any_,
+  WorkflowExecutionReadCompact_Any_Union_AgentOutput__Any__Any_,
 } from "@/client"
 import { ACTION_REF_DELIMITER, undoSlugify } from "@/lib/utils"
 
 export type WorkflowExecutionEventCompact =
-  WorkflowExecutionEventCompact_Any__Union_AgentOutput__Any___Any_
+  WorkflowExecutionEventCompact_Any_Union_AgentOutput__Any__Any_
 
 export type WorkflowExecutionReadCompact =
-  WorkflowExecutionReadCompact_Any__Union_AgentOutput__Any___Any_
+  WorkflowExecutionReadCompact_Any_Union_AgentOutput__Any__Any_
 
 // Safe because refs are slugified. Use `workflow` to namespace from regular action refs.
 export const WF_TRIGGER_EVENT_REF = "__workflow_trigger__"
@@ -136,17 +135,6 @@ export function isRunActionInput(
   )
 }
 
-export function isInteractionInput(
-  actionInput: unknown
-): actionInput is InteractionInput {
-  return (
-    typeof actionInput === "object" &&
-    actionInput !== null &&
-    "interaction_id" in actionInput &&
-    typeof (actionInput as InteractionInput).interaction_id === "string"
-  )
-}
-
 export function isDSLRunArgs(actionInput: unknown): actionInput is DSLRunArgs {
   // Define the conditions to check for DSLRunArgs
   return (
@@ -256,11 +244,13 @@ export function getLoopEventMeta(
   return undefined
 }
 
-function getCompactEventTimestamp(
+/** Effective timestamp of a compact event: close, else start, else schedule time. */
+export function getCompactEventTimestamp(
   event: WorkflowExecutionEventCompact
 ): number {
-  const time = event.close_time || event.start_time || event.schedule_time
-  return new Date(time).getTime()
+  const time = event.close_time ?? event.start_time ?? event.schedule_time
+  const timestamp = new Date(time).getTime()
+  return Number.isNaN(timestamp) ? 0 : timestamp
 }
 
 export function getLatestLoopEventMeta(

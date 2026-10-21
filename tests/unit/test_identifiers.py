@@ -1,16 +1,113 @@
+import re
 import uuid
 from typing import Self
 from uuid import UUID
 
 import pytest
-from pydantic import BaseModel
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, TypeAdapter
 
 from tracecat.identifiers.common import (
     TracecatUUID,
     id_from_short,
     id_to_short,
 )
-from tracecat.identifiers.workflow import WorkflowUUID
+from tracecat.identifiers.workflow import (
+    WF_EXEC_ID_PATTERN,
+    WF_EXEC_ID_SCHEMA_PATTERN,
+    AnyWorkflowIDPath,
+    AnyWorkflowIDQuery,
+    OptionalAnyWorkflowIDQuery,
+    WorkflowExecutionID,
+    WorkflowUUID,
+)
+
+
+@pytest.fixture
+def workflow_id_client() -> TestClient:
+    app = FastAPI()
+
+    def get_by_path(workflow_id: AnyWorkflowIDPath) -> str:
+        return str(workflow_id)
+
+    def get_by_query(workflow_id: AnyWorkflowIDQuery) -> str:
+        return str(workflow_id)
+
+    def get_by_optional_query(workflow_id: OptionalAnyWorkflowIDQuery) -> str | None:
+        return str(workflow_id) if workflow_id is not None else None
+
+    app.add_api_route("/workflows/{workflow_id}", get_by_path)
+    app.add_api_route("/workflows", get_by_query)
+    app.add_api_route("/optional-workflows", get_by_optional_query)
+    return TestClient(app)
+
+
+@pytest.mark.parametrize(
+    ("url", "location"),
+    [
+        ("/workflows/{workflow_id}", "path"),
+        ("/workflows?workflow_id={workflow_id}", "query"),
+        ("/optional-workflows?workflow_id={workflow_id}", "query"),
+    ],
+)
+@pytest.mark.parametrize(
+    "workflow_id",
+    [
+        pytest.param("wf_12345678-1234-4234-8234-123456789012", id="prefixed-uuid"),
+        pytest.param("wf_abc-def", id="non-base62-char"),
+        pytest.param("wf_" + "z" * 22, id="uuid-overflow"),
+        pytest.param("prefix_wf_abc", id="embedded-prefix"),
+        pytest.param("wf-" + "1" * 32 + "invalid", id="legacy-trailing-junk"),
+    ],
+)
+def test_workflow_id_dependencies_reject_malformed_ids(
+    workflow_id_client: TestClient, url: str, location: str, workflow_id: str
+) -> None:
+    response = workflow_id_client.get(url.format(workflow_id=workflow_id))
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == [location, "workflow_id"]
+    assert error["type"] == "value_error"
+    assert error["msg"] == (
+        "Invalid workflow ID. Expected a UUID or a short ID (wf_<base62>)."
+    )
+    assert error["input"] == workflow_id
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/workflows/{workflow_id}",
+        "/workflows?workflow_id={workflow_id}",
+        "/optional-workflows?workflow_id={workflow_id}",
+    ],
+)
+@pytest.mark.parametrize("id_format", ["uuid", "short", "legacy"])
+def test_workflow_id_dependencies_accept_valid_ids(
+    workflow_id_client: TestClient, url: str, id_format: str
+) -> None:
+    workflow_id = WorkflowUUID.new_uuid4()
+    raw_id = {
+        "uuid": str(workflow_id),
+        "short": workflow_id.short(),
+        "legacy": workflow_id.to_legacy(),
+    }[id_format]
+
+    response = workflow_id_client.get(url.format(workflow_id=raw_id))
+
+    assert response.status_code == 200
+    assert response.json() == str(workflow_id)
+
+
+def test_optional_workflow_id_dependency_accepts_omitted_id(
+    workflow_id_client: TestClient,
+) -> None:
+    response = workflow_id_client.get("/optional-workflows")
+
+    assert response.status_code == 200
+    assert response.json() is None
 
 
 def test_id_to_short() -> None:
@@ -260,3 +357,30 @@ def test_tracecat_uuid_construction(test_uuid_str):
 
     assert MockUUID.from_legacy(f"test-legacy-{test_uuid.hex}") == test_uuid
     assert MockUUID.new(f"test-legacy-{test_uuid.hex}") == test_uuid
+
+
+def test_workflow_execution_id_schema_pattern_has_no_python_named_groups() -> None:
+    """The emitted JSON Schema pattern must be ECMA-262 safe.
+
+    JSON Schema uses the ECMAScript regex dialect, which has no `(?P<name>...)`
+    named-group syntax. A pattern containing it fails clients that compile
+    schema `pattern`s as ECMAScript RegExp (e.g. MCP clients), so the
+    schema-facing pattern must not contain it.
+    """
+    pattern = TypeAdapter(WorkflowExecutionID).json_schema()["pattern"]
+    assert "(?P<" not in pattern
+
+
+def test_workflow_execution_id_schema_pattern_matches_same_ids() -> None:
+    """The schema pattern must accept/reject exactly the same IDs as the named
+    parsing pattern used at runtime."""
+    samples = [
+        "wf-0123456789abcdef0123456789abcdef:exec_AbC123",
+        "wf_4itKqkgCZrLhgYiq5L211X/exec-legacy-123",
+        "wf-0123456789abcdef0123456789abcdef:sch-0123456789abcdef0123456789abcdef-2024",
+        "not-a-wf-id:whatever",
+    ]
+    for sample in samples:
+        assert (re.fullmatch(WF_EXEC_ID_PATTERN, sample) is not None) == (
+            re.fullmatch(WF_EXEC_ID_SCHEMA_PATTERN, sample) is not None
+        )

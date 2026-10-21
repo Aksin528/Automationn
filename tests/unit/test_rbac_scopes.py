@@ -6,6 +6,7 @@ import pytest
 
 from tracecat.auth.types import Role
 from tracecat.authz.controls import (
+    ensure_can_grant_scopes,
     get_missing_scopes,
     has_all_scopes,
     has_any_scope,
@@ -27,7 +28,7 @@ from tracecat.authz.scopes import (
     WORKSPACE_OPERATIONAL_SCOPES,
 )
 from tracecat.contexts import ctx_role
-from tracecat.exceptions import ScopeDeniedError
+from tracecat.exceptions import ScopeDeniedError, TracecatAuthorizationError
 
 
 @pytest.fixture(autouse=True)
@@ -244,14 +245,48 @@ class TestGetMissingScopes:
         assert missing == set()
 
 
+class TestEnsureCanGrantScopes:
+    """Tests for the scope-ceiling check, including wildcard semantics.
+
+    Wildcard matching is inherited from ``has_scope``; these pin the ceiling
+    behavior on both sides of the wildcard so a change to ``has_scope``
+    semantics cannot silently open an escalation path.
+    """
+
+    def test_exact_match_allowed(self):
+        ensure_can_grant_scopes(frozenset({"org:member:read"}), ["org:member:read"])
+
+    def test_wildcard_granter_covers_concrete_scope(self):
+        ensure_can_grant_scopes(frozenset({"org:*"}), ["org:owner:assign"])
+
+    def test_concrete_granter_cannot_grant_wildcard_scope(self):
+        with pytest.raises(
+            TracecatAuthorizationError,
+            match=r"Cannot grant scopes not held by the caller: org:\*",
+        ):
+            ensure_can_grant_scopes(
+                frozenset({"org:read", "org:owner:assign"}), ["org:*"]
+            )
+
+    def test_empty_granter_denied(self):
+        with pytest.raises(TracecatAuthorizationError):
+            ensure_can_grant_scopes(frozenset(), ["org:member:read"])
+
+
 class TestSystemRoleScopes:
     """Tests for system role scope definitions."""
+
+    def test_scim_management_defaults_to_org_administrators(self):
+        assert "org:scim:manage" in ORG_OWNER_SCOPES
+        assert "org:scim:manage" in ORG_ADMIN_SCOPES
+        assert "org:scim:manage" not in ORG_MEMBER_SCOPES | ADMIN_SCOPES
 
     def test_viewer_includes_inbox_read(self):
         assert "inbox:read" in VIEWER_SCOPES
 
     def test_viewer_scopes_are_read_only(self):
-        for scope in VIEWER_SCOPES:
+        # Submitting a form is intake, not editing: viewers may do it.
+        for scope in VIEWER_SCOPES - {"form:submit"}:
             # Viewer should only have read scopes (no create, update, delete, execute)
             action = scope.split(":")[-1]
             assert action in ("read", "member:read"), f"Unexpected scope: {scope}"

@@ -1,4 +1,18 @@
-import type { QueryClient } from "@tanstack/react-query"
+import type { QueryClient } from "@/lib/query"
+
+/** Invalidate field metadata and case data after a field definition changes. */
+export async function invalidateCaseFieldQueries(
+  queryClient: QueryClient,
+  workspaceId: string
+): Promise<void> {
+  await Promise.all([
+    queryClient.invalidateQueries({
+      queryKey: ["case-fields", workspaceId],
+    }),
+    queryClient.invalidateQueries({ queryKey: ["case"] }),
+    queryClient.invalidateQueries({ queryKey: ["cases"] }),
+  ])
+}
 
 /**
  * Invalidate the common set of case queries that should refresh
@@ -19,4 +33,15 @@ export function invalidateCaseActivityQueries(
   queryClient.invalidateQueries({
     queryKey: ["case-durations", caseId, workspaceId],
   })
+}
+
+/** Refetch every view that shows parent/sub-case relationships. */
+export async function invalidateCaseHierarchy(
+  queryClient: QueryClient
+): Promise<void> {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ["cases"] }),
+    queryClient.invalidateQueries({ queryKey: ["case"] }),
+    queryClient.invalidateQueries({ queryKey: ["case-events"] }),
+  ])
 }

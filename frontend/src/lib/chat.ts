@@ -1,8 +1,36 @@
-import type { QueryClient } from "@tanstack/react-query"
 import * as ai from "ai"
-import type { AgentSessionEntity, UIMessage } from "@/client"
-import type { ApprovalCard } from "@/hooks/use-chat"
+import type {
+  AgentSessionEntity,
+  AgentSessionRead,
+  AgentSessionReadVercel,
+  ApprovalRead,
+  ApprovalStatus,
+  ChatReadMinimal,
+  ChatReadVercel,
+  UIMessage,
+} from "@/client"
+import { invalidateCaseCommentQueries } from "@/lib/cases/comment-queries"
 import { invalidateCaseActivityQueries } from "@/lib/cases/invalidation"
+import type { QueryClient } from "@/lib/query"
+
+export type ApprovalCard = {
+  tool_call_id: string
+  tool_name: string
+  args?: unknown
+  status?: ApprovalStatus
+  decision?: ApprovalRead["decision"]
+  reason?: string | null
+}
+
+type PersistedApprovalDecision = NonNullable<ApprovalRead["decision"]>
+type ToolApprovedDecision = Extract<
+  PersistedApprovalDecision,
+  { kind: "tool-approved" }
+>
+type ToolDeniedDecision = Extract<
+  PersistedApprovalDecision,
+  { kind: "tool-denied" }
+>
 
 type ServerToolPart = Extract<UIMessage["parts"][number], { state: string }>
 type LegacyToolState =
@@ -10,6 +38,73 @@ type LegacyToolState =
   | "approval-responded"
   | "output-denied"
 type ToolState = ai.ToolUIPart["state"] | LegacyToolState
+
+/**
+ * UI data part identifier for turn-cancelled markers. Streamed live at the
+ * point of interruption and persisted server-side so reloads keep the marker.
+ */
+export const CANCELLED_DATA_PART_TYPE = "data-cancelled"
+
+/**
+ * Payload of a {@link CANCELLED_DATA_PART_TYPE} part. `tool_call_ids` is the
+ * structured interrupt signal: the backend loopback records which tool calls
+ * the interrupt aborted mid-flight (by cancel-then-error ordering, not error
+ * text) and carries them on both the live stream event and the persisted
+ * marker row.
+ */
+export type CancelledPartData = {
+  reason?: string | null
+  tool_call_ids?: string[] | null
+}
+
+/**
+ * Extract the interrupted tool call IDs from a cancelled data part's payload.
+ * Returns an empty array for legacy payloads that predate the field.
+ */
+export function getCancelledPartToolCallIds(data: unknown): string[] {
+  if (!data || typeof data !== "object") {
+    return []
+  }
+  const toolCallIds = (data as CancelledPartData).tool_call_ids
+  if (!Array.isArray(toolCallIds)) {
+    return []
+  }
+  return toolCallIds.filter((id): id is string => typeof id === "string")
+}
+
+/**
+ * Error strings the Claude SDK records for tool calls that were aborted by a
+ * user interrupt rather than failing on their own.
+ *
+ * LEGACY FALLBACK ONLY: new cancelled turns carry structured interrupt
+ * metadata (`tool_call_ids` on the data-cancelled part, see
+ * {@link getCancelledPartToolCallIds}) and the UI prefers that signal. This
+ * substring check remains solely for histories persisted before the
+ * structured metadata existed, whose markers lack `tool_call_ids`. Do not add
+ * new patterns; extend the structured signal instead.
+ */
+const INTERRUPT_ARTIFACT_ERROR_PATTERNS = [
+  "MCP error -32001",
+  "The operation was aborted",
+  "Request was aborted",
+  "[Request interrupted by user",
+  // The SDK's tool-denial phrasing: recorded when a pending approval is
+  // resolved by the interrupt. New turns report these via `tool_call_ids`.
+  "doesn't want to take this action",
+]
+
+/**
+ * Whether a tool error text is an artifact of the user stopping the turn
+ * (SDK/MCP abort plumbing) rather than a genuine tool failure. Only
+ * meaningful for messages in a cancelled turn, and only consulted when the
+ * turn's cancelled marker carries no structured `tool_call_ids` (legacy
+ * histories).
+ */
+export function isInterruptArtifactError(errorText: string): boolean {
+  return INTERRUPT_ARTIFACT_ERROR_PATTERNS.some((pattern) =>
+    errorText.includes(pattern)
+  )
+}
 
 export function isAgentSessionEntity(
   value: unknown
@@ -23,6 +118,28 @@ export function isAgentSessionEntity(
     value === "approval" ||
     value === "external_channel"
   )
+}
+
+/**
+ * Either arm of a session/chat union, in list (`*Read`) or Vercel
+ * (`*ReadVercel`) shape. Only the AgentSession arms carry `last_error`; the
+ * legacy Chat arms do not, which is what lets `getSessionLastError` narrow.
+ */
+export type SessionOrChat =
+  | AgentSessionRead
+  | AgentSessionReadVercel
+  | ChatReadMinimal
+  | ChatReadVercel
+
+/**
+ * Read the persisted terminal error of a session's most recent run.
+ *
+ * Present iff the last run errored (errors are run-ending and clear on the next
+ * turn). Lives only on the AgentSession arms of the union — legacy Chat rows
+ * have no such field — so this returns null for those arms.
+ */
+export function getSessionLastError(session: SessionOrChat): string | null {
+  return "last_error" in session ? (session.last_error ?? null) : null
 }
 
 /**
@@ -189,10 +306,7 @@ export const ENTITY_TO_INVALIDATION: Record<
       // Invalidate cases list for workspace
       queryClient.invalidateQueries({ queryKey: ["cases", workspaceId] })
       invalidateCaseActivityQueries(queryClient, entityId, workspaceId)
-      // Invalidate case comments
-      queryClient.invalidateQueries({
-        queryKey: ["case-comments", entityId, workspaceId],
-      })
+      invalidateCaseCommentQueries(queryClient, entityId, workspaceId)
     },
   },
   agent_preset: {
@@ -250,8 +364,190 @@ export type ModelInfo = {
   iconId?: string
 }
 
-type CompactionData = {
+/**
+ * Payload of a `data-compaction` part: the compaction phase and the token
+ * count of the conversation before it was compacted.
+ */
+export type CompactionData = {
   phase?: "started" | "completed" | "failed"
+  pre_tokens?: number
+}
+
+/**
+ * Per-toolCallId lifecycle bookkeeping accumulated in the population pass of
+ * {@link transformMessages}. Positions are `"msgIndex-partIndex"` string keys.
+ */
+type ToolCallTrace = {
+  /** Position of the dedupe winner, and whether it carries output. */
+  keptPos?: string
+  hasOutput: boolean
+  /** Position of the input-available part that opened the call. */
+  openPos?: string
+  /** Position of the approval-request part matched to this call. */
+  approvalPos?: string
+  /** Position of the output-* part that closed the call. */
+  closePos?: string
+  /** Position of the most recent approval-request part naming this call. */
+  lastApprovalPos?: string
+}
+
+/** Validate the custom approval data-part payload at the generated `unknown` boundary. */
+export function isApprovalCardArray(data: unknown): data is ApprovalCard[] {
+  return (
+    Array.isArray(data) &&
+    data.every((item: unknown) => {
+      if (!item || typeof item !== "object") {
+        return false
+      }
+      return (
+        "tool_call_id" in item &&
+        typeof item.tool_call_id === "string" &&
+        item.tool_call_id.length > 0 &&
+        "tool_name" in item &&
+        typeof item.tool_name === "string" &&
+        item.tool_name.length > 0
+      )
+    })
+  )
+}
+
+/** Whether a persisted approval decision contains tool argument overrides. */
+export function isToolApprovedDecision(
+  decision: unknown
+): decision is ToolApprovedDecision {
+  return (
+    typeof decision === "object" &&
+    decision !== null &&
+    "kind" in decision &&
+    decision.kind === "tool-approved"
+  )
+}
+
+/** Whether a persisted approval decision denies a tool call. */
+export function isToolDeniedDecision(
+  decision: unknown
+): decision is ToolDeniedDecision {
+  return (
+    typeof decision === "object" &&
+    decision !== null &&
+    "kind" in decision &&
+    decision.kind === "tool-denied"
+  )
+}
+
+/** A tool call the user denied when asked to approve it. */
+export type ToolDenial = {
+  /** The user's reason, when one was recorded. */
+  reason: string | null
+}
+
+type ToolResultPart = Extract<
+  ai.ToolUIPart,
+  { state: "output-available" | "output-error" }
+>
+
+function isToolResultPart(part: ai.ToolUIPart): part is ToolResultPart {
+  return part.state === "output-available" || part.state === "output-error"
+}
+
+/**
+ * The denial recorded on a tool call's result, or null. Tracecat tags a denied
+ * call's result with `callProviderMetadata.tracecat.approval = "rejected"`,
+ * since the result itself is error text written for the model.
+ */
+export function getToolDenial(part: ai.ToolUIPart): ToolDenial | null {
+  if (!isToolResultPart(part)) {
+    return null
+  }
+  const tracecat = part.callProviderMetadata?.tracecat
+  if (!tracecat || tracecat.approval !== "rejected") {
+    return null
+  }
+  const reason =
+    typeof tracecat.reason === "string" ? tracecat.reason.trim() : ""
+  return { reason: reason || null }
+}
+
+/**
+ * Tag the results of calls this chat denied, as reloaded history does.
+ *
+ * A live continuation streams the denied call's result as an error before the
+ * session's saved history, which carries the tag, replaces it. The user's
+ * decision is in the approval submission, so it tags the result meanwhile.
+ */
+export function markLiveDenials(messages: ai.UIMessage[]): ai.UIMessage[] {
+  const reasons = new Map<string, string>()
+  for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.type !== "data-continue") {
+        continue
+      }
+      const decisions = (part as { data?: { decisions?: unknown } }).data
+        ?.decisions
+      for (const decision of Array.isArray(decisions) ? decisions : []) {
+        if (!decision || typeof decision !== "object") {
+          continue
+        }
+        const { action, tool_call_id, reason } = decision as Record<
+          string,
+          unknown
+        >
+        if (action === "deny" && typeof tool_call_id === "string") {
+          reasons.set(tool_call_id, typeof reason === "string" ? reason : "")
+        }
+      }
+    }
+  }
+  if (reasons.size === 0) {
+    return messages
+  }
+  return messages.map((message) => {
+    let tagged = false
+    const parts = message.parts.map((part) => {
+      if (
+        !ai.isToolUIPart(part) ||
+        !isToolResultPart(part) ||
+        !reasons.has(part.toolCallId) ||
+        getToolDenial(part)
+      ) {
+        return part
+      }
+      tagged = true
+      return {
+        ...part,
+        callProviderMetadata: {
+          ...part.callProviderMetadata,
+          tracecat: {
+            approval: "rejected",
+            reason: reasons.get(part.toolCallId) ?? "",
+          },
+        },
+      }
+    })
+    return tagged ? { ...message, parts } : message
+  })
+}
+
+/** Tool call IDs whose approval card still waits for a decision. */
+export function getPendingApprovalIds(messages: ai.UIMessage[]): Set<string> {
+  const toolCallIds = new Set<string>()
+  // Cards whose calls already have a result no longer wait.
+  for (const message of transformMessages(messages)) {
+    for (const part of message.parts) {
+      if (
+        part.type !== "data-approval-request" ||
+        !isApprovalCardArray(part.data)
+      ) {
+        continue
+      }
+      for (const approval of part.data) {
+        if ((approval.status ?? "pending") === "pending") {
+          toolCallIds.add(approval.tool_call_id)
+        }
+      }
+    }
+  }
+  return toolCallIds
 }
 
 /**
@@ -291,19 +587,51 @@ export function getAssistantText(parts: UIMessage["parts"]): string {
  * - Streaming tool inputs remain visible
  * - Completed tool calls collapse their input and approval parts
  * - Pending approvals (without output) remain visible
+ * - Duplicate DB/stream seam copies render once: latest output wins, otherwise
+ *   the latest occurrence wins
+ * - A call renders in the card that opened it, even when its output arrives in
+ *   a later message, such as an approval continuation or after the turn's
+ *   cancelled marker
  *
  * @param messages - Array of UI messages to transform
  * @returns Transformed messages with appropriate parts hidden/visible
  */
 export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
-  // Tool call id to array positions (using string keys for positions)
-  const states = new Map<
-    string,
-    { open?: string; approval?: string; close?: string } | undefined
-  >()
+  // One lifecycle record per toolCallId; positions are "msgIndex-partIndex".
+  const traces = new Map<string, ToolCallTrace>()
   // Array positions to ignore (using "msgIndex-partIndex" string format)
   const ignorePos = new Set<string>()
   let pendingCompactionStartPos: string | null = null
+
+  const getTrace = (toolCallId: string): ToolCallTrace => {
+    let trace = traces.get(toolCallId)
+    if (!trace) {
+      trace = { hasOutput: false }
+      traces.set(toolCallId, trace)
+    }
+    return trace
+  }
+
+  // Dedupe DB/stream seam copies: an output-bearing copy supersedes any kept
+  // copy; a non-output copy is ignored when an output copy is kept; otherwise
+  // the latest occurrence wins. Ignored positions accumulate in `ignorePos`.
+  const recordDedupe = (
+    trace: ToolCallTrace,
+    posKey: string,
+    hasOutput: boolean
+  ) => {
+    if (hasOutput) {
+      if (trace.keptPos) ignorePos.add(trace.keptPos)
+      trace.keptPos = posKey
+      trace.hasOutput = true
+    } else if (trace.hasOutput) {
+      ignorePos.add(posKey)
+    } else {
+      if (trace.keptPos) ignorePos.add(trace.keptPos)
+      trace.keptPos = posKey
+      trace.hasOutput = false
+    }
+  }
 
   for (const [i, message] of messages.entries()) {
     for (const [j, part] of message.parts.entries()) {
@@ -311,51 +639,50 @@ export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
 
       if (ai.isToolUIPart(part)) {
         const { state, toolCallId } = part
-        if (state === "input-available") {
+        const hasOutput =
+          state === "output-available" || state === "output-error"
+        const trace = getTrace(toolCallId)
+        recordDedupe(trace, posKey, hasOutput)
+
+        if (
+          !trace.hasOutput &&
+          (state === "input-streaming" || state === "input-available")
+        ) {
           // OPEN STATE
-          // If we encounter an input-available part, we open a tool call state
-          states.set(toolCallId, { open: posKey })
-        } else if (state === "output-available" || state === "output-error") {
+          // If we encounter an input part, we open a tool call state.
+          // A fresh open supersedes any prior open/approval bookkeeping.
+          trace.openPos = posKey
+          trace.approvalPos = undefined
+          trace.closePos = undefined
+        } else if (hasOutput) {
           // CLOSE STATE
           // If we encounter an output-* part:
           // 1. Close the tool call state by hiding the input-* + approval parts
           // 2. Merge the input args into the output part
-          const currState = states.get(toolCallId)
-          if (currState) {
-            if (currState.open) {
-              ignorePos.add(currState.open) // Hide open state
-            }
-            if (currState.approval) {
-              ignorePos.add(currState.approval) // Hide approval state
-            }
-          } else {
-            states.set(toolCallId, { close: posKey })
-            continue
+          if (trace.openPos) {
+            ignorePos.add(trace.openPos) // Hide open state
           }
-          // add close state
-          states.set(toolCallId, { ...currState, close: posKey })
+          if (trace.approvalPos) {
+            ignorePos.add(trace.approvalPos) // Hide approval state
+          }
+          trace.closePos = posKey
         }
       } else if (part.type === "data-approval-request") {
         // Handle approval request parts
         // 1. If approval request we mark positions, only ignore if we hit a close state
         // 2. If we see approval requests after a close state, we should ignore the approval requests
-        const approvals: ApprovalCard[] = Array.isArray(part.data)
-          ? part.data
-          : []
+        const approvals = isApprovalCardArray(part.data) ? part.data : []
         for (const approval of approvals) {
+          const toolCallId = approval.tool_call_id
+          const trace = getTrace(toolCallId)
+          trace.lastApprovalPos = posKey
           // For each approval find the matching open state and update the approval state
-          if (approval.tool_call_id) {
-            const currState = states.get(approval.tool_call_id)
-            if (currState) {
-              // If we already have a close state, ignore this approval request
-              if (currState.close) {
-                ignorePos.add(posKey)
-              }
-              states.set(approval.tool_call_id, {
-                ...currState,
-                approval: posKey,
-              })
+          if (trace.openPos || trace.approvalPos || trace.closePos) {
+            // If we already have a close state, ignore this approval request
+            if (trace.closePos) {
+              ignorePos.add(posKey)
             }
+            trace.approvalPos = posKey
           }
         }
       } else if (part.type === "data-compaction") {
@@ -380,44 +707,65 @@ export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
     }
   }
 
+  // Open positions whose call closed later, mapped to the closing output.
+  const closedAt = new Map<string, string>()
+  for (const { openPos, closePos } of traces.values()) {
+    if (openPos && closePos) {
+      closedAt.set(openPos, closePos)
+    }
+  }
+
   // Finally walk through each message and filter out the ignored positions
   const finalMessages: ai.UIMessage[] = []
   for (const [i, message] of messages.entries()) {
     const newParts: ai.UIMessagePart<ai.UIDataTypes, ai.UITools>[] = []
     for (const [j, part] of message.parts.entries()) {
       const posKey = `${i}-${j}`
+      const closePos = closedAt.get(posKey)
+      if (closePos) {
+        // Show the output in the opening card, with the input it streamed.
+        const [closeMsgIdx, closePartIdx] = closePos.split("-").map(Number)
+        const closePart = messages[closeMsgIdx].parts[closePartIdx]
+        if (
+          !ai.isToolUIPart(part) ||
+          !ai.isToolUIPart(closePart) ||
+          (closePart.state !== "output-available" &&
+            closePart.state !== "output-error")
+        ) {
+          throw new Error(
+            `Tool call parts do not match: ${JSON.stringify([part, closePart])}`
+          )
+        }
+        newParts.push({ ...closePart, input: part.input })
+        continue
+      }
       if (ignorePos.has(posKey)) continue
-      // Merge input from open state into output parts
+      if (
+        part.type === "data-approval-request" &&
+        isApprovalCardArray(part.data)
+      ) {
+        const remaining = part.data.filter(
+          ({ tool_call_id: toolCallId }) =>
+            !traces.get(toolCallId)?.hasOutput &&
+            traces.get(toolCallId)?.lastApprovalPos === posKey
+        )
+        if (remaining.length === 0) {
+          continue
+        }
+        if (remaining.length !== part.data.length) {
+          newParts.push({ ...part, data: remaining })
+          continue
+        }
+      }
+      // An output that closed an opened call already shows in the opening card.
       if (
         ai.isToolUIPart(part) &&
-        (part.state === "output-available" || part.state === "output-error")
+        (part.state === "output-available" || part.state === "output-error") &&
+        traces.get(part.toolCallId)?.openPos
       ) {
-        // Handle output parts
-        const { toolCallId } = part
-        const currState = states.get(toolCallId)
-        const newPart: Extract<
-          ai.UIMessagePart<ai.UIDataTypes, ai.UITools>,
-          { state: "output-available" | "output-error" }
-        > = {
-          ...part,
-        }
-        if (currState?.open) {
-          // Extract the open position from the string key
-          const [openMsgIdx, openPartIdx] = currState.open
-            .split("-")
-            .map(Number)
-          const openPart = messages[openMsgIdx].parts[openPartIdx]
-          if (!ai.isToolUIPart(openPart)) {
-            throw new Error(
-              `Open part is not a tool part: ${JSON.stringify(openPart)}`
-            )
-          }
-          newPart.input = openPart.input
-        }
-        newParts.push(newPart)
-      } else {
-        newParts.push(part)
+        continue
       }
+      newParts.push(part)
     }
     if (newParts.length > 0) {
       finalMessages.push({ ...message, parts: newParts })

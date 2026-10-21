@@ -1,4 +1,5 @@
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -7,18 +8,25 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat.agent.folders.schemas import AgentFolderDirectoryItem
+from tracecat.agent.folders.schemas import (
+    AgentFolderDirectoryItem,
+    AgentPresetDirectoryItem,
+)
 from tracecat.agent.folders.service import (
     AgentFolderErrorCode,
     AgentFolderService,
 )
+from tracecat.agent.preset.schemas import AgentPresetToolSummary
 from tracecat.auth.types import Role
-from tracecat.db.models import AgentFolder, AgentPreset
+from tracecat.db.models import AgentFolder, AgentPreset, MCPIntegration
 from tracecat.exceptions import (
     EntitlementRequired,
     ScopeDeniedError,
+    TracecatNotFoundError,
     TracecatValidationError,
 )
+from tracecat.integrations.enums import MCPAuthType
+from tracecat.integrations.service import IntegrationService
 from tracecat.pagination import CursorPaginationParams
 from tracecat.tiers.enums import Entitlement
 
@@ -252,6 +260,31 @@ async def test_move_preset_requires_agent_addons_entitlement(
 
 
 @pytest.mark.anyio
+async def test_move_preset_rejects_soft_deleted_preset(
+    folder_service: AgentFolderService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Soft-deleted presets should not be movable through folder management."""
+    monkeypatch.setattr(folder_service, "has_entitlement", AsyncMock(return_value=True))
+    target = await folder_service.create_folder(name="target", parent_path="/")
+    preset = AgentPreset(
+        workspace_id=folder_service.workspace_id,
+        name="Soft-deleted preset",
+        slug="soft-deleted-preset",
+        model_name="gpt-4o-mini",
+        model_provider="openai",
+        retries=3,
+        enable_internet_access=False,
+        deleted_at=datetime.now(UTC),
+    )
+    folder_service.session.add(preset)
+    await folder_service.session.commit()
+
+    with pytest.raises(TracecatNotFoundError):
+        await folder_service.move_preset(preset.id, target)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "invoker",
     [
@@ -318,6 +351,17 @@ async def test_get_directory_items_returns_real_direct_item_counts(
                 retries=3,
                 enable_internet_access=False,
                 folder_id=parent.id,
+            ),
+            AgentPreset(
+                workspace_id=folder_service.workspace_id,
+                name="soft deleted",
+                slug="soft-deleted",
+                model_name="gpt-4o-mini",
+                model_provider="openai",
+                retries=3,
+                enable_internet_access=False,
+                folder_id=parent.id,
+                deleted_at=datetime.now(UTC),
             ),
         ]
     )
@@ -480,3 +524,56 @@ async def test_rename_folder_rejects_blank_name(
 
     with pytest.raises(TracecatValidationError, match="Folder name cannot be empty"):
         await folder_service.rename_folder(folder.id, "  ")
+
+
+@pytest.mark.anyio
+async def test_directory_presets_include_tool_summaries_in_one_batch(
+    folder_service: AgentFolderService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Directory summaries share one integration load across all preset rows."""
+    monkeypatch.setattr(folder_service, "has_entitlement", AsyncMock(return_value=True))
+    integration = MCPIntegration(
+        workspace_id=folder_service.workspace_id,
+        name="Synthetic",
+        slug="synthetic",
+        server_type="stdio",
+        auth_type=MCPAuthType.NONE,
+        stdio_command="synthetic",
+    )
+    folder_service.session.add(integration)
+    await folder_service.session.flush()
+    folder_service.session.add_all(
+        [
+            AgentPreset(
+                workspace_id=folder_service.workspace_id,
+                name=f"Summary {index}",
+                slug=f"summary-{index}",
+                model_name="gpt-4o-mini",
+                model_provider="openai",
+                actions=["tools.synthetic.read", "core.http_request"],
+                namespaces=["tools.synthetic"],
+                mcp_integrations=[str(integration.id)],
+            )
+            for index in range(3)
+        ]
+    )
+    await folder_service.session.commit()
+    original_load = IntegrationService.list_mcp_integrations
+    integration_loads = 0
+
+    async def counted_load(service: IntegrationService) -> list[MCPIntegration]:
+        nonlocal integration_loads
+        integration_loads += 1
+        return list(await original_load(service))
+
+    monkeypatch.setattr(IntegrationService, "list_mcp_integrations", counted_load)
+    items = await folder_service.get_directory_items("/")
+
+    assert len(items) == 3
+    for item in items:
+        assert isinstance(item, AgentPresetDirectoryItem)
+        assert item.tool_summary == AgentPresetToolSummary(
+            tool_count=1, namespaces=["tools.synthetic"], mcp_slugs=["synthetic"]
+        )
+    assert integration_loads == 1

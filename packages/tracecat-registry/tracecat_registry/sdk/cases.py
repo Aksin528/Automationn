@@ -26,6 +26,19 @@ class CasesClient:
     def __init__(self, client: TracecatClient) -> None:
         self._client = client
 
+    async def aggregate_cases(self, spec: dict[str, Any]) -> types.AggregateResponse:
+        """Aggregate cases using the server's JSON query specification.
+
+        Args:
+            spec: Plain JSON filters, grouping, calculations, and result options.
+                The server owns validation; its recursive models cannot be
+                imported or mirrored by the standalone registry package.
+
+        Returns:
+            Flat groups and whether additional groups were omitted.
+        """
+        return await self._client.post("/cases/aggregate", json=spec)
+
     @staticmethod
     def _serialize_dropdown_values(
         dropdown_values: list[types.CaseDropdownValueInput] | None,
@@ -103,7 +116,7 @@ class CasesClient:
         """Get a case by ID.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
 
         Returns:
             Case data.
@@ -131,7 +144,7 @@ class CasesClient:
         """Update a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             summary: New summary.
             description: New description. Pass None to clear.
             status: New status.
@@ -176,7 +189,7 @@ class CasesClient:
         """Delete a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
         """
         await self._client.delete(f"/cases/{case_id}")
 
@@ -189,6 +202,7 @@ class CasesClient:
         order_by: str | Unset = UNSET,
         sort: Literal["asc", "desc"] | Unset = UNSET,
         include_rows: bool | Unset = UNSET,
+        include_payload: bool | Unset = UNSET,
     ) -> types.CaseListResponse:
         """List cases using default server-side filtering.
 
@@ -213,6 +227,8 @@ class CasesClient:
             params["sort"] = sort
         if is_set(include_rows):
             params["include_rows"] = include_rows
+        if is_set(include_payload):
+            params["include_payload"] = include_payload
 
         return await self._client.get("/cases", params=params)
 
@@ -236,6 +252,7 @@ class CasesClient:
         updated_after: datetime | str | Unset = UNSET,
         updated_before: datetime | str | Unset = UNSET,
         include_rows: bool | Unset = UNSET,
+        include_payload: bool | Unset = UNSET,
     ) -> types.CaseListResponse:
         """Search cases with filtering and pagination."""
         params: dict[str, Any] = {"limit": limit}
@@ -285,6 +302,10 @@ class CasesClient:
                 if isinstance(updated_before, datetime)
                 else updated_before
             )
+        if is_set(include_rows):
+            params["include_rows"] = include_rows
+        if is_set(include_payload):
+            params["include_payload"] = include_payload
 
         return await self._client.get("/cases/search", params=params)
 
@@ -294,7 +315,7 @@ class CasesClient:
         """List comments on a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
 
         Returns:
             List of comments.
@@ -317,7 +338,7 @@ class CasesClient:
         """Create a comment on a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             content: Comment content.
             parent_id: Parent comment ID for replies.
 
@@ -358,7 +379,7 @@ class CasesClient:
         """Update a comment.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             comment_id: The comment UUID.
             content: New content.
 
@@ -398,7 +419,7 @@ class CasesClient:
         """Delete a comment.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             comment_id: The comment UUID.
         """
         await self._client.delete(f"/cases/{case_id}/comments/{comment_id}")
@@ -409,7 +430,7 @@ class CasesClient:
         """List tags on a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
 
         Returns:
             List of tags.
@@ -426,7 +447,7 @@ class CasesClient:
         """Add a tag to a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             tag_id: The tag UUID or ref.
             create_if_missing: If True, create the tag if not found.
 
@@ -442,7 +463,7 @@ class CasesClient:
         """Remove a tag from a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             tag_id: The tag UUID or ref.
         """
         await self._client.delete(f"/cases/{case_id}/tags/{tag_id}")
@@ -453,7 +474,7 @@ class CasesClient:
         """List attachments on a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
 
         Returns:
             List of attachments.
@@ -471,7 +492,7 @@ class CasesClient:
         """Create an attachment on a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             filename: Filename for the attachment.
             content_base64: Base64-encoded file content.
             content_type: MIME type of the file.
@@ -498,7 +519,7 @@ class CasesClient:
         """Get attachment download info.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             attachment_id: The attachment UUID.
             expiry: Optional URL expiry time in seconds.
 
@@ -521,7 +542,7 @@ class CasesClient:
         """Get a presigned download URL for an attachment.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             attachment_id: The attachment UUID.
             expiry: Optional URL expiry time in seconds.
 
@@ -538,13 +559,13 @@ class CasesClient:
 
     async def download_attachment(
         self,
-        case_id: UUID,
+        case_id: str | UUID,
         attachment_id: UUID,
     ) -> types.CaseAttachmentDownloadData:
         """Download attachment content.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             attachment_id: The attachment UUID.
 
         Returns:
@@ -554,11 +575,11 @@ class CasesClient:
             f"/cases/{case_id}/attachments/{attachment_id}/download"
         )
 
-    async def delete_attachment(self, case_id: UUID, attachment_id: UUID) -> None:
+    async def delete_attachment(self, case_id: str | UUID, attachment_id: UUID) -> None:
         """Delete an attachment.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             attachment_id: The attachment UUID.
         """
         await self._client.delete(f"/cases/{case_id}/attachments/{attachment_id}")
@@ -569,7 +590,7 @@ class CasesClient:
         """List events/activity for a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
 
         Returns:
             Case events with user info.
@@ -587,7 +608,7 @@ class CasesClient:
         """Assign a user to a case by user ID.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             assignee_id: The user UUID to assign.
 
         Returns:
@@ -604,7 +625,7 @@ class CasesClient:
         """Assign a user to a case by email.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             email: The user's email address.
 
         Returns:
@@ -697,7 +718,7 @@ class CasesClient:
         This uses the UDF-compatible /cases/{case_id}/simple endpoint.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             summary: New summary.
             description: New description. Pass None to clear.
             status: New status.
@@ -756,7 +777,7 @@ class CasesClient:
         This uses the UDF-compatible /cases/{case_id}/comments/simple endpoint.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             content: Comment content.
             parent_id: Parent comment ID for replies.
             workflow_id: Selected workflow ID for workflow-backed comments.
@@ -807,7 +828,7 @@ class CasesClient:
         This uses the UDF-compatible /cases/{case_id}/assign endpoint.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             assignee_id: The user UUID to assign.
 
         Returns:
@@ -820,13 +841,13 @@ class CasesClient:
 
     async def get_attachment_metadata(
         self,
-        case_id: UUID,
+        case_id: str | UUID,
         attachment_id: UUID,
     ) -> types.CaseAttachmentRead:
         """Get attachment metadata without download URL.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             attachment_id: The attachment UUID.
 
         Returns:
@@ -838,7 +859,7 @@ class CasesClient:
 
     async def get_attachment_presigned_url(
         self,
-        case_id: UUID,
+        case_id: str | UUID,
         attachment_id: UUID,
         *,
         expiry: int | None = None,
@@ -846,7 +867,7 @@ class CasesClient:
         """Get a presigned download URL for an attachment.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             attachment_id: The attachment UUID.
             expiry: Optional URL expiry time in seconds.
 
@@ -895,7 +916,7 @@ class CasesClient:
         """Create a new task for a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
             title: Task title.
             description: Task description.
             priority: Task priority (unknown, low, medium, high, critical).
@@ -938,7 +959,7 @@ class CasesClient:
         """List all tasks for a case.
 
         Args:
-            case_id: The case UUID.
+            case_id: The case UUID or short ID.
 
         Returns:
             List of tasks.
@@ -1012,6 +1033,48 @@ class CasesClient:
         if is_set(reverse):
             params["reverse"] = reverse
         return await self._client.get(f"/cases/{case_id}/rows", params=params)
+
+    async def list_linked_cases(
+        self,
+        table_id: str,
+        row_id: str,
+        *,
+        limit: int = 20,
+        cursor: str | Unset = UNSET,
+        reverse: bool | Unset = UNSET,
+        order_by: str | Unset = UNSET,
+        sort: Literal["asc", "desc"] | Unset = UNSET,
+        exclude_case_id: str | Unset = UNSET,
+    ) -> types.CaseListResponse:
+        """List the cases that link a table row.
+
+        Args:
+            table_id: Table ID.
+            row_id: Row ID.
+            limit: Maximum items per page.
+            cursor: Pagination cursor.
+            reverse: Reverse pagination direction.
+            order_by: Case column to order by.
+            sort: Sort direction.
+            exclude_case_id: Case ID or short ID to leave out of the results.
+
+        Returns:
+            Paginated list of cases with cursor metadata.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if is_set(cursor):
+            params["cursor"] = cursor
+        if is_set(reverse):
+            params["reverse"] = reverse
+        if is_set(order_by):
+            params["order_by"] = order_by
+        if is_set(sort):
+            params["sort"] = sort
+        if is_set(exclude_case_id):
+            params["exclude_case_id"] = exclude_case_id
+        return await self._client.get(
+            f"/tables/{table_id}/rows/{row_id}/cases", params=params
+        )
 
     async def link_case_row(
         self, case_id: str, *, table_id: str, row_id: str

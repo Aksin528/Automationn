@@ -13,6 +13,7 @@ only the new `approval_vote` table and nothing else.
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 # revision identifiers, used by Alembic.

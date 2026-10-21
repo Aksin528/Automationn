@@ -2,9 +2,11 @@
 
 import type { DynamicToolUIPart, ToolUIPart } from "ai"
 import {
+  BanIcon,
   ChevronDownIcon,
   CircleCheckIcon,
   CircleMinusIcon,
+  CircleSlashIcon,
   ClockIcon,
   DownloadIcon,
   WrenchIcon,
@@ -54,7 +56,12 @@ type LegacyToolState =
   | "approval-responded"
   | "approval-rejected"
   | "output-denied"
-type ToolState = ToolPart["state"] | LegacyToolState
+/**
+ * Display-only state for tool calls that never completed because the user
+ * stopped the turn. Derived at render time; never sent to or by the server.
+ */
+type InterruptedToolState = "output-interrupted"
+type ToolState = ToolPart["state"] | LegacyToolState | InterruptedToolState
 
 export type ToolHeaderProps = {
   title?: string
@@ -72,8 +79,9 @@ const statusLabels: Record<ToolState, string> = {
   "input-available": "In progress",
   "input-streaming": "In progress",
   "output-available": "Completed",
-  "output-denied": "Error",
+  "output-denied": "Denied",
   "output-error": "Error",
+  "output-interrupted": "Interrupted",
 }
 
 const statusIcons: Record<ToolState, ReactNode> = {
@@ -95,11 +103,12 @@ const statusIcons: Record<ToolState, ReactNode> = {
   "output-available": (
     <CircleCheckIcon className="size-4 fill-emerald-500 stroke-background" />
   ),
-  "output-denied": (
-    <XCircleIcon className="size-4 fill-rose-500 stroke-background" />
-  ),
+  "output-denied": <BanIcon className="size-3.5 text-muted-foreground" />,
   "output-error": (
     <XCircleIcon className="size-4 fill-rose-500 stroke-background" />
+  ),
+  "output-interrupted": (
+    <CircleSlashIcon className="size-3.5 text-muted-foreground" />
   ),
 }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import func, select, update
@@ -12,11 +13,15 @@ from sqlalchemy.orm import Mapped
 from tracecat_ee.admin.users.schemas import AdminUserCreate
 from tracecat_ee.admin.users.service import AdminUserService
 
+from tests.support.membership import grant_org_membership, grant_workspace_membership
 from tracecat import config
+from tracecat.audit.enums import AuditEventStatus
+from tracecat.audit.service import AuditService
 from tracecat.auth.schemas import UserRole
 from tracecat.auth.types import PlatformRole
 from tracecat.db.models import (
     AccessToken,
+    LegacyMembership,
     Membership,
     Organization,
     OrganizationMembership,
@@ -80,7 +85,10 @@ async def test_create_user_creates_platform_user_without_memberships(
     workspace_membership_result = await session.execute(
         select(func.count())
         .select_from(Membership)
-        .where(Membership.user_id == created.id)
+        .where(
+            Membership.user_id == created.id,
+            Membership.workspace_id.is_not(None),
+        )
     )
     workspace_membership_count = workspace_membership_result.scalar_one()
     assert workspace_membership_count == 0
@@ -105,6 +113,59 @@ async def test_create_user_respects_superuser_flag(
     )
     user = user_result.scalar_one()
     assert user.is_superuser is True
+
+
+@pytest.mark.anyio
+async def test_admin_user_audit_logs_target_user_ids(
+    session: AsyncSession,
+    platform_role: PlatformRole,
+) -> None:
+    service = AdminUserService(session, role=platform_role)
+    create_event_calls: list[dict[str, object]] = []
+
+    async def mock_create_event(*args, **kwargs):
+        create_event_calls.append(kwargs)
+
+    with patch.object(AuditService, "create_event", side_effect=mock_create_event):
+        created = await service.create_user(
+            AdminUserCreate(
+                email="audit-created-user@example.com",
+                password="this-is-a-strong-password",
+                is_superuser=False,
+            )
+        )
+        promoted = await service.create_user(
+            AdminUserCreate(
+                email="audit-promoted-user@example.com",
+                password="this-is-a-strong-password",
+                is_superuser=False,
+            )
+        )
+        await service.promote_superuser(promoted.id)
+        current_superuser = await service.create_user(
+            AdminUserCreate(
+                email="audit-current-superuser@example.com",
+                password="this-is-a-strong-password",
+                is_superuser=True,
+            )
+        )
+        demoted = await service.create_user(
+            AdminUserCreate(
+                email="audit-demoted-user@example.com",
+                password="this-is-a-strong-password",
+                is_superuser=True,
+            )
+        )
+        await service.demote_superuser(demoted.id, current_superuser.id)
+
+    success_events = {
+        (call["action"], call["resource_id"])
+        for call in create_event_calls
+        if call["status"] == AuditEventStatus.SUCCESS
+    }
+    assert ("create", created.id) in success_events
+    assert ("promote", promoted.id) in success_events
+    assert ("demote", demoted.id) in success_events
 
 
 @pytest.mark.anyio
@@ -139,11 +200,15 @@ async def test_create_user_provisions_default_org_in_single_tenant(
     workspace_membership_count = await session.scalar(
         select(func.count())
         .select_from(Membership)
-        .where(Membership.user_id == created.id)
+        .where(
+            Membership.user_id == created.id,
+            Membership.workspace_id.is_not(None),
+        )
     )
 
     assert membership_count == 1
-    assert role_slug == "organization-member"
+    # Membership alone carries the scope floor; no org-wide role is written.
+    assert role_slug is None
     assert workspace_membership_count == 0
 
 
@@ -224,13 +289,15 @@ async def test_delete_user_clears_sessions_and_memberships(
     session.add(workspace)
     await session.flush()
     token = AccessToken(token=f"token-{uuid.uuid4().hex}", user_id=user.id)
-    session.add_all(
-        [
-            token,
-            OrganizationMembership(user_id=user.id, organization_id=org.id),
-            Membership(user_id=user.id, workspace_id=workspace.id),
-        ]
+    session.add(token)
+    await grant_org_membership(session, user_id=user.id, organization_id=org.id)
+    await grant_workspace_membership(
+        session,
+        user_id=user.id,
+        organization_id=org.id,
+        workspace_id=workspace.id,
     )
+    session.add(LegacyMembership(user_id=user.id, workspace_id=workspace.id))
     await session.commit()
 
     token_id = token.id
@@ -255,8 +322,15 @@ async def test_delete_user_clears_sessions_and_memberships(
     assert (
         await session.scalar(
             select(OrganizationMembership).where(
-                OrganizationMembership.user_id == user_id
+                OrganizationMembership.user_id == user_id,
             )
+        )
+        is None
+    )
+    # The legacy table is kept in step for older app versions.
+    assert (
+        await session.scalar(
+            select(LegacyMembership).where(LegacyMembership.user_id == user_id)
         )
         is None
     )

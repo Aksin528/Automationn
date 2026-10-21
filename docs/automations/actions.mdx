@@ -1,13 +1,21 @@
 ---
 title: "Actions"
-description: "Connect Tracecat actions to build workflows: configure inputs and outputs, reference upstream results, and chain core, integration, and custom actions."
+description: "Learn how Tracecat actions work and how to configure them: action names and types, the action toolbar, success and error paths, and control flow."
 ---
 
 import ActionExpressionsSection from "/snippets/action-expressions-section.mdx";
+import CoreActionsPointer from "/snippets/core-actions-pointer.mdx";
+import CoreActionsList from "/snippets/core-actions-list.mdx";
 
 You can view all available actions in the `/actions` page.
 
 ![Actions page](/img/automations/actions/actions-table.png)
+
+## Core actions
+
+<CoreActionsPointer />
+
+<CoreActionsList />
 
 ## Action names
 
@@ -85,7 +93,7 @@ Use `run_if` to execute an action only when a condition evaluates to a truthy va
 
 ```yaml Status and owner check
 - ref: escalate_case
-  action: core.cases.update
+  action: core.cases.update_case
   run_if: ${{ TRIGGER.status == "open" && TRIGGER.owner != None }}
   args:
     case_id: ${{ TRIGGER.case_id }}
@@ -111,9 +119,10 @@ Inside the action inputs, reference the current item with `var.<name>`. For exam
 <CodeGroup>
 ```yaml Send one email per user
 - ref: email_user
-  action: core.email.send
+  action: core.send_email_smtp
   for_each: ${{ for var.user in TRIGGER.users }}
   args:
+    sender: no-reply@example.com
     recipients:
       - ${{ var.user.email }}
     subject: "Tracecat notification"
@@ -156,8 +165,39 @@ Use `start_delay` to wait a fixed number of seconds before an action starts.
 
 ### Timeout
 
-Use `timeout` to cap how long Tracecat waits for an action attempt to finish.
-Defaults to 300 seconds.
+Use `timeout` to cap how long the action's function call may run in each attempt.
+Defaults to 300 seconds. Tracecat also caps each function call at `TRACECAT__EXECUTOR_CLIENT_TIMEOUT`, which defaults to 300 seconds (see [Environment variables](/self-hosting/environment-variables)).
+
+The timeout covers only the function call. Platform work such as resolving secrets, loading the action's registry code, and starting the sandbox doesn't count toward it. An attempt that hits the timeout fails with `Action execution timed out after <timeout>s` and is retried if `max_attempts` allows it.
+
+A template action counts as one action: all its steps, including nested templates, share one timeout, which starts when the template starts running. Time between steps, such as starting each step's sandbox, counts toward it. When the timeout runs out, Tracecat stops the running step, skips the remaining steps, and fails the attempt. The `TRACECAT__EXECUTOR_CLIENT_TIMEOUT` cap applies to each step's function call, not to the template as a whole.
+
+For `core.script.run_python`, the shorter of `timeout` and the script's `timeout_seconds` applies. The `TRACECAT__EXECUTOR_CLIENT_TIMEOUT` cap doesn't apply.
+
+Each `for_each` iteration gets the full timeout, but all iterations share one attempt that Tracecat caps at the timeout plus 600 seconds. A loop whose iterations run longer than that fails the attempt, and a retry runs every iteration again.
+
+For `ai.agent`, `ai.action`, and `ai.preset_agent`, `timeout` caps the agent's active runtime in seconds. Unset means 1800 seconds (30 minutes).
+
+Tracecat clamps an explicit value between 1800 seconds and `TRACECAT__AGENT_SANDBOX_TIMEOUT`, which defaults to 3600 seconds (see [Environment variables](/self-hosting/environment-variables)). Tracecat stores the clamped value instead of rejecting the action. A ceiling below 1800 seconds lowers both the default and the floor to the ceiling.
+
+A pause for a tool approval does not count toward the timeout, and the resumed run gets the full timeout again.
+
+```yaml
+- ref: investigate_alert
+  action: ai.agent
+  retry_policy:
+    timeout: 2700
+  args:
+    model:
+      model_name: gpt-4.1
+      model_provider: openai
+    user_prompt: |
+      Investigate this alert:
+
+      ${{ TRIGGER.alert }}
+```
+
+A run that reaches the timeout fails with `Agent execution timed out after 2700s`. The workflow-level `timeout` still bounds the whole run, including approval waits.
 
 ### Max attempts
 

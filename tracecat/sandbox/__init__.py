@@ -3,13 +3,13 @@
 This package provides secure sandboxed environments for executing Python scripts.
 It supports two execution modes:
 
-1. **nsjail sandbox** (when TRACECAT__DISABLE_NSJAIL=false):
+1. **nsjail sandbox** (when TRACECAT__EXECUTOR_BACKEND=nsjail):
    - Full OS-level isolation via Linux namespaces
    - Network, filesystem, and process isolation
    - Resource limits (memory, CPU, file size)
    - Requires privileged Docker mode or CAP_SYS_ADMIN
 
-2. **Unsafe PID executor** (when TRACECAT__DISABLE_NSJAIL=true, default):
+2. **Unsafe PID executor** (when TRACECAT__EXECUTOR_BACKEND=direct, default):
    - Subprocess isolation with venv per dependency set
    - PID namespace isolation when available
    - Works without privileged mode
@@ -24,8 +24,10 @@ from tracecat.sandbox.exceptions import (
     PackageInstallError,
     SandboxError,
     SandboxExecutionError,
+    SandboxInfrastructureError,
     SandboxTimeoutError,
     SandboxValidationError,
+    SandboxWorkloadError,
 )
 from tracecat.sandbox.safe_lambda import SafeLambdaValidator, build_safe_lambda
 from tracecat.sandbox.service import SandboxService, validate_run_python_script
@@ -46,6 +48,8 @@ __all__ = [
     "SandboxError",
     "SandboxTimeoutError",
     "SandboxExecutionError",
+    "SandboxInfrastructureError",
+    "SandboxWorkloadError",
     "SandboxValidationError",
     "PackageInstallError",
     # Validation

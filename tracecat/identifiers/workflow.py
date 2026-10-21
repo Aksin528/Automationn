@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, Query
+from fastapi.exceptions import RequestValidationError
 from pydantic import UUID4, StringConstraints
 
 from tracecat.identifiers.common import TracecatUUID
@@ -26,6 +27,11 @@ WF_EXEC_SUFFIX_PATTERN = (
     rf"({EXEC_ID_SHORT_PATTERN}|{LEGACY_EXEC_ID_PATTERN}|{SCHEDULE_EXEC_ID_PATTERN})"
 )
 WF_EXEC_ID_PATTERN = rf"(?P<workflow_id>{LEGACY_WF_ID_PATTERN}|{WF_ID_SHORT_PATTERN})[:/](?P<execution_id>{WF_EXEC_SUFFIX_PATTERN})"
+# ECMA-262 (the JSON Schema regex dialect) has no `(?P<name>...)` syntax; strip
+# the group names for schema-facing constraints so emitted tool/field schemas
+# compile in strict clients that build ECMAScript RegExp validators (e.g. MCP
+# clients). Runtime parsing keeps the named pattern above for `match.group(...)`.
+WF_EXEC_ID_SCHEMA_PATTERN = re.sub(r"\?P<[^>]+>", "", WF_EXEC_ID_PATTERN)
 
 WorkflowIDShort = Annotated[str, StringConstraints(pattern=WF_ID_SHORT_PATTERN)]
 """A short base62 encoded string representation of a workflow UUID.
@@ -102,7 +108,9 @@ AnyExecutionID = ExecutionUUID | ExecutionIDShort
 AnyWorkspaceID = WorkspaceUUID | WorkspaceIDShort | UUID4
 """A workspace ID that can be either a UUID or a short string."""
 
-WorkflowExecutionID = Annotated[str, StringConstraints(pattern=WF_EXEC_ID_PATTERN)]
+WorkflowExecutionID = Annotated[
+    str, StringConstraints(pattern=WF_EXEC_ID_SCHEMA_PATTERN)
+]
 """The full unique ID for a workflow execution.
 
 Not to be confused with the run ID, which is a UUID for each run/retry of the execution.
@@ -163,12 +171,33 @@ def exec_id_from_parts(
     return f"{wf_id}:{exec_suffix_id}"
 
 
+def _wf_id_from_any(
+    workflow_id: AnyWorkflowID, *, loc: Literal["path", "query"]
+) -> WorkflowID:
+    try:
+        return WorkflowUUID.new(workflow_id)
+    except ValueError as exc:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": (loc, "workflow_id"),
+                    "msg": (
+                        "Invalid workflow ID. Expected a UUID or a short ID "
+                        "(wf_<base62>)."
+                    ),
+                    "input": workflow_id,
+                }
+            ]
+        ) from exc
+
+
 def wf_id_from_any_dep(workflow_id: AnyWorkflowID) -> WorkflowID:
     """Convert a workflow ID string to a UUID.
 
     Accepts either a UUID string or a short ID in the format wf_XXXXX.
     """
-    return WorkflowUUID.new(workflow_id)
+    return _wf_id_from_any(workflow_id, loc="path")
 
 
 def opt_wf_id_from_any_query_dep(
@@ -178,7 +207,7 @@ def opt_wf_id_from_any_query_dep(
 
     Accepts either a UUID string or a short ID in the format wf_XXXXX.
     """
-    return WorkflowUUID.new(workflow_id) if workflow_id else None
+    return _wf_id_from_any(workflow_id, loc="query") if workflow_id else None
 
 
 def wf_id_from_any_query_dep(workflow_id: AnyWorkflowID = Query(...)) -> WorkflowID:
@@ -186,7 +215,7 @@ def wf_id_from_any_query_dep(workflow_id: AnyWorkflowID = Query(...)) -> Workflo
 
     Accepts either a UUID string or a short ID in the format wf_XXXXX.
     """
-    return WorkflowUUID.new(workflow_id)
+    return _wf_id_from_any(workflow_id, loc="query")
 
 
 AnyWorkflowIDPath = Annotated[WorkflowID, Depends(wf_id_from_any_dep)]

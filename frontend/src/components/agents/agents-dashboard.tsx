@@ -1,6 +1,5 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
 import { format } from "date-fns"
 import {
   AlertTriangleIcon,
@@ -20,6 +19,8 @@ import {
   MousePointerClickIcon,
   Pencil,
   SearchIcon,
+  Sparkles,
+  StarIcon,
   TagsIcon,
   Trash2,
   Type,
@@ -27,13 +28,20 @@ import {
 } from "lucide-react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import {
+  memo,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react"
 import type {
   AgentFolderDirectoryItem,
   AgentPresetDirectoryItem,
-  AgentPresetReadMinimal,
   AgentTagRead,
   ApprovalRead,
+  MCPIntegrationRead,
 } from "@/client"
 import {
   agentPresetsAddPresetTag,
@@ -42,6 +50,13 @@ import {
   agentPresetsRemovePresetTag,
 } from "@/client"
 import { AgentApprovalsDialog } from "@/components/agents/agent-approvals-dialog"
+import { AgentWorkflowBadges } from "@/components/agents/agent-workflow-badges"
+import { OverflowTooltipList } from "@/components/agents/overflow-tooltip-list"
+import {
+  useAgentCatalogFilterOptions,
+  useAgentCatalogFilterState,
+} from "@/components/agents/use-agent-catalog-filters"
+import { WorkspaceDefaultAgentBadge } from "@/components/agents/workspace-default-agent-badge"
 import { useScopeCheck } from "@/components/auth/scope-guard"
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { CopyButton } from "@/components/copy-button"
@@ -50,7 +65,17 @@ import {
   getFileTreeItems,
   ROOT_FOLDER_NAME,
 } from "@/components/dashboard/file-tree-command"
-import { getIcon } from "@/components/icons"
+import {
+  FilterMultiSelect,
+  type FilterOption,
+} from "@/components/filters/filter-multi-select"
+import {
+  getIcon,
+  getIconSource,
+  getMcpProviderIconId,
+  getModelProviderIconId,
+  ProviderIcon,
+} from "@/components/icons"
 import { JsonViewWithControls } from "@/components/json-viewer"
 import { CenteredSpinner, Spinner } from "@/components/loading/spinner"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -86,6 +111,7 @@ import {
 } from "@/components/ui/context-menu"
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -128,7 +154,17 @@ import {
   useCreateAgentPreset,
   useDeleteAgentPreset,
   useMoveAgentPreset,
+  useSetDefaultAgent,
+  useUpdateAgentPreset,
 } from "@/hooks/use-agent-presets"
+import { useEntitlements } from "@/hooks/use-entitlements"
+import { useWorkspaceDetails } from "@/hooks/use-workspace"
+import {
+  type AgentCatalogFilters,
+  type AgentWorkflowRef,
+  hasAgentCatalogFilters,
+  matchesAgentCatalogFilters,
+} from "@/lib/agent-catalog-filters"
 import { buildDuplicateAgentPresetPayload } from "@/lib/agent-presets"
 import type { AgentSessionWithStatus, AgentStatusTone } from "@/lib/agents"
 import {
@@ -137,6 +173,8 @@ import {
 } from "@/lib/agents"
 import type { TracecatApiError } from "@/lib/errors"
 import { executionId as splitExecutionId } from "@/lib/event-history"
+import { useListMcpIntegrations } from "@/lib/hooks"
+import { useQueryClient } from "@/lib/query"
 import { cn, reconstructActionType, shortTimeAgo } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
@@ -690,7 +728,6 @@ function AgentSessionCard({
                                   <JsonViewWithControls
                                     src={toolArgsValue}
                                     defaultExpanded={true}
-                                    defaultTab="nested"
                                     showControls={false}
                                     className="text-xs"
                                   />
@@ -708,7 +745,6 @@ function AgentSessionCard({
                                   <JsonViewWithControls
                                     src={decisionValue}
                                     defaultExpanded={true}
-                                    defaultTab="nested"
                                     showControls={false}
                                     className="text-xs"
                                   />
@@ -783,9 +819,8 @@ const DEFAULT_AGENT_SORT: AgentsSortValue = {
 enum AgentActiveDialog {
   FolderCreate,
   FolderRename,
-  FolderDelete,
   PresetMove,
-  PresetDelete,
+  Delete,
 }
 
 const ROW_NAME_COLUMN_CLASS = "min-w-0 w-[340px] shrink-0 truncate text-xs"
@@ -953,34 +988,30 @@ export function AgentFolderCreateDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent size="sm">
         <DialogHeader>
           <DialogTitle>Create folder</DialogTitle>
           <DialogDescription>
             Create a new folder to organize your agents.
           </DialogDescription>
         </DialogHeader>
-        <div className="py-2">
-          <Input
-            placeholder="Folder name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                void handleSubmit()
-              }
-            }}
-          />
-        </div>
+        <DialogBody>
+          <div className="py-2">
+            <Input
+              placeholder="Folder name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  void handleSubmit()
+                }
+              }}
+            />
+          </div>
+        </DialogBody>
         <DialogFooter>
           <Button
-            variant="secondary"
-            onClick={() => onOpenChange(false)}
-            disabled={createFolderIsPending}
-          >
-            Cancel
-          </Button>
-          <Button
+            size="sm"
             onClick={() => void handleSubmit()}
             disabled={createFolderIsPending || !name.trim()}
           >
@@ -1000,7 +1031,7 @@ function AgentFolderRenameDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  folder: AgentFolderDirectoryItem | null
+  folder: AgentFolderDirectoryItem
 }) {
   const workspaceId = useWorkspaceId()
   const { updateFolder, updateFolderIsPending } = useAgentFolders(workspaceId, {
@@ -1009,13 +1040,13 @@ function AgentFolderRenameDialog({
   const [name, setName] = useState("")
 
   useEffect(() => {
-    if (open && folder) {
+    if (open) {
       setName(folder.name)
     }
   }, [open, folder])
 
   const handleSubmit = async () => {
-    if (!folder || !name.trim()) return
+    if (!name.trim()) return
     try {
       await updateFolder({ folderId: folder.id, name: name.trim() })
       onOpenChange(false)
@@ -1031,34 +1062,30 @@ function AgentFolderRenameDialog({
         onOpenChange(isOpen)
       }}
     >
-      <DialogContent>
+      <DialogContent size="sm">
         <DialogHeader>
           <DialogTitle>Rename folder</DialogTitle>
           <DialogDescription>
             Enter a new name for the folder.
           </DialogDescription>
         </DialogHeader>
-        <div className="py-2">
-          <Input
-            placeholder="New folder name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                void handleSubmit()
-              }
-            }}
-          />
-        </div>
+        <DialogBody>
+          <div className="py-2">
+            <Input
+              placeholder="New folder name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  void handleSubmit()
+                }
+              }}
+            />
+          </div>
+        </DialogBody>
         <DialogFooter>
           <Button
-            variant="secondary"
-            onClick={() => onOpenChange(false)}
-            disabled={updateFolderIsPending}
-          >
-            Cancel
-          </Button>
-          <Button
+            size="sm"
             onClick={() => void handleSubmit()}
             disabled={updateFolderIsPending || !name.trim()}
           >
@@ -1075,71 +1102,6 @@ function AgentFolderRenameDialog({
   )
 }
 
-function AgentFolderDeleteDialog({
-  open,
-  onOpenChange,
-  folder,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  folder: AgentFolderDirectoryItem | null
-}) {
-  const workspaceId = useWorkspaceId()
-  const { deleteFolder } = useAgentFolders(workspaceId, { enabled: open })
-  const [confirmName, setConfirmName] = useState("")
-
-  useEffect(() => {
-    if (open) {
-      setConfirmName("")
-    }
-  }, [open])
-
-  return (
-    <AlertDialog
-      open={open}
-      onOpenChange={(isOpen) => {
-        onOpenChange(isOpen)
-      }}
-    >
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Delete folder</AlertDialogTitle>
-          <AlertDialogDescription>
-            Are you sure you want to delete this folder? This action cannot be
-            undone. You cannot delete a folder that contains agents or other
-            folders.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <div className="my-4">
-          <Input
-            placeholder={`Type "${folder?.name}" to confirm`}
-            value={confirmName}
-            onChange={(e) => setConfirmName(e.target.value)}
-          />
-        </div>
-        <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            variant="destructive"
-            disabled={!folder || confirmName !== folder?.name}
-            onClick={async () => {
-              if (folder) {
-                try {
-                  await deleteFolder({ folderId: folder.id })
-                } catch {
-                  // toast handled by hook
-                }
-              }
-            }}
-          >
-            Confirm
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-  )
-}
-
 function AgentPresetMoveDialog({
   open,
   onOpenChange,
@@ -1147,7 +1109,7 @@ function AgentPresetMoveDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  preset: AgentPresetDirectoryItem | AgentPresetReadMinimal | null
+  preset: AgentPresetDirectoryItem
 }) {
   const workspaceId = useWorkspaceId()
   const { moveAgentPreset, moveAgentPresetIsPending } =
@@ -1163,7 +1125,6 @@ function AgentPresetMoveDialog({
   }, [open])
 
   const handleMove = async () => {
-    if (!preset) return
     try {
       await moveAgentPreset({
         presetId: preset.id,
@@ -1185,64 +1146,67 @@ function AgentPresetMoveDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent size="md" className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Move agent</DialogTitle>
           <DialogDescription>
             Choose a folder to move{" "}
-            <span className="font-medium">{preset?.name}</span> to.
+            <span className="font-medium">{preset.name}</span> to.
           </DialogDescription>
         </DialogHeader>
-        <div className="flex w-full items-center py-4">
-          <Popover open={openFolderSelect} onOpenChange={setOpenFolderSelect}>
-            <PopoverTrigger asChild>
-              <Button
-                variant="outline"
-                role="combobox"
-                aria-expanded={openFolderSelect}
-                className="flex w-96 max-w-full min-w-0 justify-between overflow-hidden"
-              >
-                {selectedFolder ? (
-                  <div className="flex min-w-0 flex-1 items-center gap-2">
-                    <FolderIcon className="size-4 shrink-0" />
-                    <span
-                      className="truncate"
-                      title={
-                        selectedFolder === "/"
+        <DialogBody>
+          <div className="flex w-full items-center py-4">
+            <Popover
+              modal
+              open={openFolderSelect}
+              onOpenChange={setOpenFolderSelect}
+            >
+              <PopoverTrigger asChild>
+                <Button
+                  variant="outline"
+                  role="combobox"
+                  aria-expanded={openFolderSelect}
+                  className="flex w-96 max-w-full min-w-0 justify-between overflow-hidden"
+                >
+                  {selectedFolder ? (
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
+                      <FolderIcon className="size-4 shrink-0" />
+                      <span
+                        className="truncate"
+                        title={
+                          selectedFolder === "/"
+                            ? ROOT_FOLDER_NAME
+                            : selectedFolder
+                        }
+                      >
+                        {selectedFolder === "/"
                           ? ROOT_FOLDER_NAME
-                          : selectedFolder
-                      }
-                    >
-                      {selectedFolder === "/"
-                        ? ROOT_FOLDER_NAME
-                        : selectedFolder}
-                    </span>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2">
-                    Select a folder...
-                  </div>
-                )}
-                <ChevronDownIcon className="ml-2 size-4 shrink-0 opacity-50" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-[--radix-popover-trigger-width] overflow-hidden p-0">
-              <FileTreeCommand
-                items={fileTreeItems}
-                onSelect={handleSelectFolder}
-              />
-            </PopoverContent>
-          </Popover>
-        </div>
-        <DialogFooter className="sm:justify-end">
+                          : selectedFolder}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      Select a folder...
+                    </div>
+                  )}
+                  <ChevronDownIcon className="ml-2 size-4 shrink-0 opacity-50" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent
+                className="w-[--radix-popover-trigger-width] overflow-hidden p-0"
+                portal={true}
+              >
+                <FileTreeCommand
+                  items={fileTreeItems}
+                  onSelect={handleSelectFolder}
+                />
+              </PopoverContent>
+            </Popover>
+          </div>
+        </DialogBody>
+        <DialogFooter>
           <Button
-            variant="secondary"
-            onClick={() => onOpenChange(false)}
-            disabled={moveAgentPresetIsPending}
-          >
-            Cancel
-          </Button>
-          <Button
+            size="sm"
             onClick={() => void handleMove()}
             disabled={moveAgentPresetIsPending || !selectedFolder}
           >
@@ -1254,16 +1218,19 @@ function AgentPresetMoveDialog({
   )
 }
 
-function AgentPresetDeleteDialog({
+function AgentItemDeleteDialog({
   open,
   onOpenChange,
-  preset,
+  item,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  preset: AgentPresetDirectoryItem | AgentPresetReadMinimal | null
+  item: AgentDirectoryItem
 }) {
   const workspaceId = useWorkspaceId()
+  const { deleteFolder } = useAgentFolders(workspaceId, {
+    enabled: open && item.type === "folder",
+  })
   const { deleteAgentPreset } = useDeleteAgentPreset(workspaceId)
   const [confirmName, setConfirmName] = useState("")
 
@@ -1273,19 +1240,47 @@ function AgentPresetDeleteDialog({
     }
   }, [open])
 
+  const handleDelete = async () => {
+    try {
+      if (item.type === "folder") {
+        await deleteFolder({ folderId: item.id })
+      } else {
+        await deleteAgentPreset({ presetId: item.id, presetName: item.name })
+      }
+    } catch {
+      // toast handled by hook
+    }
+  }
+
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>Delete agent</AlertDialogTitle>
+          <AlertDialogTitle>
+            {item.type === "folder" ? "Delete folder" : "Delete agent"}
+          </AlertDialogTitle>
           <AlertDialogDescription>
-            Are you sure you want to delete this agent preset? This action
-            cannot be undone.
+            {item.type === "folder" ? (
+              <>
+                Are you sure you want to delete the{" "}
+                <span className="font-medium">{item.name}</span> folder? This
+                action cannot be undone. You cannot delete a folder that
+                contains agents or other folders.
+              </>
+            ) : (
+              <>
+                Are you sure you want to delete the{" "}
+                <span className="font-medium">{item.name}</span> agent? It will
+                also be removed as a subagent from every agent that uses it,
+                including saved versions. Restoring an older agent version will
+                not bring this subagent back. This cannot be undone.
+              </>
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="my-4">
           <Input
-            placeholder={`Type "${preset?.name}" to confirm`}
+            placeholder={`Type "${item.name}" to confirm`}
             value={confirmName}
             onChange={(e) => setConfirmName(e.target.value)}
           />
@@ -1294,19 +1289,8 @@ function AgentPresetDeleteDialog({
           <AlertDialogCancel>Cancel</AlertDialogCancel>
           <AlertDialogAction
             variant="destructive"
-            disabled={!preset || confirmName !== preset?.name}
-            onClick={async () => {
-              if (preset) {
-                try {
-                  await deleteAgentPreset({
-                    presetId: preset.id,
-                    presetName: preset.name,
-                  })
-                } catch {
-                  // toast handled by hook
-                }
-              }
-            }}
+            disabled={confirmName !== item.name}
+            onClick={handleDelete}
           >
             Confirm
           </AlertDialogAction>
@@ -1318,16 +1302,23 @@ function AgentPresetDeleteDialog({
 
 // -- Context menu actions ----------------------------------------------------
 
+type DefaultAgentActions = {
+  presetId: string | null
+  canSet: boolean
+  isPending: boolean
+  onSet: (presetId: string) => void
+}
+
 function AgentFolderContextActions({
   item,
   setActiveDialog,
-  setSelectedFolder,
+  setSelectedItem,
   canUpdateAgent,
   canDeleteAgent,
 }: {
   item: AgentFolderDirectoryItem
   setActiveDialog: (dialog: AgentActiveDialog | null) => void
-  setSelectedFolder: (folder: AgentFolderDirectoryItem | null) => void
+  setSelectedItem: (item: AgentDirectoryItem) => void
   canUpdateAgent: boolean
   canDeleteAgent: boolean
 }) {
@@ -1351,7 +1342,7 @@ function AgentFolderContextActions({
           onClick={(e) => e.stopPropagation()}
           onSelect={(e) => {
             e.stopPropagation()
-            setSelectedFolder(item)
+            setSelectedItem(item)
             setActiveDialog(AgentActiveDialog.FolderRename)
           }}
         >
@@ -1367,8 +1358,8 @@ function AgentFolderContextActions({
             onClick={(e) => e.stopPropagation()}
             onSelect={(e) => {
               e.stopPropagation()
-              setSelectedFolder(item)
-              setActiveDialog(AgentActiveDialog.FolderDelete)
+              setSelectedItem(item)
+              setActiveDialog(AgentActiveDialog.Delete)
             }}
           >
             <Trash2 className="mr-2 size-3.5" />
@@ -1383,7 +1374,7 @@ function AgentFolderContextActions({
 function AgentPresetContextActions({
   item,
   setActiveDialog,
-  setSelectedPreset,
+  setSelectedItem,
   availableTags,
   areTagsLoading = false,
   onDuplicate,
@@ -1391,24 +1382,28 @@ function AgentPresetContextActions({
   canUpdateAgent,
   canDeleteAgent,
   canDuplicateAgent,
+  organizationEnabled = true,
+  defaultAgentActions,
 }: {
-  item: AgentPresetDirectoryItem | AgentPresetReadMinimal
+  item: AgentPresetDirectoryItem
   setActiveDialog: (dialog: AgentActiveDialog | null) => void
-  setSelectedPreset: (
-    preset: AgentPresetDirectoryItem | AgentPresetReadMinimal | null
-  ) => void
+  setSelectedItem: (item: AgentDirectoryItem) => void
   availableTags?: AgentTagRead[]
   areTagsLoading?: boolean
-  onDuplicate?: (
-    item: AgentPresetDirectoryItem | AgentPresetReadMinimal
-  ) => void
+  onDuplicate?: (item: AgentPresetDirectoryItem) => void
   duplicateDisabled?: boolean
   canUpdateAgent: boolean
   canDeleteAgent: boolean
   canDuplicateAgent: boolean
+  /** Whether folder/tag organization (agent add-ons) is available. */
+  organizationEnabled?: boolean
+  defaultAgentActions: DefaultAgentActions
 }) {
   const workspaceId = useWorkspaceId()
   const queryClient = useQueryClient()
+  const canOrganize = canUpdateAgent && organizationEnabled
+  const { updateAgentPreset, updateAgentPresetIsPending } =
+    useUpdateAgentPreset(workspaceId)
   return (
     <ContextMenuGroup>
       <ContextMenuItem
@@ -1425,13 +1420,47 @@ function AgentPresetContextActions({
           Open in new tab
         </Link>
       </ContextMenuItem>
+      {defaultAgentActions.canSet ? (
+        <ContextMenuItem
+          className="text-xs"
+          disabled={
+            defaultAgentActions.isPending ||
+            defaultAgentActions.presetId === item.id
+          }
+          onClick={(e) => e.stopPropagation()}
+          onSelect={(e) => {
+            e.stopPropagation()
+            defaultAgentActions.onSet(item.id)
+          }}
+        >
+          <StarIcon className="mr-2 size-3.5" />
+          Make default
+        </ContextMenuItem>
+      ) : null}
       {canUpdateAgent ? (
+        <ContextMenuCheckboxItem
+          className="text-xs"
+          checked={item.use_in_chat}
+          disabled={updateAgentPresetIsPending}
+          onClick={(e) => e.stopPropagation()}
+          onSelect={(e) => e.stopPropagation()}
+          onCheckedChange={(checked) => {
+            void updateAgentPreset({
+              presetId: item.id,
+              use_in_chat: checked,
+            }).catch(() => {})
+          }}
+        >
+          Use in chat
+        </ContextMenuCheckboxItem>
+      ) : null}
+      {canOrganize ? (
         <ContextMenuItem
           className="text-xs"
           onClick={(e) => e.stopPropagation()}
           onSelect={(e) => {
             e.stopPropagation()
-            setSelectedPreset(item)
+            setSelectedItem(item)
             setActiveDialog(AgentActiveDialog.PresetMove)
           }}
         >
@@ -1439,7 +1468,7 @@ function AgentPresetContextActions({
           Move to folder
         </ContextMenuItem>
       ) : null}
-      {canUpdateAgent ? (
+      {canOrganize ? (
         availableTags && availableTags.length > 0 ? (
           <ContextMenuSub>
             <ContextMenuSubTrigger
@@ -1567,8 +1596,8 @@ function AgentPresetContextActions({
             onClick={(e) => e.stopPropagation()}
             onSelect={(e) => {
               e.stopPropagation()
-              setSelectedPreset(item)
-              setActiveDialog(AgentActiveDialog.PresetDelete)
+              setSelectedItem(item)
+              setActiveDialog(AgentActiveDialog.Delete)
             }}
           >
             <Trash2 className="mr-2 size-3.5" />
@@ -1582,12 +1611,160 @@ function AgentPresetContextActions({
 
 // -- Row components ----------------------------------------------------------
 
+const TOOL_SOURCE_TILE_CAP = 8
+
+function ToolSourceTiles({
+  groups,
+  renderIcon,
+}: {
+  groups: string[][]
+  renderIcon: (name: string) => ReactNode
+}) {
+  return (
+    <>
+      {groups.slice(0, TOOL_SOURCE_TILE_CAP).map((names) => (
+        <Tooltip key={names[0]}>
+          <TooltipTrigger asChild>
+            <span role="img" aria-label={names.join(", ")}>
+              {renderIcon(names[0])}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{names.join(", ")}</TooltipContent>
+        </Tooltip>
+      ))}
+      {groups.length > TOOL_SOURCE_TILE_CAP && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="shrink-0 text-[11px] text-muted-foreground">
+              +{groups.length - TOOL_SOURCE_TILE_CAP}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>
+            <OverflowTooltipList
+              items={groups
+                .slice(TOOL_SOURCE_TILE_CAP)
+                .flat()
+                .map((name) => ({ key: name, label: name }))}
+            />
+          </TooltipContent>
+        </Tooltip>
+      )}
+    </>
+  )
+}
+
+type McpIntegrationsBySlug = Map<string, MCPIntegrationRead>
+
+const NO_MCP_INTEGRATIONS: McpIntegrationsBySlug = new Map()
+
+const NO_WORKFLOWS: AgentWorkflowRef[] = []
+
+function pluralize(count: number, singular: string): string {
+  return `${count} ${count === 1 ? singular : `${singular}s`}`
+}
+
+/**
+ * Label a preset's tool total: registry tools plus the tools of its remote MCP
+ * integrations. Integrations whose tools cannot be counted are listed after
+ * it instead: stdio servers, and remote ones with no known tools (not loaded
+ * or not discovered yet).
+ */
+function getToolCountLabel(
+  toolCount: number,
+  mcpSlugs: string[],
+  mcpBySlug: McpIntegrationsBySlug
+): string {
+  let tools = toolCount
+  let stdio = 0
+  let uncounted = 0
+  for (const slug of mcpSlugs) {
+    const integration = mcpBySlug.get(slug)
+    if (integration?.server_type === "stdio") {
+      stdio += 1
+      continue
+    }
+    const count =
+      integration?.tools?.filter(
+        (tool) => tool.enabled !== false && tool.status !== "missing"
+      ).length ?? 0
+    if (count > 0) tools += count
+    else uncounted += 1
+  }
+  const parts: string[] = []
+  if (tools > 0) parts.push(pluralize(tools, "tool"))
+  if (uncounted > 0) parts.push(`${uncounted} MCP`)
+  if (stdio > 0) parts.push(`${stdio} stdio MCP`)
+  return parts.join(" + ")
+}
+
+const AgentToolSources = memo(function AgentToolSources({
+  summary,
+  mcpBySlug,
+}: {
+  summary: AgentPresetDirectoryItem["tool_summary"]
+  mcpBySlug: McpIntegrationsBySlug
+}) {
+  const {
+    tool_count: toolCount = 0,
+    namespaces: toolNamespaces = [],
+    mcp_slugs: mcpSlugs = [],
+  } = summary ?? {}
+  if (toolCount === 0 && mcpSlugs.length === 0) {
+    return null
+  }
+
+  const sources = new Map<object | string, string[]>()
+  for (const namespace of toolNamespaces) {
+    const source = getIconSource(namespace)
+    const names = sources.get(source) ?? []
+    names.push(namespace)
+    sources.set(source, names)
+  }
+  const namespaces = [...sources.values()]
+
+  return (
+    <div
+      data-testid="tool-sources"
+      className="flex min-w-0 items-center gap-1 overflow-hidden"
+    >
+      <ToolSourceTiles
+        groups={namespaces}
+        renderIcon={(namespace) =>
+          getIcon(namespace, { className: "size-5 rounded border" })
+        }
+      />
+      {mcpSlugs.length > 0 ? (
+        <>
+          {namespaces.length > 0 ? (
+            <span
+              role="separator"
+              aria-orientation="vertical"
+              className="mx-1 h-3.5 w-px bg-border"
+            />
+          ) : null}
+          <ToolSourceTiles
+            groups={mcpSlugs.map((slug) => [slug])}
+            renderIcon={(slug) => (
+              <ProviderIcon
+                providerId={getMcpProviderIconId(slug)}
+                className="size-5 rounded border"
+              />
+            )}
+          />
+        </>
+      ) : null}
+      <span className="ml-1.5 whitespace-nowrap text-[11px] text-muted-foreground">
+        {getToolCountLabel(toolCount, mcpSlugs, mcpBySlug)}
+      </span>
+    </div>
+  )
+})
+
 function AgentCatalogRow({
   item,
   onOpenPreset,
   onOpenFolder,
-  setSelectedPreset,
-  setSelectedFolder,
+  setSelectedItem,
   setActiveDialog,
   availableTags,
   areTagsLoading,
@@ -1596,24 +1773,27 @@ function AgentCatalogRow({
   canUpdateAgent,
   canDeleteAgent,
   canDuplicateAgent,
+  organizationEnabled = true,
+  defaultAgentActions,
+  mcpBySlug,
+  workflows,
 }: {
   item: AgentDirectoryItem
+  mcpBySlug: McpIntegrationsBySlug
+  workflows: AgentWorkflowRef[]
   onOpenPreset: (presetId: string) => void
   onOpenFolder: (path: string) => void
-  setSelectedPreset: (
-    preset: AgentPresetDirectoryItem | AgentPresetReadMinimal | null
-  ) => void
-  setSelectedFolder: (folder: AgentFolderDirectoryItem | null) => void
+  setSelectedItem: (item: AgentDirectoryItem) => void
   setActiveDialog: (dialog: AgentActiveDialog | null) => void
   availableTags?: AgentTagRead[]
   areTagsLoading?: boolean
-  onDuplicate?: (
-    item: AgentPresetDirectoryItem | AgentPresetReadMinimal
-  ) => void
+  onDuplicate?: (item: AgentPresetDirectoryItem) => void
   duplicateDisabled?: boolean
   canUpdateAgent: boolean
   canDeleteAgent: boolean
   canDuplicateAgent: boolean
+  organizationEnabled?: boolean
+  defaultAgentActions: DefaultAgentActions
 }) {
   const [isContextMenuOpen, setIsContextMenuOpen] = useState(false)
 
@@ -1637,12 +1817,19 @@ function AgentCatalogRow({
               <FolderIcon className="size-4 shrink-0 text-foreground" />
               <div className="flex min-w-0 flex-1 items-center gap-3">
                 <span className={ROW_NAME_COLUMN_CLASS}>{item.name}</span>
-                <div className="flex shrink-0 items-center gap-1">
+                <div className="ml-auto flex shrink-0 items-center gap-1">
+                  <Badge
+                    variant="secondary"
+                    className="h-5 px-2 text-[10px] font-normal"
+                  >
+                    <BoxIcon className="mr-1 size-3" />
+                    {item.num_items} {itemCountLabel}
+                  </Badge>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Badge
                         variant="secondary"
-                        className="h-5 cursor-default px-2 text-[10px] font-normal"
+                        className="h-5 shrink-0 cursor-default px-2 text-[10px] font-normal"
                       >
                         <Clock3 className="mr-1 size-3" />
                         {getAgentRelativeDateLabel(item.updated_at)}
@@ -1652,13 +1839,6 @@ function AgentCatalogRow({
                       {format(new Date(item.updated_at), "PPpp")}
                     </TooltipContent>
                   </Tooltip>
-                  <Badge
-                    variant="secondary"
-                    className="h-5 px-2 text-[10px] font-normal"
-                  >
-                    <BoxIcon className="mr-1 size-3" />
-                    {item.num_items} {itemCountLabel}
-                  </Badge>
                 </div>
               </div>
             </button>
@@ -1668,7 +1848,7 @@ function AgentCatalogRow({
           <AgentFolderContextActions
             item={item}
             setActiveDialog={setActiveDialog}
-            setSelectedFolder={setSelectedFolder}
+            setSelectedItem={setSelectedItem}
             canUpdateAgent={canUpdateAgent}
             canDeleteAgent={canDeleteAgent}
           />
@@ -1695,25 +1875,44 @@ function AgentCatalogRow({
             <MousePointerClickIcon className="size-4 shrink-0 text-primary" />
             <div className="flex min-w-0 flex-1 items-center gap-3">
               <span className={ROW_NAME_COLUMN_CLASS}>{item.name}</span>
-              <div className="flex min-w-0 flex-1 items-center justify-start gap-2 overflow-hidden">
+              <AgentToolSources
+                summary={item.tool_summary}
+                mcpBySlug={mcpBySlug}
+              />
+              <div className="ml-auto flex shrink-0 items-center gap-2">
+                <AgentWorkflowBadges workflows={workflows} />
                 <div className="flex shrink-0 items-center gap-1">
-                  <Badge
-                    variant="secondary"
-                    className="h-5 px-2 text-[10px] font-normal"
-                  >
-                    {item.model_provider}
-                  </Badge>
-                  <Badge
-                    variant="secondary"
-                    className="h-5 px-2 text-[10px] font-normal"
-                  >
-                    {item.model_name}
-                  </Badge>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Badge
                         variant="secondary"
-                        className="h-5 cursor-default px-2 text-[10px] font-normal"
+                        className="h-5 shrink-0 gap-1 px-2 text-[10px] font-normal"
+                      >
+                        <ProviderIcon
+                          providerId={getModelProviderIconId(
+                            item.model_provider
+                          )}
+                          className="size-3 rounded-none bg-transparent p-0 [&>svg]:size-full [&>svg]:rounded-none [&>svg]:bg-transparent"
+                        />
+                        {item.model_name}
+                      </Badge>
+                    </TooltipTrigger>
+                    <TooltipContent>{item.model_provider}</TooltipContent>
+                  </Tooltip>
+                  {defaultAgentActions.presetId === item.id ? (
+                    <Badge
+                      variant="outline"
+                      className="h-5 gap-1 px-2 text-[10px] font-normal"
+                    >
+                      <StarIcon className="size-3" />
+                      Default
+                    </Badge>
+                  ) : null}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Badge
+                        variant="secondary"
+                        className="h-5 shrink-0 cursor-default px-2 text-[10px] font-normal"
                       >
                         <Clock3 className="mr-1 size-3" />
                         {getAgentRelativeDateLabel(item.updated_at)}
@@ -1724,7 +1923,9 @@ function AgentCatalogRow({
                     </TooltipContent>
                   </Tooltip>
                 </div>
-                <AgentPresetTagPills tags={item.tags} />
+                {organizationEnabled ? (
+                  <AgentPresetTagPills tags={item.tags} />
+                ) : null}
               </div>
             </div>
           </button>
@@ -1734,7 +1935,7 @@ function AgentCatalogRow({
         <AgentPresetContextActions
           item={item}
           setActiveDialog={setActiveDialog}
-          setSelectedPreset={setSelectedPreset}
+          setSelectedItem={setSelectedItem}
           availableTags={availableTags}
           areTagsLoading={areTagsLoading}
           onDuplicate={onDuplicate}
@@ -1742,6 +1943,8 @@ function AgentCatalogRow({
           canUpdateAgent={canUpdateAgent}
           canDeleteAgent={canDeleteAgent}
           canDuplicateAgent={canDuplicateAgent}
+          organizationEnabled={organizationEnabled}
+          defaultAgentActions={defaultAgentActions}
         />
       </ContextMenuContent>
     </ContextMenu>
@@ -1774,7 +1977,22 @@ function AgentsCatalogHeader({
   view,
   onViewChange,
   totalCount,
+  viewSwitchEnabled = true,
+  defaultAgentId,
+  filters,
+  onFiltersChange,
+  mcpOptions,
+  mcpEmptyMessage,
+  workflowOptions,
+  workflowEmptyMessage,
 }: {
+  filters: AgentCatalogFilters
+  onFiltersChange: (filters: AgentCatalogFilters) => void
+  mcpOptions: FilterOption[]
+  mcpEmptyMessage: string
+  /** Null hides the filter, e.g. without workflow read access. */
+  workflowOptions: FilterOption[] | null
+  workflowEmptyMessage: string
   searchQuery: string
   onSearchChange: (query: string) => void
   sortBy: AgentsSortValue
@@ -1782,6 +2000,8 @@ function AgentsCatalogHeader({
   view: AgentsViewMode
   onViewChange: (view: AgentsViewMode) => void
   totalCount: number
+  viewSwitchEnabled?: boolean
+  defaultAgentId?: string | null
 }) {
   const selectedSortLabel =
     SORT_FIELD_OPTIONS.find((o) => o.value === sortBy.field)?.label ?? "Updated"
@@ -1815,22 +2035,24 @@ function AgentsCatalogHeader({
       </header>
 
       <div className="flex flex-wrap items-center gap-2 px-4 py-2">
-        <Select
-          value={view}
-          onValueChange={(v) => onViewChange(v as AgentsViewMode)}
-        >
-          <SelectTrigger className="h-6 w-[138px] rounded-md px-2 text-xs font-medium">
-            <div className="flex items-center gap-1.5">
-              {VIEW_ICON[view]}
-              <span>View</span>
-            </div>
-            <SelectValue placeholder={VIEW_LABEL[view]} />
-          </SelectTrigger>
-          <SelectContent align="start">
-            <SelectItem value="list">List</SelectItem>
-            <SelectItem value="folders">Folders</SelectItem>
-          </SelectContent>
-        </Select>
+        {viewSwitchEnabled ? (
+          <Select
+            value={view}
+            onValueChange={(v) => onViewChange(v as AgentsViewMode)}
+          >
+            <SelectTrigger className="h-6 w-[138px] rounded-md px-2 text-xs font-medium">
+              <div className="flex items-center gap-1.5">
+                {VIEW_ICON[view]}
+                <span>View</span>
+              </div>
+              <SelectValue placeholder={VIEW_LABEL[view]} />
+            </SelectTrigger>
+            <SelectContent align="start">
+              <SelectItem value="list">List</SelectItem>
+              <SelectItem value="folders">Folders</SelectItem>
+            </SelectContent>
+          </Select>
+        ) : null}
 
         <div className="inline-flex items-center rounded-md border border-input bg-transparent">
           <Select
@@ -1880,6 +2102,38 @@ function AgentsCatalogHeader({
             )}
           </button>
         </div>
+        <FilterMultiSelect
+          placeholder="MCP servers"
+          icon={Sparkles}
+          value={filters.mcpSlugs}
+          options={mcpOptions}
+          onChange={(mcpSlugs) => onFiltersChange({ ...filters, mcpSlugs })}
+          mode="include"
+          onModeChange={() => {}}
+          allowExclude={false}
+          emptyMessage={mcpEmptyMessage}
+        />
+        {workflowOptions ? (
+          <FilterMultiSelect
+            placeholder="Workflows"
+            icon={WorkflowIcon}
+            value={filters.workflowIds}
+            options={workflowOptions}
+            onChange={(workflowIds) =>
+              onFiltersChange({ ...filters, workflowIds })
+            }
+            mode="include"
+            onModeChange={() => {}}
+            allowExclude={false}
+            emptyMessage={workflowEmptyMessage}
+          />
+        ) : null}
+        {defaultAgentId ? (
+          <WorkspaceDefaultAgentBadge
+            presetId={defaultAgentId}
+            organizationEnabled={viewSwitchEnabled}
+          />
+        ) : null}
       </div>
     </div>
   )
@@ -1893,12 +2147,28 @@ export function AgentsDashboard() {
   const queryClient = useQueryClient()
   const workspaceId = useWorkspaceId()
   const searchParams = useSearchParams()
+  const { workspace } = useWorkspaceDetails()
+  const { setDefaultAgent, isSettingDefaultAgent } =
+    useSetDefaultAgent(workspaceId)
+  const defaultAgentId = workspace?.default_agent_preset_id ?? null
+  const defaultAgentActions: DefaultAgentActions = {
+    presetId: defaultAgentId,
+    canSet: useScopeCheck("workspace:update") === true,
+    isPending: isSettingDefaultAgent,
+    onSet: setDefaultAgent,
+  }
   const canCreateAgent = useScopeCheck("agent:create") === true
   const canUpdateAgent = useScopeCheck("agent:update") === true
   const canDeleteAgent = useScopeCheck("agent:delete") === true
   const canDuplicateAgent = canCreateAgent && canUpdateAgent
+  const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
+  // Folders and tags are agent add-ons; without them the catalog is a flat
+  // list and no folder/tag endpoint is called, whatever the URL says.
+  const organizationEnabled = hasEntitlement("agent_addons")
 
-  const view = parseAgentsViewMode(searchParams?.get("view"))
+  const view: AgentsViewMode = organizationEnabled
+    ? parseAgentsViewMode(searchParams?.get("view"))
+    : "list"
   const currentPath = normalizeAgentFolderPath(searchParams?.get("path"))
 
   const [searchQuery, setSearchQuery] = useState("")
@@ -1907,27 +2177,108 @@ export function AgentsDashboard() {
   const [activeDialog, setActiveDialog] = useState<AgentActiveDialog | null>(
     null
   )
-  const [selectedFolder, setSelectedFolder] =
-    useState<AgentFolderDirectoryItem | null>(null)
-  const [selectedPreset, setSelectedPreset] = useState<
-    AgentPresetDirectoryItem | AgentPresetReadMinimal | null
-  >(null)
+  const [selectedItem, setSelectedItem] = useState<AgentDirectoryItem | null>(
+    null
+  )
 
-  // Data hooks
+  const baseRoute = `/workspaces/${workspaceId}/agents`
+
+  const buildRoute = useCallback(
+    (params: URLSearchParams): string => {
+      const query = params.toString()
+      return query ? `${baseRoute}?${query}` : baseRoute
+    },
+    [baseRoute]
+  )
+
+  const replaceParams = useCallback(
+    (params: URLSearchParams) => router.replace(buildRoute(params)),
+    [buildRoute, router]
+  )
+  const { filters, setFilters, canReadWorkflows } = useAgentCatalogFilterState({
+    searchParams,
+    replaceParams,
+  })
+  // A folder only lists its own children, so an active filter searches the
+  // flat catalog to reach agents in nested folders.
+  const flatCatalog = view === "list" || hasAgentCatalogFilters(filters)
+
+  // Data hooks. The flat list also feeds the MCP filter options in the
+  // folder view, so agents in nested folders stay selectable.
   const { presets, presetsIsLoading, presetsError } = useAgentPresets(
     workspaceId,
-    { enabled: view === "list" }
+    { enabled: !entitlementsLoading }
   )
   const { directoryItems, directoryItemsIsLoading, directoryItemsError } =
     useAgentDirectoryItems(currentPath, workspaceId, {
-      enabled: view === "folders",
+      enabled: organizationEnabled && !flatCatalog,
     })
-  const { agentTags, agentTagsIsLoading } = useAgentTagCatalog(workspaceId)
+
+  // The preset summary names MCP integrations only by slug. Use the unfiltered
+  // workspace-wide list so filtering never drops an option, plus the current
+  // folder while that list loads.
+  const usedMcpSlugs = useMemo(() => {
+    const summaries = [
+      ...(presets ?? []).map((preset) => preset.tool_summary),
+      ...(directoryItems ?? []).flatMap((item) =>
+        item.type === "preset" ? [item.tool_summary] : []
+      ),
+    ]
+    return [
+      ...new Set(summaries.flatMap((summary) => summary?.mcp_slugs ?? [])),
+    ]
+  }, [directoryItems, presets])
+  // The list endpoint needs `integration:read`; without it the request 403s
+  // and the slugs stay uncounted.
+  const canReadIntegrations = useScopeCheck("integration:read") === true
+  const mcpQuery = useListMcpIntegrations(workspaceId, undefined, {
+    enabled: canReadIntegrations,
+  })
+  // A skipped query still returns data cached before the scope was lost.
+  const mcpIntegrations = canReadIntegrations
+    ? mcpQuery.mcpIntegrations
+    : undefined
+  let mcpEmptyMessage = "No MCP servers found."
+  if (canReadIntegrations && mcpQuery.mcpIntegrationsIsLoading) {
+    mcpEmptyMessage = "Loading MCP servers..."
+  } else if (canReadIntegrations && mcpQuery.mcpIntegrationsError) {
+    mcpEmptyMessage = "Failed to load MCP servers."
+  }
+  const mcpBySlug = useMemo(
+    () =>
+      mcpIntegrations
+        ? new Map(
+            mcpIntegrations.map((integration) => [
+              integration.slug,
+              integration,
+            ])
+          )
+        : NO_MCP_INTEGRATIONS,
+    [mcpIntegrations]
+  )
+  const {
+    workflowsByPreset,
+    mcpOptions,
+    workflowOptions,
+    workflowEmptyMessage,
+    workflowFilterIsLoading,
+    workflowFilterError,
+  } = useAgentCatalogFilterOptions({
+    workspaceId,
+    filters,
+    canReadWorkflows,
+    mcpBySlug,
+    usedMcpSlugs,
+  })
+
+  const { agentTags, agentTagsIsLoading } = useAgentTagCatalog(workspaceId, {
+    enabled: organizationEnabled,
+  })
   const { createAgentPreset, createAgentPresetIsPending } =
     useCreateAgentPreset(workspaceId)
   const { moveAgentPreset } = useMoveAgentPreset(workspaceId)
   const { folders, foldersIsLoading } = useAgentFolders(workspaceId, {
-    enabled: view === "list",
+    enabled: organizationEnabled && flatCatalog,
   })
   const folderPathById = useMemo(
     () => new Map((folders ?? []).map((folder) => [folder.id, folder.path])),
@@ -1935,7 +2286,7 @@ export function AgentsDashboard() {
   )
 
   const handleDuplicatePreset = useCallback(
-    async (item: AgentPresetDirectoryItem | AgentPresetReadMinimal) => {
+    async (item: AgentPresetDirectoryItem) => {
       try {
         const [fullPreset, allPresets] = await Promise.all([
           queryClient.fetchQuery({
@@ -1963,24 +2314,26 @@ export function AgentsDashboard() {
           existingSlugs
         )
         const created = await createAgentPreset(payload)
-        const targetFolderPath =
-          view === "folders"
-            ? currentPath
-            : item.folder_id
-              ? folderPathById.get(item.folder_id)
-              : "/"
+        if (organizationEnabled) {
+          let targetFolderPath: string | undefined = "/"
+          if (!flatCatalog) {
+            targetFolderPath = currentPath
+          } else if (item.folder_id) {
+            targetFolderPath = folderPathById.get(item.folder_id)
+          }
 
-        if (targetFolderPath === undefined) {
-          throw new Error("Source agent folder is not loaded yet")
-        }
+          if (targetFolderPath === undefined) {
+            throw new Error("Source agent folder is not loaded yet")
+          }
 
-        try {
-          await moveAgentPreset({
-            presetId: created.id,
-            folder_path: targetFolderPath,
-          })
-        } catch {
-          // Move hook already toasts; continue to open the duplicated preset.
+          try {
+            await moveAgentPreset({
+              presetId: created.id,
+              folder_path: targetFolderPath,
+            })
+          } catch {
+            // Move hook already toasts; continue to open the duplicated preset.
+          }
         }
         router.push(`/workspaces/${workspaceId}/agents/${created.id}`)
       } catch (error) {
@@ -1995,24 +2348,15 @@ export function AgentsDashboard() {
     [
       createAgentPreset,
       currentPath,
+      flatCatalog,
       folderPathById,
       moveAgentPreset,
+      organizationEnabled,
       presets,
       queryClient,
       router,
-      view,
       workspaceId,
     ]
-  )
-
-  const baseRoute = `/workspaces/${workspaceId}/agents`
-
-  const buildRoute = useCallback(
-    (params: URLSearchParams): string => {
-      const query = params.toString()
-      return query ? `${baseRoute}?${query}` : baseRoute
-    },
-    [baseRoute]
   )
 
   const handleViewChange = useCallback(
@@ -2064,11 +2408,18 @@ export function AgentsDashboard() {
     [normalizedSearch]
   )
 
+  const matchesQuery = useCallback(
+    (item: AgentDirectoryItem): boolean =>
+      matchesSearch(item) &&
+      matchesAgentCatalogFilters(item, filters, workflowsByPreset),
+    [filters, matchesSearch, workflowsByPreset]
+  )
+
   // Folder view items
   const sortedDirectoryItems = useMemo(() => {
-    const filtered = (directoryItems ?? []).filter(matchesSearch)
+    const filtered = (directoryItems ?? []).filter(matchesQuery)
     return [...filtered].sort((a, b) => compareAgentItemsBySort(a, b, sortBy))
-  }, [directoryItems, matchesSearch, sortBy])
+  }, [directoryItems, matchesQuery, sortBy])
 
   // List view items — convert presets to directory items
   const sortedListItems = useMemo(() => {
@@ -2079,23 +2430,27 @@ export function AgentsDashboard() {
         name: preset.name,
         slug: preset.slug,
         description: preset.description,
+        use_in_chat: preset.use_in_chat,
         model_provider: preset.model_provider,
         model_name: preset.model_name,
+        tool_summary: preset.tool_summary,
         folder_id: preset.folder_id ?? null,
         tags: preset.tags ?? [],
         created_at: preset.created_at,
         updated_at: preset.updated_at,
       })
     )
-    const filtered = items.filter(matchesSearch)
+    const filtered = items.filter(matchesQuery)
     return [...filtered].sort((a, b) => compareAgentItemsBySort(a, b, sortBy))
-  }, [presets, matchesSearch, sortBy])
+  }, [presets, matchesQuery, sortBy])
 
-  const visibleItems =
-    view === "folders" ? sortedDirectoryItems : sortedListItems
+  const visibleItems = flatCatalog ? sortedListItems : sortedDirectoryItems
   const isLoading =
-    view === "folders" ? directoryItemsIsLoading : presetsIsLoading
-  const error = view === "folders" ? directoryItemsError : presetsError
+    entitlementsLoading ||
+    workflowFilterIsLoading ||
+    (flatCatalog ? presetsIsLoading : directoryItemsIsLoading)
+  const error =
+    (flatCatalog ? presetsError : directoryItemsError) ?? workflowFilterError
 
   return (
     <TooltipProvider>
@@ -2108,6 +2463,14 @@ export function AgentsDashboard() {
           view={view}
           onViewChange={handleViewChange}
           totalCount={visibleItems.length}
+          viewSwitchEnabled={organizationEnabled}
+          defaultAgentId={defaultAgentId}
+          filters={filters}
+          onFiltersChange={setFilters}
+          mcpOptions={mcpOptions}
+          mcpEmptyMessage={mcpEmptyMessage}
+          workflowOptions={workflowOptions}
+          workflowEmptyMessage={workflowEmptyMessage}
         />
 
         <div className="min-h-0 flex-1 overflow-auto">
@@ -2138,10 +2501,11 @@ export function AgentsDashboard() {
                 <AgentCatalogRow
                   key={`${item.type}-${item.id}`}
                   item={item}
+                  mcpBySlug={mcpBySlug}
+                  workflows={workflowsByPreset.get(item.id) ?? NO_WORKFLOWS}
                   onOpenPreset={handleOpenPreset}
                   onOpenFolder={handleOpenFolder}
-                  setSelectedPreset={setSelectedPreset}
-                  setSelectedFolder={setSelectedFolder}
+                  setSelectedItem={setSelectedItem}
                   setActiveDialog={setActiveDialog}
                   availableTags={agentTags}
                   areTagsLoading={agentTagsIsLoading}
@@ -2149,10 +2513,13 @@ export function AgentsDashboard() {
                   canUpdateAgent={canUpdateAgent}
                   canDeleteAgent={canDeleteAgent}
                   canDuplicateAgent={canDuplicateAgent}
+                  organizationEnabled={organizationEnabled}
+                  defaultAgentActions={defaultAgentActions}
                   duplicateDisabled={
                     createAgentPresetIsPending ||
-                    (item.type === "preset" &&
-                      view === "list" &&
+                    (organizationEnabled &&
+                      item.type === "preset" &&
+                      flatCatalog &&
                       item.folder_id != null &&
                       (foldersIsLoading || !folderPathById.has(item.folder_id)))
                   }
@@ -2163,54 +2530,47 @@ export function AgentsDashboard() {
         </div>
       </div>
 
-      {/* Dialogs */}
-      <AgentFolderCreateDialog
-        open={activeDialog === AgentActiveDialog.FolderCreate}
-        onOpenChange={(isOpen) => {
-          if (!isOpen) setActiveDialog(null)
-        }}
-        currentPath={currentPath}
-      />
-      <AgentFolderRenameDialog
-        open={activeDialog === AgentActiveDialog.FolderRename}
-        onOpenChange={(isOpen) => {
-          if (!isOpen) {
-            setActiveDialog(null)
-            setSelectedFolder(null)
-          }
-        }}
-        folder={selectedFolder}
-      />
-      <AgentFolderDeleteDialog
-        open={activeDialog === AgentActiveDialog.FolderDelete}
-        onOpenChange={(isOpen) => {
-          if (!isOpen) {
-            setActiveDialog(null)
-            setSelectedFolder(null)
-          }
-        }}
-        folder={selectedFolder}
-      />
-      <AgentPresetMoveDialog
-        open={activeDialog === AgentActiveDialog.PresetMove}
-        onOpenChange={(isOpen) => {
-          if (!isOpen) {
-            setActiveDialog(null)
-            setSelectedPreset(null)
-          }
-        }}
-        preset={selectedPreset}
-      />
-      <AgentPresetDeleteDialog
-        open={activeDialog === AgentActiveDialog.PresetDelete}
-        onOpenChange={(isOpen) => {
-          if (!isOpen) {
-            setActiveDialog(null)
-            setSelectedPreset(null)
-          }
-        }}
-        preset={selectedPreset}
-      />
+      {/* Dialogs. Closing only clears the active dialog; the selection is
+          kept so the dialog stays mounted through its exit animation and is
+          always replaced before the next open. */}
+      {organizationEnabled ? (
+        <>
+          <AgentFolderCreateDialog
+            open={activeDialog === AgentActiveDialog.FolderCreate}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) setActiveDialog(null)
+            }}
+            currentPath={currentPath}
+          />
+          {selectedItem?.type === "folder" ? (
+            <AgentFolderRenameDialog
+              open={activeDialog === AgentActiveDialog.FolderRename}
+              onOpenChange={(isOpen) => {
+                if (!isOpen) setActiveDialog(null)
+              }}
+              folder={selectedItem}
+            />
+          ) : null}
+          {selectedItem?.type === "preset" ? (
+            <AgentPresetMoveDialog
+              open={activeDialog === AgentActiveDialog.PresetMove}
+              onOpenChange={(isOpen) => {
+                if (!isOpen) setActiveDialog(null)
+              }}
+              preset={selectedItem}
+            />
+          ) : null}
+        </>
+      ) : null}
+      {selectedItem ? (
+        <AgentItemDeleteDialog
+          open={activeDialog === AgentActiveDialog.Delete}
+          onOpenChange={(isOpen) => {
+            if (!isOpen) setActiveDialog(null)
+          }}
+          item={selectedItem}
+        />
+      ) : null}
     </TooltipProvider>
   )
 }

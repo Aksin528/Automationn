@@ -5,6 +5,7 @@ between the jailed agent runtime and trusted services:
 
 1. MCP Token: For tool execution via the trusted MCP server
 2. LLM Token: For LLM API calls via the LLM gateway
+3. Agent OTel Token: For sandbox bridge calls to the host OTel relay
 
 These tokens are separate to provide isolation - a compromised MCP execution
 path (which runs user code) cannot make arbitrary LLM calls, and vice versa.
@@ -20,9 +21,10 @@ from typing import Any, Literal
 
 import jwt
 from jwt import PyJWTError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from tracecat import config
+from tracecat.agent.mcp.utils import canonical_mcp_tool_name
 from tracecat.auth.secrets import get_service_key
 from tracecat.identifiers import OrganizationID, UserID, WorkspaceID
 from tracecat.registry.lock.types import RegistryLock
@@ -114,6 +116,15 @@ class MCPTokenClaims(BaseModel):
     """Organization UUID for authorization context."""
     allowed_actions: list[str]
     """Set of allowed action names (e.g., {"tools.slack.post_message", "core.http_request"})."""
+    deferred_actions: list[str] = Field(default_factory=list)
+    """Registry, user MCP, or internal tools this token lists but never executes.
+
+    The holder can see and propose these tools, but the trusted server refuses
+    to run them. The minting service executes approved calls itself with a
+    separate token, so approval is enforced even if the holder is compromised.
+    Names are stored in canonical form so every spelling of a tool is refused.
+    The ambiguous dotted user MCP spelling (``mcp.{server}.{tool}``) is rejected.
+    """
     user_mcp_servers: list[UserMCPServerClaim] = Field(default_factory=list)
     """User-defined MCP server configurations for proxying tool calls."""
     allowed_internal_tools: list[str] = Field(default_factory=list)
@@ -129,6 +140,13 @@ class MCPTokenClaims(BaseModel):
     New tokens should always include this claim.
     """
 
+    @field_validator("deferred_actions")
+    @classmethod
+    def _canonicalize_deferred_actions(cls, names: list[str]) -> list[str]:
+        # Execution checks a call under its canonical name, so a deferred name
+        # in any other spelling would never match and the deny would not hold.
+        return list(dict.fromkeys(canonical_mcp_tool_name(name) for name in names))
+
 
 def mint_mcp_token(
     *,
@@ -137,6 +155,7 @@ def mint_mcp_token(
     allowed_actions: list[str],
     session_id: uuid.UUID,
     registry_lock: RegistryLock,
+    deferred_actions: list[str] | None = None,
     user_id: UserID | None = None,
     parent_agent_workflow_id: str | None = None,
     parent_agent_run_id: str | None = None,
@@ -159,18 +178,33 @@ def mint_mcp_token(
         organization_id: Organization UUID for authorization context
         allowed_actions: Set of allowed action names
         session_id: Agent session ID for traceability
-        registry_lock: Registry lock resolved for this token's registry actions
+        registry_lock: Registry lock resolved for this token's registry
+            and deferred actions
+        deferred_actions: Action names listed for discovery but never
+            executable with this token, such as approval-gated tools
         user_id: Optional user ID for audit/traceability
         user_mcp_servers: User-defined MCP server configs for proxying
         allowed_internal_tools: Set of allowed internal tool names
         internal_tool_context: Context for internal tools (preset_id, entity_type)
-        ttl_seconds: Token TTL in seconds (defaults to executor token TTL)
+        ttl_seconds: Token TTL in seconds (defaults to the agent sandbox timeout
+            plus a small buffer so the token outlives one full turn)
 
     Returns:
         Signed JWT string
+
+    Raises:
+        ValueError: If a tool is both deferred and allowed (as an action or
+            internal tool), in any spelling of its name, or a deferred name
+            uses the ambiguous dotted user MCP spelling
     """
+    deferred_actions = deferred_actions or []
+    # Execution authorizes a call only when its canonical name is allowed
+    # verbatim, so compare the raw allowed names with canonical deferred ones.
+    executable = {*allowed_actions, *(allowed_internal_tools or [])}
+    if executable & {canonical_mcp_tool_name(name) for name in deferred_actions}:
+        raise ValueError("An MCP tool cannot be both allowed and deferred")
     now = datetime.now(UTC)
-    ttl = ttl_seconds or config.TRACECAT__EXECUTOR_TOKEN_TTL_SECONDS
+    ttl = ttl_seconds or config.TRACECAT__AGENT_SANDBOX_TIMEOUT + 60
 
     payload: dict[str, Any] = {
         "iss": MCP_TOKEN_ISSUER,
@@ -190,6 +224,7 @@ def mint_mcp_token(
             parent_agent_workflow_id=parent_agent_workflow_id,
             parent_agent_run_id=parent_agent_run_id,
             allowed_actions=allowed_actions,
+            deferred_actions=deferred_actions,
             user_mcp_servers=user_mcp_servers or [],
             allowed_internal_tools=allowed_internal_tools or [],
             internal_tool_context=internal_tool_context,
@@ -355,13 +390,14 @@ def mint_llm_token(
         model_settings: Model-specific settings (temperature, max_tokens,
             reasoning_effort, etc.) passed through to LLM provider
         use_workspace_credentials: Legacy credential scope for no-catalog tokens
-        ttl_seconds: Token TTL in seconds (defaults to executor token TTL)
+        ttl_seconds: Token TTL in seconds (defaults to the agent sandbox timeout
+            plus a small buffer so the token outlives one full turn)
 
     Returns:
         Signed JWT string
     """
     now = datetime.now(UTC)
-    ttl = ttl_seconds or config.TRACECAT__EXECUTOR_TOKEN_TTL_SECONDS
+    ttl = ttl_seconds or config.TRACECAT__AGENT_SANDBOX_TIMEOUT + 60
 
     payload: dict[str, Any] = {
         # Standard JWT claims
@@ -424,3 +460,105 @@ def verify_llm_token(token: str) -> LLMTokenClaims:
         return LLMTokenClaims.model_validate(payload)
     except ValidationError as exc:
         raise ValueError("Invalid LLM token claims") from exc
+
+
+# -----------------------------------------------------------------------------
+# Agent OTel Token (for sandbox bridge to host relay)
+# -----------------------------------------------------------------------------
+
+AGENT_OTEL_TOKEN_ISSUER = "tracecat-agent-executor"
+AGENT_OTEL_TOKEN_AUDIENCE = "tracecat-agent-otel-relay"
+AGENT_OTEL_TOKEN_SUBJECT = "tracecat-agent-runtime"
+AGENT_OTEL_REQUIRED_CLAIMS = (
+    "iss",
+    "aud",
+    "sub",
+    "iat",
+    "exp",
+    "workspace_id",
+    "organization_id",
+    "session_id",
+)
+
+
+class AgentOtelTokenClaims(BaseModel):
+    """Claims extracted from a verified Agent OTel relay token."""
+
+    workspace_id: WorkspaceID = Field(..., description="Workspace UUID")
+    organization_id: OrganizationID = Field(..., description="Organization UUID")
+    session_id: uuid.UUID = Field(..., description="Agent session UUID")
+
+
+def mint_agent_otel_token(
+    *,
+    workspace_id: WorkspaceID,
+    organization_id: OrganizationID,
+    session_id: uuid.UUID,
+    ttl_seconds: int | None = None,
+) -> str:
+    """Create a signed JWT for sandbox bridge calls to the host OTel relay.
+
+    The token authorizes only the internal agent OTel bridge-to-relay path. It
+    does not grant access to Tracecat APIs or tenant collector credentials.
+
+    Args:
+        workspace_id: Workspace UUID for authorization context.
+        organization_id: Organization UUID for authorization context.
+        session_id: Agent session UUID for relay claim matching.
+        ttl_seconds: Token TTL in seconds (defaults to the agent sandbox
+            timeout plus a small buffer so the token outlives a full turn).
+
+    Returns:
+        Signed JWT string.
+    """
+    now = datetime.now(UTC)
+    ttl = ttl_seconds or config.TRACECAT__AGENT_SANDBOX_TIMEOUT + 60
+
+    payload: dict[str, Any] = {
+        "iss": AGENT_OTEL_TOKEN_ISSUER,
+        "aud": AGENT_OTEL_TOKEN_AUDIENCE,
+        "sub": AGENT_OTEL_TOKEN_SUBJECT,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=ttl)).timestamp()),
+        "workspace_id": str(workspace_id),
+        "organization_id": str(organization_id),
+        "session_id": str(session_id),
+    }
+
+    return jwt.encode(payload, get_service_key(), algorithm="HS256")
+
+
+def verify_agent_otel_token(token: str) -> AgentOtelTokenClaims:
+    """Verify an Agent OTel relay JWT and return extracted claims.
+
+    Args:
+        token: The JWT string to verify.
+
+    Returns:
+        AgentOtelTokenClaims containing the expected tenant/session identity.
+
+    Raises:
+        ValueError: If token is invalid, expired, or missing required claims.
+    """
+    if not token:
+        raise ValueError("Invalid Agent OTel token")
+
+    try:
+        payload = jwt.decode(
+            token,
+            get_service_key(),
+            algorithms=["HS256"],
+            audience=AGENT_OTEL_TOKEN_AUDIENCE,
+            issuer=AGENT_OTEL_TOKEN_ISSUER,
+            options={"require": list(AGENT_OTEL_REQUIRED_CLAIMS)},
+        )
+    except PyJWTError as exc:
+        raise ValueError("Invalid Agent OTel token") from exc
+
+    if payload.get("sub") != AGENT_OTEL_TOKEN_SUBJECT:
+        raise ValueError("Invalid Agent OTel token subject")
+
+    try:
+        return AgentOtelTokenClaims.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError("Invalid Agent OTel token claims") from exc

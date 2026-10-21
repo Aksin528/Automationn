@@ -2,15 +2,26 @@ import uuid  # noqa: I001
 import asyncio
 from collections.abc import Iterator
 from decimal import Decimal
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from fastapi import HTTPException
+from sqlalchemy import delete, select, text
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import selectinload as sa_selectinload
+from sqlalchemy.pool import NullPool
 
+from tests.database import TEST_DB_CONFIG
+from tracecat.audit.enums import AuditEventStatus
+from tracecat.audit.service import AuditService
 from tracecat.auth.types import Role
 from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.cases.dropdowns.schemas import (
@@ -28,17 +39,29 @@ from tracecat.cases.enums import (
     CaseSeverity,
     CaseStatus,
 )
+from tracecat.cases.filters import resolve_tag_ids
 from tracecat.cases.schemas import (
+    CaseCommentCreate,
     CaseCreate,
     CaseFieldCreate,
     CaseReadMinimal,
     CaseUpdate,
 )
 from tracecat.tags.schemas import TagCreate
-from tracecat.cases.service import CaseFieldsService, CasesService
+from tracecat.cases.service import (
+    CASE_BATCH_LOCK_TIMEOUT,
+    CaseCommentsService,
+    CaseFieldsService,
+    CasesService,
+)
 from tracecat.cases.tags.service import CaseTagsService
-from tracecat.db.models import Case, Workspace
-from tracecat.exceptions import TracecatAuthorizationError
+from tracecat.db.models import Case, CaseComment, CaseEvent, Organization, Workspace
+from tracecat.exceptions import (
+    TracecatAuthorizationError,
+    TracecatConflictError,
+    TracecatNotFoundError,
+    TracecatValidationError,
+)
 from tracecat.pagination import CursorPaginationParams
 from tracecat.tables.enums import SqlType
 
@@ -47,9 +70,19 @@ pytestmark = pytest.mark.usefixtures("db")
 
 @pytest.fixture(autouse=True)
 def stub_case_duration_sync() -> Iterator[None]:
-    with patch(
-        "tracecat.cases.service.CaseDurationService.sync_case_durations",
-        new=AsyncMock(return_value=None),
+    with (
+        patch(
+            "tracecat.cases.events.sync_case_duration",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "tracecat.cases.events.enqueue_case_duration_sync_after_commit",
+            return_value=None,
+        ),
+        patch(
+            "tracecat.cases.service.publish_case_event_payload",
+            new=AsyncMock(return_value=None),
+        ),
     ):
         yield
 
@@ -163,6 +196,38 @@ async def _create_dropdown_with_option(
     return definition, option
 
 
+def _assert_batch_audit_calls(
+    mock_create_event: AsyncMock,
+    *,
+    action: Literal["update", "delete"],
+    case_ids: list[uuid.UUID],
+    succeeded: int,
+    failed: int,
+    terminal_status: AuditEventStatus = AuditEventStatus.SUCCESS,
+) -> None:
+    base_data = {
+        "is_batch": True,
+        "case_ids": [str(case_id) for case_id in case_ids],
+        "case_count": len(case_ids),
+    }
+    assert mock_create_event.await_args_list == [
+        call(
+            resource_type="case",
+            action=action,
+            resource_id=None,
+            status=AuditEventStatus.ATTEMPT,
+            data=base_data,
+        ),
+        call(
+            resource_type="case",
+            action=action,
+            resource_id=None,
+            status=terminal_status,
+            data={**base_data, "succeeded_count": succeeded, "failed_count": failed},
+        ),
+    ]
+
+
 @pytest.mark.anyio
 class TestCasesService:
     async def test_create_and_get_case(
@@ -187,6 +252,17 @@ class TestCasesService:
         assert retrieved_case.status == case_create_params.status
         assert retrieved_case.priority == case_create_params.priority
         assert retrieved_case.severity == case_create_params.severity
+
+    async def test_case_exists(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+    ) -> None:
+        """Test the lightweight case existence probe."""
+        created_case = await cases_service.create_case(case_create_params)
+
+        assert await cases_service.case_exists(created_case.id) is True
+        assert await cases_service.case_exists(uuid.uuid4()) is False
 
     async def test_create_and_get_case_with_assignee(
         self,
@@ -373,6 +449,69 @@ class TestCasesService:
         assert target_case.id in result_ids
         assert second_case.id not in result_ids
 
+    @pytest.mark.parametrize("case_ref", ["CASE-0001", "case-0001", "1", " 0001 "])
+    async def test_resolve_case_id_accepts_short_ids(
+        self, cases_service: CasesService, case_ref: str
+    ) -> None:
+        case = await cases_service.create_case(
+            CaseCreate(
+                summary="Resolvable case",
+                description="Resolvable case",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        assert await cases_service.resolve_case_id(case_ref) == case.id
+
+    async def test_resolve_case_id_returns_uuid_without_lookup(
+        self, cases_service: CasesService
+    ) -> None:
+        case_id = uuid.uuid4()
+
+        assert await cases_service.resolve_case_id(str(case_id)) == case_id
+        assert await cases_service.resolve_case_id(case_id) == case_id
+
+    @pytest.mark.parametrize("case_ref", ["CASE-", "CASE-12a", "not-a-case", ""])
+    async def test_resolve_case_id_rejects_invalid_refs(
+        self, cases_service: CasesService, case_ref: str
+    ) -> None:
+        with pytest.raises(TracecatValidationError):
+            await cases_service.resolve_case_id(case_ref)
+
+    async def test_resolve_case_id_is_workspace_scoped(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        svc_organization,
+    ) -> None:
+        await cases_service.create_case(
+            CaseCreate(
+                summary="Workspace one case",
+                description="Workspace one case",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        second_workspace = Workspace(
+            name="resolve-scope-workspace",
+            organization_id=svc_organization.id,
+        )
+        session.add(second_workspace)
+        await session.commit()
+        second_role = cases_service.role.model_copy(
+            update={
+                "workspace_id": second_workspace.id,
+                "organization_id": second_workspace.organization_id,
+            }
+        )
+        second_service = CasesService(session=session, role=second_role)
+
+        with pytest.raises(TracecatNotFoundError):
+            await second_service.resolve_case_id("CASE-0001")
+
     async def test_create_case_concurrently_allocates_unique_workspace_numbers(
         self,
         cases_service: CasesService,
@@ -380,7 +519,7 @@ class TestCasesService:
         svc_role: Role,
         svc_workspace: Workspace,
     ) -> None:
-        """Concurrent creates should serialize on the workspace counter row."""
+        """Concurrent creates should allocate unique workspace-local numbers."""
         await cases_service.fields._ensure_schema_ready()
         await cases_service.session.commit()
         assert session.bind is not None
@@ -427,6 +566,192 @@ class TestCasesService:
                 )
             ).scalars()
             assert sorted(stored_case_numbers.all()) == [1, 2, 3, 4, 5]
+
+    async def test_slow_related_writes_do_not_hold_case_number_counter_lock(
+        self,
+    ) -> None:
+        """A stalled case should not block another case before final allocation."""
+        organization_id = uuid.uuid4()
+        workspace_id = uuid.uuid4()
+        role = Role(
+            type="service",
+            workspace_id=workspace_id,
+            organization_id=organization_id,
+            service_id="tracecat-service",
+            scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-service"],
+        )
+        concurrent_engine = create_async_engine(
+            TEST_DB_CONFIG.test_url,
+            poolclass=NullPool,
+        )
+        session_factory = async_sessionmaker(
+            bind=concurrent_engine,
+            expire_on_commit=False,
+        )
+        slow_write_started = asyncio.Event()
+        release_slow_write = asyncio.Event()
+        original_upsert = CaseFieldsService.upsert_field_values
+        backend_pids: set[int] = set()
+
+        async def pause_slow_case(
+            fields_service: CaseFieldsService,
+            case: Case,
+            fields: dict[str, Any],
+        ) -> dict[str, Any]:
+            if case.summary == "Slow case":
+                slow_write_started.set()
+                await release_slow_write.wait()
+            return await original_upsert(fields_service, case, fields)
+
+        async def create_case(summary: str) -> int:
+            async with session_factory() as concurrent_session:
+                backend_pid = await concurrent_session.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                assert backend_pid is not None
+                backend_pids.add(backend_pid)
+                service = CasesService(
+                    session=concurrent_session,
+                    role=role.model_copy(deep=True),
+                )
+                case = await service.create_case(
+                    CaseCreate(
+                        summary=summary,
+                        description=summary,
+                        status=CaseStatus.NEW,
+                        priority=CasePriority.MEDIUM,
+                        severity=CaseSeverity.LOW,
+                    )
+                )
+                return case.case_number
+
+        slow_task: asyncio.Task[int] | None = None
+        try:
+            async with session_factory() as seed_session:
+                seed_session.add_all(
+                    [
+                        Organization(
+                            id=organization_id,
+                            name="Case contention test organization",
+                            slug=f"case-contention-{organization_id.hex[:8]}",
+                            is_active=True,
+                        ),
+                        Workspace(
+                            id=workspace_id,
+                            name=f"case-contention-{workspace_id.hex[:8]}",
+                            organization_id=organization_id,
+                        ),
+                    ]
+                )
+                await seed_session.commit()
+                seed_service = CasesService(session=seed_session, role=role)
+                await seed_service.fields._ensure_schema_ready()
+                await seed_session.commit()
+
+            with (
+                patch.object(
+                    CaseFieldsService,
+                    "_ensure_schema_ready",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch.object(
+                    CaseFieldsService,
+                    "upsert_field_values",
+                    new=pause_slow_case,
+                ),
+            ):
+                slow_task = asyncio.create_task(create_case("Slow case"))
+                await asyncio.wait_for(slow_write_started.wait(), timeout=5)
+                fast_case_number = await asyncio.wait_for(
+                    create_case("Fast case"), timeout=5
+                )
+                release_slow_write.set()
+                slow_case_number = await asyncio.wait_for(slow_task, timeout=5)
+        finally:
+            release_slow_write.set()
+            if slow_task is not None:
+                if not slow_task.done():
+                    slow_task.cancel()
+                await asyncio.gather(slow_task, return_exceptions=True)
+            async with session_factory() as cleanup_session:
+                await cleanup_session.execute(
+                    delete(Workspace).where(Workspace.id == workspace_id)
+                )
+                await cleanup_session.execute(
+                    delete(Organization).where(Organization.id == organization_id)
+                )
+                await cleanup_session.commit()
+            await concurrent_engine.dispose()
+
+        assert len(backend_pids) == 2
+        assert fast_case_number == 1
+        assert slow_case_number == 2
+
+    async def test_failed_case_creation_rolls_back_allocated_number(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+    ) -> None:
+        """The counter remains gapless when failure occurs after allocation."""
+        workspace_id = cases_service.workspace_id
+        original_assign = cases_service._assign_next_case_number
+
+        async def fail_after_counter_update(case: Case) -> None:
+            await original_assign(case)
+            raise RuntimeError("Synthetic failure after case-number allocation")
+
+        with (
+            patch.object(
+                cases_service,
+                "_assign_next_case_number",
+                new=fail_after_counter_update,
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            await cases_service.create_case(
+                CaseCreate(
+                    summary="Failed case",
+                    description="Failed case",
+                    status=CaseStatus.NEW,
+                    priority=CasePriority.MEDIUM,
+                    severity=CaseSeverity.LOW,
+                )
+            )
+
+        workspace = await session.scalar(
+            select(Workspace).where(Workspace.id == workspace_id)
+        )
+        assert workspace is not None
+        assert workspace.last_case_number == 0
+        stored_cases = (
+            await session.execute(select(Case).where(Case.workspace_id == workspace_id))
+        ).scalars()
+        assert stored_cases.all() == []
+
+    async def test_pending_case_number_cannot_be_committed(
+        self,
+        session: AsyncSession,
+        svc_workspace: Workspace,
+    ) -> None:
+        """The deferred database invariant rejects a persisted sentinel."""
+        session.add(
+            Case(
+                workspace_id=svc_workspace.id,
+                case_number=0,
+                summary="Pending case",
+                description="Pending case",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        await session.flush()
+        # The session fixture wraps each test in an outer transaction, so force
+        # deferred triggers to run instead of relying on session.commit().
+        with pytest.raises(DBAPIError):
+            await session.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+        await session.rollback()
 
     async def test_list_cases_with_limit(
         self, cases_service: CasesService, case_create_params: CaseCreate
@@ -674,6 +999,578 @@ class TestCasesService:
         assert retrieved_case.summary == update_params.summary
         assert retrieved_case.status == update_params.status
         assert retrieved_case.priority == update_params.priority
+
+    async def test_batch_update_cases(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+        session: AsyncSession,
+    ) -> None:
+        """Batch updates emit per-case events and commit once."""
+        first_case = await cases_service.create_case(case_create_params)
+        second_case = await cases_service.create_case(
+            case_create_params.model_copy(update={"summary": "Second case"})
+        )
+        case_ids = [first_case.id, second_case.id]
+        original_commit = session.commit
+        mock_publish = AsyncMock()
+
+        async def commit_batch() -> None:
+            mock_publish.assert_not_awaited()
+            await original_commit()
+
+        with (
+            patch.object(
+                AuditService, "create_event", new_callable=AsyncMock
+            ) as mock_audit,
+            patch(
+                "tracecat.cases.events.publish_case_event_payload",
+                new=mock_publish,
+            ),
+            patch.object(
+                cases_service.events,
+                "create_event",
+                wraps=cases_service.events.create_event,
+            ) as mock_create_case_event,
+            patch.object(session, "commit", side_effect=commit_batch) as mock_commit,
+        ):
+            response = await cases_service.batch_update_cases(
+                case_ids, CaseUpdate(summary="Batch updated")
+            )
+            for _ in range(10):
+                if mock_publish.await_count == 2:
+                    break
+                await asyncio.sleep(0)
+
+        assert response.succeeded == 2
+        assert response.failed == 0
+        assert all(result.success for result in response.results)
+        assert mock_create_case_event.await_count == 2
+        assert mock_publish.await_count == 2
+        mock_commit.assert_awaited_once()
+        _assert_batch_audit_calls(
+            mock_audit,
+            action="update",
+            case_ids=case_ids,
+            succeeded=2,
+            failed=0,
+        )
+
+        for case_id in case_ids:
+            updated_case = await cases_service.get_case(case_id)
+            assert updated_case is not None
+            assert updated_case.summary == "Batch updated"
+
+    async def test_case_batch_lock_statements_use_expected_strength(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+    ) -> None:
+        """Updates use NO KEY UPDATE while deletes retain full UPDATE locks."""
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = []
+
+        with patch.object(
+            session, "execute", new=AsyncMock(return_value=result)
+        ) as mock_execute:
+            await cases_service._lock_cases([uuid.uuid4()], key_share=True)
+            assert mock_execute.await_args is not None
+            update_statement = mock_execute.await_args.args[0]
+
+            await cases_service._lock_cases([uuid.uuid4()])
+            assert mock_execute.await_args is not None
+            delete_statement = mock_execute.await_args.args[0]
+
+        update_sql = str(update_statement.compile(dialect=postgresql.dialect()))
+        delete_sql = str(delete_statement.compile(dialect=postgresql.dialect()))
+        assert "FOR NO KEY UPDATE" in update_sql
+        assert "FOR UPDATE" in delete_sql
+        assert "FOR NO KEY UPDATE" not in delete_sql
+
+    async def test_batch_update_reuses_locked_case_for_dropdown_values(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+    ) -> None:
+        """Batch dropdown writes do not requery their already-locked case."""
+        definition, option = await _create_dropdown_with_option(
+            cases_service,
+            definition_name="Batch Triage",
+            definition_ref="batch_triage",
+            option_label="Escalated",
+            option_ref="escalated",
+        )
+        created_case = await cases_service.create_case(case_create_params)
+
+        with patch.object(
+            cases_service.dropdowns,
+            "_get_case",
+            wraps=cases_service.dropdowns._get_case,
+        ) as mock_get_case:
+            response = await cases_service.batch_update_cases(
+                [created_case.id],
+                CaseUpdate(
+                    dropdown_values=[
+                        CaseDropdownValueInput(
+                            definition_id=definition.id,
+                            option_id=option.id,
+                        )
+                    ]
+                ),
+            )
+
+        assert response.succeeded == 1
+        mock_get_case.assert_not_awaited()
+        values = await cases_service.dropdowns.list_values_for_case(created_case.id)
+        assert len(values) == 1
+        assert values[0].option_id == option.id
+
+    @pytest.mark.parametrize("action", ["update", "delete"])
+    async def test_batch_case_lock_timeout_raises_conflict_and_audits_failure(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        action: Literal["update", "delete"],
+    ) -> None:
+        """SQLSTATE 55P03 becomes a conflict after rollback and failure audit."""
+
+        class LockNotAvailableError(Exception):
+            sqlstate = "55P03"
+
+        case_ids = [uuid.uuid4(), uuid.uuid4()]
+        lock_error = DBAPIError(
+            "SELECT ... FOR UPDATE",
+            {},
+            LockNotAvailableError(),
+        )
+
+        with (
+            patch.object(
+                AuditService, "create_event", new_callable=AsyncMock
+            ) as mock_audit,
+            patch.object(
+                cases_service,
+                "_lock_cases",
+                side_effect=lock_error,
+            ) as mock_lock_cases,
+            patch.object(session, "execute", new_callable=AsyncMock) as mock_execute,
+            patch.object(session, "rollback", wraps=session.rollback) as mock_rollback,
+        ):
+            with pytest.raises(TracecatConflictError) as exc_info:
+                if action == "update":
+                    await cases_service.batch_update_cases(case_ids, CaseUpdate())
+                else:
+                    await cases_service.batch_delete_cases(case_ids)
+
+        assert exc_info.value.__cause__ is lock_error
+        mock_rollback.assert_awaited_once()
+        assert mock_execute.await_args is not None
+        timeout_statement = mock_execute.await_args.args[0]
+        assert str(timeout_statement) == (
+            f"SET LOCAL lock_timeout = '{CASE_BATCH_LOCK_TIMEOUT}'"
+        )
+        if action == "update":
+            mock_lock_cases.assert_awaited_once_with(
+                case_ids,
+                load_dropdown_values=False,
+                key_share=True,
+            )
+        else:
+            mock_lock_cases.assert_awaited_once_with(
+                case_ids, load_dropdown_values=False, key_share=False
+            )
+        _assert_batch_audit_calls(
+            mock_audit,
+            action=action,
+            case_ids=case_ids,
+            succeeded=0,
+            failed=2,
+            terminal_status=AuditEventStatus.FAILURE,
+        )
+
+    async def test_batch_update_cases_deduplicates_case_ids(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+    ) -> None:
+        """Duplicate IDs produce one ordered result and audit entry per case."""
+        first_case = await cases_service.create_case(case_create_params)
+        second_case = await cases_service.create_case(
+            case_create_params.model_copy(update={"summary": "Second case"})
+        )
+        case_ids = [first_case.id, second_case.id]
+
+        with patch.object(
+            AuditService, "create_event", new_callable=AsyncMock
+        ) as mock_audit:
+            response = await cases_service.batch_update_cases(
+                [first_case.id, second_case.id, first_case.id],
+                CaseUpdate(summary="Batch updated"),
+            )
+
+        assert response.succeeded == 2
+        assert response.failed == 0
+        assert [result.case_id for result in response.results] == case_ids
+        _assert_batch_audit_calls(
+            mock_audit,
+            action="update",
+            case_ids=case_ids,
+            succeeded=2,
+            failed=0,
+        )
+
+    async def test_batch_update_cases_isolates_partial_failure(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+        session: AsyncSession,
+    ) -> None:
+        """A typed per-case failure rolls back its savepoint only."""
+        first_case = await cases_service.create_case(case_create_params)
+        invalid_case = await cases_service.create_case(
+            case_create_params.model_copy(update={"summary": "Invalid case"})
+        )
+        third_case = await cases_service.create_case(
+            case_create_params.model_copy(update={"summary": "Third case"})
+        )
+        invalid_case_id = invalid_case.id
+        case_ids = [first_case.id, invalid_case.id, third_case.id]
+        apply_case_update = cases_service._apply_case_update
+
+        async def apply_with_one_failure(case: Case, params: CaseUpdate) -> None:
+            if case.id == invalid_case_id:
+                await apply_case_update(case, params)
+                raise ValueError("Invalid case update")
+            await apply_case_update(case, params)
+
+        mock_publish = AsyncMock()
+        with (
+            patch.object(
+                AuditService, "create_event", new_callable=AsyncMock
+            ) as mock_audit,
+            patch(
+                "tracecat.cases.events.publish_case_event_payload",
+                new=mock_publish,
+            ),
+            patch.object(
+                cases_service.events,
+                "create_event",
+                wraps=cases_service.events.create_event,
+            ) as mock_create_case_event,
+            patch.object(
+                cases_service,
+                "_apply_case_update",
+                side_effect=apply_with_one_failure,
+            ),
+            patch.object(session, "commit", wraps=session.commit) as mock_commit,
+        ):
+            response = await cases_service.batch_update_cases(
+                case_ids, CaseUpdate(summary="Batch updated")
+            )
+            for _ in range(10):
+                if mock_publish.await_count == 2:
+                    break
+                await asyncio.sleep(0)
+
+        assert response.succeeded == 2
+        assert response.failed == 1
+        assert response.results[0].success is True
+        assert response.results[1].success is False
+        assert response.results[1].error == "Invalid case update"
+        assert response.results[2].success is True
+        assert mock_create_case_event.await_count == 3
+        assert {
+            published.kwargs["case_id"] for published in mock_publish.await_args_list
+        } == {str(case_ids[0]), str(case_ids[2])}
+        mock_commit.assert_awaited_once()
+        _assert_batch_audit_calls(
+            mock_audit,
+            action="update",
+            case_ids=case_ids,
+            succeeded=2,
+            failed=1,
+        )
+
+        unchanged_case = await cases_service.get_case(invalid_case_id)
+        assert unchanged_case is not None
+        assert unchanged_case.summary == "Invalid case"
+
+    async def test_batch_update_cases_isolates_not_found_failure(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+    ) -> None:
+        """A per-case lookup failure (e.g. missing dropdown ref) stays per-case."""
+        first_case = await cases_service.create_case(case_create_params)
+        invalid_case = await cases_service.create_case(
+            case_create_params.model_copy(update={"summary": "Invalid case"})
+        )
+        invalid_case_id = invalid_case.id
+        case_ids = [first_case.id, invalid_case.id]
+        apply_case_update = cases_service._apply_case_update
+
+        async def apply_with_missing_ref(case: Case, params: CaseUpdate) -> None:
+            if case.id == invalid_case_id:
+                raise TracecatNotFoundError("Dropdown definition not found")
+            await apply_case_update(case, params)
+
+        with (
+            patch.object(AuditService, "create_event", new_callable=AsyncMock),
+            patch.object(
+                cases_service,
+                "_apply_case_update",
+                side_effect=apply_with_missing_ref,
+            ),
+        ):
+            response = await cases_service.batch_update_cases(
+                case_ids, CaseUpdate(summary="Batch updated")
+            )
+
+        assert response.succeeded == 1
+        assert response.failed == 1
+        assert response.results[0].success is True
+        assert response.results[1].success is False
+        assert response.results[1].error == "Dropdown definition not found"
+
+    async def test_batch_update_cases_all_not_found(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+    ) -> None:
+        """Missing cases return one failed result per requested ID."""
+        case_ids = [uuid.uuid4(), uuid.uuid4()]
+
+        with (
+            patch.object(
+                AuditService, "create_event", new_callable=AsyncMock
+            ) as mock_audit,
+            patch.object(session, "commit", wraps=session.commit) as mock_commit,
+        ):
+            response = await cases_service.batch_update_cases(
+                case_ids, CaseUpdate(summary="Batch updated")
+            )
+
+        assert response.succeeded == 0
+        assert response.failed == 2
+        assert [result.case_id for result in response.results] == case_ids
+        assert all(result.error == "Case not found" for result in response.results)
+        mock_commit.assert_awaited_once()
+        _assert_batch_audit_calls(
+            mock_audit,
+            action="update",
+            case_ids=case_ids,
+            succeeded=0,
+            failed=2,
+            terminal_status=AuditEventStatus.FAILURE,
+        )
+
+    async def test_batch_delete_cases(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+        session: AsyncSession,
+    ) -> None:
+        """Batch delete removes all found cases with one commit and audit pair."""
+        first_case = await cases_service.create_case(case_create_params)
+        second_case = await cases_service.create_case(
+            case_create_params.model_copy(update={"summary": "Second case"})
+        )
+        case_ids = [first_case.id, second_case.id]
+
+        with (
+            patch.object(
+                AuditService, "create_event", new_callable=AsyncMock
+            ) as mock_audit,
+            patch.object(session, "commit", wraps=session.commit) as mock_commit,
+        ):
+            response = await cases_service.batch_delete_cases(case_ids)
+
+        assert response.succeeded == 2
+        assert response.failed == 0
+        assert all(result.success for result in response.results)
+        mock_commit.assert_awaited_once()
+        _assert_batch_audit_calls(
+            mock_audit,
+            action="delete",
+            case_ids=case_ids,
+            succeeded=2,
+            failed=0,
+        )
+        for case_id in case_ids:
+            assert await cases_service.get_case(case_id) is None
+
+    async def test_batch_delete_cases_with_threaded_comments(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+        session: AsyncSession,
+    ) -> None:
+        """Deleting a case with a reply comment must not trip the parent-id
+        RESTRICT self-FK: replies are unlinked before the case row is deleted
+        and database cascades remove the comments."""
+        created_case = await cases_service.create_case(case_create_params)
+        comments_service = CaseCommentsService(session=session, role=cases_service.role)
+        parent = await comments_service.create_comment(
+            created_case, CaseCommentCreate(content="thread starter")
+        )
+        await comments_service.create_comment(
+            created_case,
+            CaseCommentCreate(content="reply", parent_id=parent.id),
+        )
+        await session.commit()
+
+        response = await cases_service.batch_delete_cases([created_case.id])
+
+        assert response.succeeded == 1
+        assert response.failed == 0
+        assert await cases_service.get_case(created_case.id) is None
+        remaining = await session.execute(
+            select(CaseComment).where(CaseComment.case_id == created_case.id)
+        )
+        assert remaining.scalars().all() == []
+
+    async def test_batch_delete_cases_deduplicates_case_ids(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+    ) -> None:
+        """Duplicate delete IDs produce one result and count once."""
+        created_case = await cases_service.create_case(case_create_params)
+
+        with patch.object(
+            AuditService, "create_event", new_callable=AsyncMock
+        ) as mock_audit:
+            response = await cases_service.batch_delete_cases(
+                [created_case.id, created_case.id]
+            )
+
+        assert response.succeeded == 1
+        assert response.failed == 0
+        assert [result.case_id for result in response.results] == [created_case.id]
+        _assert_batch_audit_calls(
+            mock_audit,
+            action="delete",
+            case_ids=[created_case.id],
+            succeeded=1,
+            failed=0,
+        )
+
+    async def test_batch_update_cases_discards_callbacks_on_outer_rollback(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+        session: AsyncSession,
+    ) -> None:
+        """A whole-batch rollback cannot publish callbacks on a later commit."""
+        first_case = await cases_service.create_case(case_create_params)
+        second_case = await cases_service.create_case(
+            case_create_params.model_copy(update={"summary": "Second case"})
+        )
+        original_apply_case_update = cases_service._apply_case_update
+
+        async def fail_second_update(case: Case, params: CaseUpdate) -> None:
+            if case.id == second_case.id:
+                raise RuntimeError("Unexpected failure")
+            await original_apply_case_update(case, params)
+
+        mock_publish = AsyncMock()
+        with (
+            patch.object(AuditService, "create_event", new_callable=AsyncMock),
+            patch(
+                "tracecat.cases.events.publish_case_event_payload",
+                new=mock_publish,
+            ),
+            patch.object(
+                cases_service,
+                "_apply_case_update",
+                side_effect=fail_second_update,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="Unexpected failure"):
+                await cases_service.batch_update_cases(
+                    [first_case.id, second_case.id],
+                    CaseUpdate(summary="Batch updated"),
+                )
+
+            await session.commit()
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+        mock_publish.assert_not_awaited()
+
+    async def test_batch_update_cases_survives_audit_database_failure(
+        self,
+        cases_service: CasesService,
+        case_create_params: CaseCreate,
+        session: AsyncSession,
+    ) -> None:
+        """Audit DB failures occur on sessions isolated from the batch transaction."""
+        created_case = await cases_service.create_case(case_create_params)
+        audit_sessions: list[AsyncSession] = []
+
+        async def fail_audit_event(audit_service: AuditService, **_: Any) -> None:
+            audit_sessions.append(audit_service.session)
+            await audit_service.session.execute(
+                text("SELECT * FROM intentionally_missing_audit_test_table")
+            )
+
+        with patch.object(AuditService, "create_event", new=fail_audit_event):
+            response = await cases_service.batch_update_cases(
+                [created_case.id], CaseUpdate(summary="Batch updated")
+            )
+
+        assert response.succeeded == 1
+        assert response.failed == 0
+        assert len(audit_sessions) == 2
+        assert all(audit_session is not session for audit_session in audit_sessions)
+        updated_case = await cases_service.get_case(created_case.id)
+        assert updated_case is not None
+        assert updated_case.summary == "Batch updated"
+
+    async def test_batch_update_cases_audits_whole_batch_failure(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+    ) -> None:
+        """Unexpected failures roll back and emit one terminal failure audit."""
+        case_ids = [uuid.uuid4(), uuid.uuid4()]
+
+        with (
+            patch.object(
+                AuditService, "create_event", new_callable=AsyncMock
+            ) as mock_audit,
+            patch.object(
+                cases_service,
+                "_lock_cases",
+                side_effect=RuntimeError("Unexpected failure"),
+            ),
+            patch.object(session, "rollback", wraps=session.rollback) as mock_rollback,
+        ):
+            with pytest.raises(RuntimeError, match="Unexpected failure"):
+                await cases_service.batch_update_cases(case_ids, CaseUpdate())
+
+        mock_rollback.assert_awaited_once()
+        base_data = {
+            "is_batch": True,
+            "case_ids": [str(case_id) for case_id in case_ids],
+            "case_count": 2,
+        }
+        assert mock_audit.await_args_list == [
+            call(
+                resource_type="case",
+                action="update",
+                resource_id=None,
+                status=AuditEventStatus.ATTEMPT,
+                data=base_data,
+            ),
+            call(
+                resource_type="case",
+                action="update",
+                resource_id=None,
+                status=AuditEventStatus.FAILURE,
+                data={**base_data, "succeeded_count": 0, "failed_count": 2},
+            ),
+        ]
 
     async def test_update_case_close_emits_case_closed_event(
         self, cases_service: CasesService, case_create_params: CaseCreate
@@ -1120,6 +2017,54 @@ class TestCasesService:
 
         assert search_response.model_dump() == list_response.model_dump()
 
+    async def test_search_cases_reverse_pagination_returns_adjacent_page(
+        self, cases_service: CasesService
+    ) -> None:
+        """A previous cursor returns the adjacent page, not the first page."""
+        for i in range(9):
+            await cases_service.create_case(
+                CaseCreate(
+                    summary=f"Reverse pagination case {i}",
+                    description="Case for reverse pagination test",
+                    status=CaseStatus.NEW,
+                    priority=CasePriority.MEDIUM,
+                    severity=CaseSeverity.LOW,
+                )
+            )
+
+        async def get_page(cursor: str | None = None, *, reverse: bool = False):
+            return await cases_service.search_cases(
+                params=CursorPaginationParams(
+                    limit=3,
+                    cursor=cursor,
+                    reverse=reverse,
+                )
+            )
+
+        all_cases = await cases_service.search_cases(
+            params=CursorPaginationParams(limit=20)
+        )
+        expected_ids = [case.id for case in all_cases.items]
+
+        page1 = await get_page()
+        page2 = await get_page(page1.next_cursor)
+        page3 = await get_page(page2.next_cursor)
+        assert [case.id for case in page3.items] == expected_ids[6:9]
+        assert page3.prev_cursor is not None
+
+        back = await get_page(page3.prev_cursor, reverse=True)
+        assert [case.id for case in back.items] == expected_ids[3:6]
+        assert back.next_cursor is not None
+        assert back.prev_cursor is not None
+
+        forward_again = await get_page(back.next_cursor)
+        assert [case.id for case in forward_again.items] == expected_ids[6:9]
+
+        back_to_first = await get_page(back.prev_cursor, reverse=True)
+        assert [case.id for case in back_to_first.items] == expected_ids[:3]
+        assert back_to_first.next_cursor is not None
+        assert back_to_first.prev_cursor is None
+
     async def test_search_cases_gates_duration_selectinload(
         self, cases_service: CasesService
     ) -> None:
@@ -1146,6 +2091,31 @@ class TestCasesService:
             await cases_service.search_cases(params=params, include_durations=True)
 
         assert "durations" in loader_calls
+
+    async def test_search_cases_gates_payload(
+        self, cases_service: CasesService
+    ) -> None:
+        """Case payload should only be returned when include_payload=True."""
+        payload = {"alert_id": "abc-123", "score": 42}
+        await cases_service.create_case(
+            CaseCreate(
+                summary="Payload case",
+                description="Case with a payload",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+                payload=payload,
+            )
+        )
+        params = CursorPaginationParams(limit=10, cursor=None, reverse=False)
+
+        default_response = await cases_service.search_cases(params=params)
+        assert default_response.items[0].payload is None
+
+        with_payload = await cases_service.search_cases(
+            params=params, include_payload=True
+        )
+        assert with_payload.items[0].payload == payload
 
     async def test_search_cases_tag_filter_uses_or_logic(
         self, cases_service: CasesService
@@ -1206,6 +2176,115 @@ class TestCasesService:
         assert case_with_second_tag.id in result_ids
         assert unrelated_case.id not in result_ids
 
+        aggregates = await cases_service.get_search_case_aggregates(
+            tag_ids=[tag_one.id, tag_two.id]
+        )
+        assert aggregates.total == len(response.items) == 2
+
+    @pytest.mark.parametrize("search_term", ["%", "_", "\\", r"\%_"])
+    async def test_search_literal_metacharacters_match_rows_and_counts(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        svc_organization: Organization,
+        search_term: str,
+    ) -> None:
+        """Literal text matches both text columns without crossing workspaces."""
+        summary_match = await cases_service.create_case(
+            CaseCreate(
+                summary=f"Literal {search_term} marker",
+                description="Plain description",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        description_match = await cases_service.create_case(
+            CaseCreate(
+                summary="Plain summary",
+                description=f"Literal {search_term} marker",
+                status=CaseStatus.RESOLVED,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        await cases_service.create_case(
+            CaseCreate(
+                summary="Literal wildcard replacement marker",
+                description="Plain description",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        other_workspace = Workspace(
+            name="literal-search-other-workspace", organization_id=svc_organization.id
+        )
+        session.add(other_workspace)
+        await session.commit()
+        other_role = cases_service.role.model_copy(
+            update={"workspace_id": other_workspace.id}
+        )
+        other_service = CasesService(session, other_role)
+        await other_service.create_case(
+            CaseCreate(
+                summary=f"Literal {search_term} marker",
+                description="Plain description",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+
+        response = await cases_service.search_cases(
+            CursorPaginationParams(limit=20), search_term=search_term
+        )
+        aggregates = await cases_service.get_search_case_aggregates(
+            search_term=search_term
+        )
+
+        assert {item.id for item in response.items} == {
+            summary_match.id,
+            description_match.id,
+        }
+        assert aggregates.total == len(response.items) == 2
+        assert aggregates.status_groups.new == 1
+        assert aggregates.status_groups.resolved == 1
+
+    async def test_search_tag_resolution_is_workspace_scoped(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        svc_organization: Organization,
+    ) -> None:
+        """Foreign tag UUIDs and refs cannot silently remove a requested filter."""
+        tag = await cases_service.tags.create_tag(TagCreate(name="Local search tag"))
+        resolved_ids = await resolve_tag_ids(
+            tags=[tag.ref, str(tag.id)], role=cases_service.role, session=session
+        )
+        assert resolved_ids == [tag.id, tag.id]
+
+        other_workspace = Workspace(
+            name="tag-search-other-workspace", organization_id=svc_organization.id
+        )
+        session.add(other_workspace)
+        await session.commit()
+        other_role = cases_service.role.model_copy(
+            update={"workspace_id": other_workspace.id}
+        )
+        other_tag = await CaseTagsService(session, other_role).create_tag(
+            TagCreate(name="Foreign search tag")
+        )
+
+        for identifier in (other_tag.ref, str(other_tag.id)):
+            with pytest.raises(HTTPException) as error:
+                await resolve_tag_ids(
+                    tags=[tag.ref, identifier], role=cases_service.role, session=session
+                )
+            assert error.value.status_code == 400
+            assert error.value.detail == f"Unknown case tag filter: {identifier!r}"
+
     async def test_search_cases_short_id_exact_match(
         self, cases_service: CasesService
     ) -> None:
@@ -1257,6 +2336,133 @@ class TestCasesService:
         non_exact_ids = {item.id for item in non_exact_response.items}
         assert target_case.id not in non_exact_ids
 
+    @pytest.mark.parametrize("reference_type", ["uuid", "short_id"])
+    async def test_exact_case_search_finds_older_sub_case_before_pagination(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        reference_type: Literal["uuid", "short_id"],
+    ) -> None:
+        """Exact references find older sub-cases without fuzzy matches or views."""
+        now = datetime.now(UTC)
+        parent = Case(
+            id=uuid.uuid4(),
+            workspace_id=cases_service.workspace_id,
+            case_number=1,
+            summary="Synthetic parent",
+            description="Synthetic parent",
+            status=CaseStatus.NEW,
+            priority=CasePriority.MEDIUM,
+            severity=CaseSeverity.LOW,
+        )
+        target = Case(
+            id=uuid.uuid4(),
+            workspace_id=cases_service.workspace_id,
+            case_number=42,
+            parent_id=parent.id,
+            summary="Synthetic older sub-case",
+            description="Synthetic older sub-case",
+            status=CaseStatus.CLOSED,
+            priority=CasePriority.LOW,
+            severity=CaseSeverity.LOW,
+            created_at=now - timedelta(days=60),
+            updated_at=now - timedelta(days=60),
+        )
+        newer_match = Case(
+            workspace_id=cases_service.workspace_id,
+            case_number=43,
+            summary=f"Synthetic text mentions {target.id} and CASE-0042",
+            description="Synthetic text match",
+            status=CaseStatus.NEW,
+            priority=CasePriority.MEDIUM,
+            severity=CaseSeverity.LOW,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add_all([parent, target, newer_match])
+        await session.commit()
+        params = CursorPaginationParams(limit=1)
+        case_id = target.id if reference_type == "uuid" else None
+        short_id = target.short_id if reference_type == "short_id" else None
+        events_before = list((await session.scalars(select(CaseEvent.id))).all())
+
+        response = await cases_service.search_cases(
+            params,
+            case_id=case_id,
+            short_id=short_id,
+            hierarchy="all",
+            order_by="created_at",
+            sort="desc",
+        )
+        assert [item.id for item in response.items] == [target.id]
+        assert response.items[0].parent is not None
+        assert response.items[0].parent.id == parent.id
+        assert response.has_more is False
+
+        date_filtered = await cases_service.search_cases(
+            params,
+            case_id=case_id,
+            short_id=short_id,
+            start_time=now - timedelta(days=30),
+        )
+        status_filtered = await cases_service.search_cases(
+            params, case_id=case_id, short_id=short_id, status=[CaseStatus.NEW]
+        )
+        hierarchy_filtered = await cases_service.search_cases(
+            params, case_id=case_id, short_id=short_id, hierarchy="top_level"
+        )
+        assert date_filtered.items == []
+        assert status_filtered.items == []
+        assert hierarchy_filtered.items == []
+        promoted_top_level = await cases_service.search_cases(
+            params,
+            search_term=str(target.id) if case_id else target.short_id,
+            promote_exact_match=True,
+            hierarchy="top_level",
+        )
+        assert [item.id for item in promoted_top_level.items] == [newer_match.id]
+        assert promoted_top_level.total_estimate == 1
+        assert not promoted_top_level.items[0].is_exact_match
+        events_after = list((await session.scalars(select(CaseEvent.id))).all())
+        assert events_after == events_before
+
+    async def test_exact_uuid_search_cannot_find_another_workspace_case(
+        self,
+        cases_service: CasesService,
+        session: AsyncSession,
+        svc_organization: Organization,
+    ) -> None:
+        """An exact UUID cannot bypass the service's workspace authorization."""
+        other_workspace = Workspace(
+            name="synthetic-search-workspace",
+            organization_id=svc_organization.id,
+        )
+        session.add(other_workspace)
+        await session.commit()
+        other_case = Case(
+            workspace_id=other_workspace.id,
+            case_number=42,
+            summary="Synthetic case in another workspace",
+            description="Synthetic case in another workspace",
+            status=CaseStatus.NEW,
+            priority=CasePriority.MEDIUM,
+            severity=CaseSeverity.LOW,
+        )
+        session.add(other_case)
+        await session.commit()
+
+        response = await cases_service.search_cases(
+            CursorPaginationParams(limit=1), case_id=other_case.id, hierarchy="all"
+        )
+        assert response.items == []
+        assert response.has_more is False
+        promoted = await cases_service.search_cases(
+            CursorPaginationParams(limit=1),
+            search_term=str(other_case.id),
+            promote_exact_match=True,
+        )
+        assert promoted.items == []
+
     async def test_search_cases_short_id_rejects_invalid_value(
         self, cases_service: CasesService
     ) -> None:
@@ -1269,6 +2475,95 @@ class TestCasesService:
                 params=params,
                 short_id="CASE-ABCD",
             )
+
+    @pytest.mark.parametrize(
+        "short_id", ["CASE-2147483648", "CASE-9999999999", "9999999999"]
+    )
+    async def test_search_cases_short_id_rejects_overflow(
+        self, cases_service: CasesService, short_id: str
+    ) -> None:
+        """Oversized exact IDs fail validation before binding a PostgreSQL integer."""
+        with pytest.raises(
+            ValueError, match="Short ID number cannot exceed 2147483647"
+        ):
+            await cases_service.search_cases(
+                CursorPaginationParams(limit=1), short_id=short_id
+            )
+
+    async def test_search_cases_short_id_accepts_maximum_case_number(
+        self, cases_service: CasesService, session: AsyncSession
+    ) -> None:
+        """The largest PostgreSQL integer remains a valid exact case reference."""
+        target = Case(
+            workspace_id=cases_service.workspace_id,
+            case_number=2147483647,
+            summary="Synthetic maximum case number",
+            description="Synthetic maximum case number",
+            status=CaseStatus.NEW,
+            priority=CasePriority.MEDIUM,
+            severity=CaseSeverity.LOW,
+        )
+        session.add(target)
+        await session.commit()
+        response = await cases_service.search_cases(
+            CursorPaginationParams(limit=1), short_id="CASE-2147483647"
+        )
+        assert [item.id for item in response.items] == [target.id]
+
+    async def test_search_cases_search_term_matches_case_ids(
+        self, cases_service: CasesService, session: AsyncSession
+    ) -> None:
+        """search_term should match case UUIDs and unpadded or 5+ digit short IDs."""
+        target_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Target case",
+                description="Target description",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        other_case = await cases_service.create_case(
+            CaseCreate(
+                summary="Other case",
+                description="Other description",
+                status=CaseStatus.NEW,
+                priority=CasePriority.MEDIUM,
+                severity=CaseSeverity.LOW,
+            )
+        )
+        target_case.case_number = 12345
+        await session.commit()
+        assert target_case.short_id == "CASE-12345"
+
+        params = CursorPaginationParams(limit=20, cursor=None, reverse=False)
+        for term in (
+            str(target_case.id),
+            str(target_case.id).upper(),
+            f"  {target_case.id.hex}  ",
+            "CASE-12345",
+            "case-12345",
+            "12345",
+            "CASE-012345",
+        ):
+            response = await cases_service.search_cases(params=params, search_term=term)
+            result_ids = {item.id for item in response.items}
+            assert result_ids == {target_case.id}, term
+
+        other_response = await cases_service.search_cases(
+            params=params, search_term=f"CASE-{other_case.case_number}"
+        )
+        assert {item.id for item in other_response.items} == {other_case.id}
+
+        overflow_response = await cases_service.search_cases(
+            params=params, search_term="9999999999"
+        )
+        assert overflow_response.items == []
+
+        partial_uuid_response = await cases_service.search_cases(
+            params=params, search_term=str(target_case.id)[:8]
+        )
+        assert target_case.id not in {item.id for item in partial_uuid_response.items}
 
     async def test_get_search_case_aggregates_applies_enum_filters(
         self, cases_service: CasesService, session: AsyncSession
@@ -1475,3 +2770,181 @@ class TestCasesService:
         # Verify the case was NOT created (entire transaction rolled back)
         cases = await _list_cases(cases_service)
         assert len(cases) == 0, "Case should not exist if fields creation failed"
+
+
+@pytest.fixture
+async def exact_search_cases(
+    session: AsyncSession, cases_service: CasesService
+) -> tuple[Case, Case, Case]:
+    """An older exact case and two newer cases mentioning both references."""
+    now = datetime.now(UTC)
+    exact_id = uuid.uuid4()
+    cases = tuple(
+        Case(
+            id=exact_id if number == 42 else uuid.uuid4(),
+            workspace_id=cases_service.workspace_id,
+            case_number=number,
+            summary=(
+                "Synthetic older exact case"
+                if number == 42
+                else f"Synthetic mention CASE-0042 {exact_id}"
+            ),
+            description="Synthetic search fixture",
+            status=CaseStatus.CLOSED if number == 42 else CaseStatus.NEW,
+            priority=CasePriority.LOW,
+            severity=CaseSeverity.LOW,
+            created_at=now - timedelta(days=60 if number == 42 else number - 42),
+            updated_at=now,
+        )
+        for number in (42, 43, 44)
+    )
+    session.add_all(cases)
+    await session.commit()
+    return cases[0], cases[1], cases[2]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reference_type", ["short_id", "uuid"])
+async def test_promoted_exact_case_paginates_before_filtered_mentions(
+    cases_service: CasesService,
+    session: AsyncSession,
+    exact_search_cases: tuple[Case, Case, Case],
+    reference_type: Literal["short_id", "uuid"],
+) -> None:
+    """One-item pages retain all text hits, exact-first ordering and view counts."""
+    exact, first_mention, second_mention = exact_search_cases
+    query = exact.short_id if reference_type == "short_id" else str(exact.id)
+    start_time = datetime.now(UTC) - timedelta(days=30)
+    events_before = list((await session.scalars(select(CaseEvent.id))).all())
+    cursor = None
+    ids = []
+    pages = []
+    for _ in range(3):
+        page = await cases_service.search_cases(
+            CursorPaginationParams(limit=1, cursor=cursor),
+            search_term=query,
+            promote_exact_match=True,
+            start_time=start_time,
+            status=[CaseStatus.NEW],
+            order_by="created_at",
+            sort="desc",
+        )
+        assert len(page.items) == 1
+        assert page.total_estimate == 2
+        ids.append(page.items[0].id)
+        pages.append(page)
+        cursor = page.next_cursor
+    assert ids == [exact.id, first_mention.id, second_mention.id]
+    assert pages[0].items[0].is_exact_match
+    assert pages[0].items[0].is_outside_filters
+    assert all(not page.items[0].is_exact_match for page in pages[1:])
+    assert pages[-1].has_more is False
+    assert cursor is None
+    assert list((await session.scalars(select(CaseEvent.id))).all()) == events_before
+    # Backward navigation reaches the same exact first page.
+    assert pages[1].prev_cursor is not None
+    previous = await cases_service.search_cases(
+        CursorPaginationParams(limit=1, cursor=pages[1].prev_cursor),
+        search_term=query,
+        promote_exact_match=True,
+        start_time=start_time,
+        status=[CaseStatus.NEW],
+        order_by="created_at",
+        sort="desc",
+    )
+    assert [item.id for item in previous.items] == [exact.id]
+
+
+@pytest.mark.anyio
+async def test_promoted_exact_case_is_not_duplicated_or_counted_twice(
+    cases_service: CasesService, exact_search_cases: tuple[Case, Case, Case]
+) -> None:
+    """A case within the filters appears once and keeps the ordinary total."""
+    exact, first, second = exact_search_cases
+    result = await cases_service.search_cases(
+        CursorPaginationParams(limit=10),
+        search_term=exact.short_id,
+        promote_exact_match=True,
+    )
+    assert [item.id for item in result.items] == [exact.id, first.id, second.id]
+    assert result.items[0].is_exact_match
+    assert result.items[0].is_outside_filters is False
+    assert result.total_estimate == 3
+
+
+@pytest.mark.anyio
+async def test_promoted_exact_case_survives_an_empty_ordinary_population(
+    cases_service: CasesService, exact_search_cases: tuple[Case, Case, Case]
+) -> None:
+    """An impossible client filter still allows only the exact case to appear."""
+    exact, _, _ = exact_search_cases
+    result = await cases_service.search_cases(
+        CursorPaginationParams(limit=1),
+        search_term=exact.short_id,
+        promote_exact_match=True,
+        match_none=True,
+    )
+    assert [item.id for item in result.items] == [exact.id]
+    assert result.items[0].is_outside_filters
+    assert result.total_estimate == 0
+    assert result.has_more is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("promote", [False, True])
+async def test_explicit_identity_filters_remain_strict_during_promotion(
+    cases_service: CasesService,
+    exact_search_cases: tuple[Case, Case, Case],
+    promote: bool,
+) -> None:
+    """An explicit identity/relationship query cannot escape supplied filters."""
+    exact, _, _ = exact_search_cases
+    result = await cases_service.search_cases(
+        CursorPaginationParams(limit=10),
+        search_term=exact.short_id,
+        case_id=exact.id,
+        promote_exact_match=promote,
+        status=[CaseStatus.NEW],
+    )
+    assert result.items == []
+
+
+@pytest.mark.anyio
+async def test_numeric_text_does_not_promote_an_old_case(
+    cases_service: CasesService, exact_search_cases: tuple[Case, Case, Case]
+) -> None:
+    """Ambiguous numeric input retains ordinary text and date filtering."""
+    exact, _, _ = exact_search_cases
+    result = await cases_service.search_cases(
+        CursorPaginationParams(limit=10),
+        search_term="42",
+        promote_exact_match=True,
+        start_time=datetime.now(UTC) - timedelta(days=30),
+    )
+    assert exact.id not in {item.id for item in result.items}
+    assert all(not item.is_exact_match for item in result.items)
+
+
+@pytest.mark.anyio
+async def test_promoted_cursor_survives_exact_case_deletion(
+    cases_service: CasesService,
+    session: AsyncSession,
+    exact_search_cases: tuple[Case, Case, Case],
+) -> None:
+    """Deleting the promoted anchor leaves continuation query identity stable."""
+    exact, first, second = exact_search_cases
+    page = await cases_service.search_cases(
+        CursorPaginationParams(limit=1),
+        search_term="CASE-0042",
+        promote_exact_match=True,
+    )
+    assert [item.id for item in page.items] == [exact.id]
+    await session.delete(exact)
+    await session.commit()
+    following = await cases_service.search_cases(
+        CursorPaginationParams(limit=2, cursor=page.next_cursor),
+        search_term="CASE-0042",
+        promote_exact_match=True,
+    )
+    assert [item.id for item in following.items] == [first.id, second.id]
+    assert following.has_more is False

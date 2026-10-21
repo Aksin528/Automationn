@@ -7,6 +7,7 @@ import type { Extension } from "@codemirror/state"
 import { EditorView } from "@codemirror/view"
 import ReactCodeMirror from "@uiw/react-codemirror"
 import { useTheme } from "next-themes"
+import { useMemo } from "react"
 
 import { cn } from "@/lib/utils"
 
@@ -16,8 +17,14 @@ interface CodeEditorProps {
   language?: string
   readOnly?: boolean
   wrapLongLines?: boolean
+  placeholder?: string
+  extensions?: Extension[]
   className?: string
+  /** Called once with the editor view, for callers that drive it directly. */
+  onCreateEditor?: (view: EditorView) => void
 }
+
+const NO_EXTENSIONS: Extension[] = []
 
 function getLanguageExtension(language: string): Extension | null {
   switch (language) {
@@ -39,22 +46,33 @@ export function CodeEditor({
   language = "python",
   readOnly = false,
   wrapLongLines = false,
+  placeholder,
+  extensions: customExtensions = NO_EXTENSIONS,
   className,
+  onCreateEditor,
 }: CodeEditorProps) {
   const { resolvedTheme } = useTheme()
-  const languageExtension = getLanguageExtension(language)
-  const extensions = [
-    ...(languageExtension ? [languageExtension] : []),
-    ...(wrapLongLines ? [EditorView.lineWrapping] : []),
-  ]
+  const codeMirrorTheme = resolvedTheme === "dark" ? "dark" : "light"
+  // A new array reconfigures the editor, so keep it stable for callers that
+  // pass stable extensions.
+  const extensions = useMemo(() => {
+    const languageExtension = getLanguageExtension(language)
+    return [
+      ...(languageExtension ? [languageExtension] : []),
+      ...(wrapLongLines ? [EditorView.lineWrapping] : []),
+      ...customExtensions,
+    ]
+  }, [language, wrapLongLines, customExtensions])
 
   return (
     <ReactCodeMirror
       value={value}
       onChange={onChange}
       extensions={extensions}
+      theme={codeMirrorTheme}
       readOnly={readOnly}
-      theme={resolvedTheme === "dark" ? "dark" : "light"}
+      placeholder={placeholder}
+      onCreateEditor={onCreateEditor}
       className={cn(
         // Ensure the editor and all its tooltips/autocomplete popups are fully rounded and do not stick out
         "max-w-full min-w-0 rounded-md text-xs focus-visible:outline-none",

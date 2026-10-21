@@ -5,8 +5,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import httpx
+import orjson
 import pytest
 from tracecat_registry.sdk.cases import CasesClient
+from tracecat_registry.sdk.client import TracecatClient
 
 
 @pytest.fixture
@@ -24,6 +27,41 @@ def mock_tracecat_client() -> MagicMock:
 def cases_client(mock_tracecat_client: MagicMock) -> CasesClient:
     """Create a CasesClient with mocked HTTP client."""
     return CasesClient(mock_tracecat_client)
+
+
+@pytest.mark.anyio
+async def test_aggregate_cases_uses_exact_gateway_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = {
+        "group_by": [{"field": "fields.amount", "alias": "amount"}],
+        "filters": {"or": [{"field": "fields.region", "op": "is_null"}]},
+        "aggs": [{"function": "count"}],
+    }
+    response = {
+        "groups": [{"amount": "12345678901234567890.123", "count": 2}],
+        "truncated": True,
+    }
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert (
+            str(request.url)
+            == "http://tracecat-action-gateway/internal/cases/aggregate"
+        )
+        assert orjson.loads(request.content) == spec
+        return httpx.Response(200, json=response)
+
+    def create_transport(*, uds: str) -> httpx.MockTransport:
+        assert uds == "/tmp/aggregate-cases-test.sock"
+        return httpx.MockTransport(handle)
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", create_transport)
+    client = TracecatClient(action_gateway_socket="/tmp/aggregate-cases-test.sock")
+    assert await client.cases.aggregate_cases(spec) == response
+    assert len(requests) == 1
 
 
 @pytest.mark.anyio
@@ -211,4 +249,20 @@ async def test_update_comment_simple_only_sends_content(
     mock_tracecat_client.patch.assert_called_once_with(
         "/comments/comment-id/simple",
         json={"content": "Updated content"},
+    )
+
+
+@pytest.mark.anyio
+async def test_list_linked_cases_uses_table_row_path(
+    cases_client: CasesClient, mock_tracecat_client: MagicMock
+) -> None:
+    mock_tracecat_client.get.return_value = {"items": [], "next_cursor": None}
+
+    await cases_client.list_linked_cases(
+        "table-id", "row-id", limit=5, exclude_case_id="CASE-0001", sort="asc"
+    )
+
+    mock_tracecat_client.get.assert_called_once_with(
+        "/tables/table-id/rows/row-id/cases",
+        params={"limit": 5, "sort": "asc", "exclude_case_id": "CASE-0001"},
     )

@@ -31,6 +31,37 @@ from tracecat.storage.exceptions import (
 )
 
 
+def _normalize_mime_type(mime_type: str) -> str:
+    """Normalize a MIME type to its base form (lowercased, parameters stripped)."""
+    if not mime_type:
+        return ""
+    return mime_type.split(";", 1)[0].strip().lower()
+
+
+def mime_equivalence_key(mime_type: str) -> str:
+    """Compute a normalized equivalence key for related MIME type variants.
+
+    Args:
+        mime_type: The MIME type to normalize and canonicalize.
+
+    Returns:
+        A MIME type key with parameters stripped, case normalized, a single
+        leading experimental subtype prefix removed, and a trailing compressed
+        qualifier removed.
+    """
+    base = _normalize_mime_type(mime_type)
+    if "/" not in base:
+        return base
+    type_part, sub = base.split("/", 1)
+    # remove leading experimental prefix
+    if sub.startswith("x-"):
+        sub = sub[2:]
+    # strip trailing qualifier commonly seen in legacy types
+    if sub.endswith("-compressed"):
+        sub = sub[: -len("-compressed")]
+    return f"{type_part}/{sub}"
+
+
 class FileValidationResult(BaseModel):
     """Result of file validation."""
 
@@ -83,7 +114,7 @@ class FileSecurityValidator:
         # Validate extension
         self._validate_extension(filename)
         # Validate MIME type
-        normalized_mime = self._normalize_mime_type(declared_mime_type)
+        normalized_mime = _normalize_mime_type(declared_mime_type)
         self._validate_mime_type(normalized_mime)
         # Polyfile magic number check (if enabled)
         if self.validate_magic_number:
@@ -179,11 +210,11 @@ class FileSecurityValidator:
 
     def _validate_mime_type(self, mime_type: str) -> bool:
         """Validate MIME type (normalized to base type)."""
-        base_mime = self._normalize_mime_type(mime_type)
+        base_mime = _normalize_mime_type(mime_type)
         allowed = {t.lower() for t in self.allowed_mime_types}
         # Use equivalence keys to handle common vendor/legacy prefixes consistently
-        allowed_equiv = {self._mime_equivalence_key(t) for t in allowed}
-        if self._mime_equivalence_key(base_mime) not in allowed_equiv:
+        allowed_equiv = {mime_equivalence_key(t) for t in allowed}
+        if mime_equivalence_key(base_mime) not in allowed_equiv:
             logger.error(f"File MIME type {mime_type} is not allowed")
             raise FileMimeTypeError(
                 f"File MIME type {mime_type} is not allowed",
@@ -195,8 +226,9 @@ class FileSecurityValidator:
     def _validate_magic_number(self, content: bytes, declared_mime_type: str) -> bool:
         """Validate file type via polyfile magic matching with generic errors.
 
-        We trust polyfile's detection and intentionally avoid custom fallbacks
-        or leaking detailed types in error messages.
+        We trust polyfile's detection and intentionally avoid custom fallbacks.
+        Type errors report the declared and detected MIME types so callers can
+        see why their content was rejected.
         """
         if not content:
             # Generic user-facing message
@@ -213,9 +245,9 @@ class FileSecurityValidator:
                 if mimetypes:
                     for mt in mimetypes:
                         if mt:
-                            base = self._normalize_mime_type(mt)
+                            base = _normalize_mime_type(mt)
                             detected_types.add(base)
-                            detected_equiv.add(self._mime_equivalence_key(base))
+                            detected_equiv.add(mime_equivalence_key(base))
         except Exception as e:
             # Keep messages generic for user-facing responses
             logger.error("Unknown or unsupported file type")
@@ -225,8 +257,8 @@ class FileSecurityValidator:
             logger.error("Unknown or unsupported file type")
             raise FileContentMismatchError("Unknown or unsupported file type")
 
-        declared_base = self._normalize_mime_type(declared_mime_type)
-        declared_key = self._mime_equivalence_key(declared_base)
+        declared_base = _normalize_mime_type(declared_mime_type)
+        declared_key = mime_equivalence_key(declared_base)
         if declared_key not in detected_equiv:
             # Keep message generic for users
             logger.error(
@@ -234,18 +266,22 @@ class FileSecurityValidator:
                 declared_mime_type=declared_base,
                 detected_types=list(detected_types),
             )
+            detected = sorted(detected_types)
             raise FileMimeTypeError(
-                "Unknown or unsupported file type",
+                f"File content does not match declared MIME type {declared_base} "
+                f"(detected: {', '.join(detected)})",
                 declared_base,
                 self.allowed_mime_types,
+                detected_types=detected,
             )
 
         allowed = {t.lower() for t in self.allowed_mime_types}
-        allowed_equiv = {self._mime_equivalence_key(t) for t in allowed}
+        allowed_equiv = {mime_equivalence_key(t) for t in allowed}
         if detected_equiv & allowed_equiv:
             return True
 
-        representative = next(iter(detected_types))
+        detected = sorted(detected_types)
+        representative = detected[0]
         logger.error(
             "Detected MIME type is not allowed",
             declared_mime_type=declared_base,
@@ -253,39 +289,11 @@ class FileSecurityValidator:
             allowed_types=self.allowed_mime_types,
         )
         raise FileMimeTypeError(
-            "Unknown or unsupported file type",
+            f"Detected MIME type {', '.join(detected)} is not allowed",
             representative,
             self.allowed_mime_types,
+            detected_types=detected,
         )
-
-    @staticmethod
-    def _normalize_mime_type(mime_type: str) -> str:
-        """Normalize a MIME type to its base form (lowercased, parameters stripped)."""
-        if not mime_type:
-            return ""
-        return mime_type.split(";", 1)[0].strip().lower()
-
-    @staticmethod
-    def _mime_equivalence_key(mime_type: str) -> str:
-        """Compute an equivalence key for MIME types to compare related variants consistently.
-
-        Strategy:
-        - Lowercase, strip parameters first (callers pass normalized base).
-        - For subtype, remove a single leading "x-" (experimental prefix).
-        - Remove a trailing "-compressed" qualifier.
-        This avoids one-off mappings while handling common vendor variants consistently.
-        """
-        base = FileSecurityValidator._normalize_mime_type(mime_type)
-        if "/" not in base:
-            return base
-        type_part, sub = base.split("/", 1)
-        # remove leading experimental prefix
-        if sub.startswith("x-"):
-            sub = sub[2:]
-        # strip trailing qualifier commonly seen in legacy types
-        if sub.endswith("-compressed"):
-            sub = sub[: -len("-compressed")]
-        return f"{type_part}/{sub}"
 
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename to prevent security issues while preserving user-provided names.

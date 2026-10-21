@@ -1,6 +1,5 @@
 "use client"
 
-import { useQuery, useQueryClient } from "@tanstack/react-query"
 import Cookies from "js-cookie"
 import { useRouter } from "next/navigation"
 import { useCallback } from "react"
@@ -13,6 +12,7 @@ import {
 } from "@/client"
 import { authConfig } from "@/config/auth"
 import { getCurrentUser, User } from "@/lib/auth"
+import { useQuery, useQueryClient } from "@/lib/query"
 
 /* ── AUTH ACTIONS HOOK ─────────────────────────────────────────────────── */
 
@@ -35,6 +35,9 @@ export function useAuthActions() {
     async (redirectUrl?: string) => {
       const logoutResponse = await authAuthDatabaseLogout()
       Cookies.remove("tracecat:active-org-id")
+      // Clear the legacy literal name as well as js-cookie's encoded name.
+      document.cookie =
+        "tracecat:active-org-id=; Path=/; Max-Age=0; SameSite=Lax"
       await queryClient.invalidateQueries({
         queryKey: ["auth"],
       })

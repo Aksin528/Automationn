@@ -1,13 +1,10 @@
 import base64
-import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-import temporalio.service
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 from sqlalchemy import or_, select
-from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from temporalio.client import WorkflowExecution
 
@@ -22,15 +19,13 @@ from tracecat.auth.dependencies import (
 from tracecat.auth.types import Role
 from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
-from tracecat.db.models import Workflow, WorkflowDefinition
+from tracecat.db.models import Workflow
 from tracecat.dsl.common import (
     DSLInput,
     get_execution_type_from_search_attr,
     get_trigger_type_from_search_attr,
 )
-from tracecat.ee.interactions.schemas import InteractionRead
-from tracecat.ee.interactions.service import ApprovalVoteResult, InteractionService
-from tracecat.exceptions import TracecatValidationError
+from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
 from tracecat.identifiers import UserID
 from tracecat.identifiers.workflow import (
     AnyWorkflowIDPath,
@@ -42,6 +37,10 @@ from tracecat.identifiers.workflow import (
     exec_id_to_parts,
 )
 from tracecat.logger import logger
+from tracecat.observability.otel import (
+    current_trace_id,
+    set_current_span_attributes,
+)
 from tracecat.pagination import CursorPaginatedResponse, CursorPaginationParams
 from tracecat.registry.lock.types import RegistryLock
 from tracecat.settings.service import get_setting
@@ -63,6 +62,11 @@ from tracecat.workflow.executions.enums import (
     ExecutionType,
     TemporalSearchAttr,
     TriggerType,
+)
+from tracecat.workflow.executions.rerun import (
+    WorkflowRerunPlan,
+    WorkflowRerunRequest,
+    WorkflowRerunResponse,
 )
 from tracecat.workflow.executions.schemas import (
     WorkflowExecutionBulkResetRequest,
@@ -94,6 +98,7 @@ from tracecat.workflow.executions.service import (
     WorkflowExecutionResultNotFoundError,
     WorkflowExecutionsService,
 )
+from tracecat.workflow.management.definitions import WorkflowDefinitionsService
 from tracecat.workflow.management.management import WorkflowsManagementService
 
 router = APIRouter(prefix="/workflow-executions", tags=["workflow-executions"])
@@ -261,79 +266,6 @@ async def _external_preview_response(
         truncated=ref.size_bytes > preview_size,
         encoding=encoding,
     )
-
-
-async def _list_interactions(
-    session: AsyncSession,
-    execution_id: UnquotedExecutionID,
-) -> list[InteractionRead]:
-    if await get_setting("app_interactions_enabled", default=False):
-        svc = InteractionService(session=session)
-        interactions = await svc.list_interactions(wf_exec_id=execution_id)
-        return [
-            InteractionRead(
-                id=interaction.id,
-                wf_exec_id=interaction.wf_exec_id,
-                type=interaction.type,
-                status=interaction.status,
-                request_payload=interaction.request_payload,
-                response_payload=interaction.response_payload,
-                expires_at=interaction.expires_at,
-                created_at=interaction.created_at,
-                updated_at=interaction.updated_at,
-                actor=interaction.actor,
-                action_ref=interaction.action_ref,
-                action_type=interaction.action_type,
-            )
-            for interaction in interactions
-        ]
-    else:
-        logger.debug("Interactions are disabled, skipping interaction states")
-        return []
-
-
-class ApprovalVoteRequest(BaseModel):
-    decision: Literal["approve", "reject"]
-    comment: str | None = None
-
-
-@router.post("/{execution_id:path}/interactions/{interaction_id}/votes")
-@require_scope("workflow:execute")
-async def vote_on_interaction(
-    role: WorkspaceUserRouteRole,
-    session: AsyncDBSession,
-    execution_id: UnquotedExecutionID,
-    interaction_id: uuid.UUID,
-    params: ApprovalVoteRequest,
-) -> ApprovalVoteResult:
-    """Cast an authenticated in-app approve/reject vote on a pending approval interaction."""
-    if not await get_setting("app_interactions_enabled", default=False):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Interactions are disabled for this organization.",
-        )
-    svc = InteractionService(session=session, role=role)
-    interaction = await svc.get_interaction(interaction_id)
-    if interaction is None or interaction.wf_exec_id != execution_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Interaction not found"
-        )
-    if role.user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Voting requires an authenticated user.",
-        )
-    try:
-        return await svc.record_vote(
-            interaction,
-            user_id=role.user_id,
-            decision=params.decision,
-            comment=params.comment,
-        )
-    except TracecatValidationError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
-        ) from e
 
 
 def _normalize_search_term(search_term: str | None) -> str | None:
@@ -631,6 +563,68 @@ async def reset_workflow_execution(
     )
 
 
+async def _rerun_workflow_execution(
+    role: WorkspaceActorRouteRole,
+    execution_id: WorkflowExecutionID,
+    params: WorkflowRerunRequest,
+    *,
+    dry_run: bool,
+) -> WorkflowRerunPlan | WorkflowRerunResponse:
+    try:
+        async with WorkflowsManagementService.with_session(role=role) as service:
+            return await service.rerun_workflow_execution(
+                execution_id,
+                use_draft=params.use_draft,
+                version=params.version,
+                fixed_action_refs=params.fixed_action_refs,
+                rerun_from_ref=params.rerun_from_ref,
+                dry_run=dry_run,
+            )
+    except TracecatNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "type": "TracecatValidationError",
+                "message": str(e),
+                "detail": e.detail,
+            },
+        ) from e
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
+
+
+@router.post("/{execution_id:path}/rerun/preview")
+@require_scope("workflow:execute")
+async def preview_workflow_execution_rerun(
+    role: WorkspaceActorRouteRole,
+    execution_id: UnquotedExecutionID,
+    params: WorkflowRerunRequest,
+) -> WorkflowRerunPlan:
+    """Match a past run's successful action results against a rerun target."""
+    plan = await _rerun_workflow_execution(role, execution_id, params, dry_run=True)
+    assert isinstance(plan, WorkflowRerunPlan)
+    return plan
+
+
+@router.post("/{execution_id:path}/rerun")
+@require_scope("workflow:execute")
+async def rerun_workflow_execution(
+    role: WorkspaceActorRouteRole,
+    execution_id: UnquotedExecutionID,
+    params: WorkflowRerunRequest,
+) -> WorkflowRerunResponse:
+    """Rerun a past run, reusing results of its successful actions."""
+    response = await _rerun_workflow_execution(
+        role, execution_id, params, dry_run=False
+    )
+    assert isinstance(response, WorkflowRerunResponse)
+    return response
+
+
 @router.post("/reset/bulk")
 @require_scope("workflow:terminate")
 async def bulk_reset_workflow_executions(
@@ -662,7 +656,6 @@ async def _get_workflow_execution_response(
         )
     logger.debug("Getting workflow execution events", execution_id=execution.id)
     events = await service.list_workflow_execution_events(execution.id)
-    interactions = await _list_interactions(session, execution.id)
     return WorkflowExecutionRead(
         id=execution.id,
         run_id=execution.run_id,
@@ -674,7 +667,6 @@ async def _get_workflow_execution_response(
         task_queue=execution.task_queue,
         history_length=execution.history_length,
         events=events,
-        interactions=interactions,
         trigger_type=get_trigger_type_from_search_attr(
             execution.typed_search_attributes, execution.id
         ),
@@ -762,7 +754,6 @@ async def get_workflow_execution_compact(
             except Exception as e:
                 logger.error("Error transforming AgentOutput to UIMessages", error=e)
 
-    interactions = await _list_interactions(session, execution_id)
     return WorkflowExecutionReadCompact(
         id=execution.id,
         parent_wf_exec_id=execution.parent_id,
@@ -775,7 +766,6 @@ async def get_workflow_execution_compact(
         task_queue=execution.task_queue,
         history_length=execution.history_length,
         events=compact_events,
-        interactions=interactions,
         trigger_type=get_trigger_type_from_search_attr(
             execution.typed_search_attributes, execution.id
         ),
@@ -1038,6 +1028,24 @@ async def get_workflow_execution_collection_page(
     )
 
 
+def _annotate_execution_trace(
+    role: Role, response: WorkflowExecutionCreateResponse
+) -> None:
+    """Correlate the request span with the execution it started and hand the
+    caller a reference for opening that trace."""
+    set_current_span_attributes(
+        {
+            "tracecat.organization.id": role.organization_id,
+            "tracecat.workspace.id": role.workspace_id,
+            "tracecat.workflow.id": response["wf_id"],
+            "tracecat.workflow.execution.id": response["wf_exec_id"],
+            "tracecat.trigger.type": TriggerType.MANUAL,
+        }
+    )
+    if trace_id := current_trace_id():
+        response["trace_id"] = trace_id
+
+
 @router.post("")
 @require_scope("workflow:execute")
 async def create_workflow_execution(
@@ -1046,26 +1054,22 @@ async def create_workflow_execution(
     session: AsyncDBSession,
 ) -> WorkflowExecutionCreateResponse:
     """Create and schedule a workflow execution."""
-    service = await WorkflowExecutionsService.connect(role=role)
-    # Get the dslinput from the workflow definition
+    # Get the dslinput from the workflow definition scoped to the caller's
+    # workspace. The request body workflow_id is user-controlled, so a raw lookup
+    # by workflow_id would allow one workspace to execute another's workflow.
     wf_id = WorkflowUUID.new(params.workflow_id)
-    try:
-        result = await session.execute(
-            select(WorkflowDefinition)
-            .where(WorkflowDefinition.workflow_id == wf_id)
-            .order_by(WorkflowDefinition.version.desc())
-        )
-        defn = result.scalars().first()
-        if not defn:
-            raise NoResultFound("No workflow definition found for workflow ID")
-    except NoResultFound as e:
-        # No workflow associated with the webhook
-        logger.opt(exception=e).error("Invalid workflow ID", error=e)
+    defn_service = WorkflowDefinitionsService(session, role=role)
+    defn = await defn_service.get_definition_by_workflow_id(
+        wf_id, load_relationships=False
+    )
+    if not defn:
+        logger.error("Invalid workflow ID", workflow_id=wf_id)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Invalid workflow ID"
-        ) from e
+        )
     dsl_input = DSLInput(**defn.content)
     try:
+        service = await WorkflowExecutionsService.connect(role=role)
         response = service.create_workflow_execution_nowait(
             dsl=dsl_input,
             wf_id=wf_id,
@@ -1078,6 +1082,7 @@ async def create_workflow_execution(
                 else None
             ),
         )
+        _annotate_execution_trace(role, response)
         return response
     except TracecatValidationError as e:
         raise HTTPException(
@@ -1115,6 +1120,9 @@ async def create_draft_workflow_execution(
             )
         try:
             dsl_input = await mgmt_service.build_dsl_from_workflow(workflow)
+            fixed_action_results = await mgmt_service.locked_action_results(
+                wf_id, dsl_input
+            )
         except TracecatValidationError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1152,7 +1160,9 @@ async def create_draft_workflow_execution(
             payload=params.inputs,
             time_anchor=params.time_anchor,
             # For draft workflow executions, pass None to dynamically resolve the registry lock
+            fixed_action_results=fixed_action_results,
         )
+        _annotate_execution_trace(role, response)
         return response
     except TracecatValidationError as e:
         raise HTTPException(
@@ -1183,14 +1193,6 @@ async def cancel_workflow_execution(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         ) from e
-    except temporalio.service.RPCError as e:
-        if "workflow execution already completed" in e.message:
-            logger.info(
-                "Workflow execution already completed, ignoring cancellation request",
-            )
-        else:
-            logger.error(e.message, error=e, execution_id=execution_id)
-            raise e
 
 
 @router.post(
@@ -1212,11 +1214,3 @@ async def terminate_workflow_execution(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         ) from e
-    except temporalio.service.RPCError as e:
-        if "workflow execution already completed" in e.message:
-            logger.info(
-                "Workflow execution already completed, ignoring termination request",
-            )
-        else:
-            logger.error(e.message, error=e, execution_id=execution_id)
-            raise e

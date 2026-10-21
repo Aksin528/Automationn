@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
 import orjson
 from pydantic import Discriminator, TypeAdapter
-from pydantic_ai.messages import AgentStreamEvent, ModelMessage, ModelResponse, TextPart
 
 from tracecat.agent.common.stream_types import UnifiedStreamEvent
 
 UnifiedStreamEventTA: TypeAdapter[UnifiedStreamEvent] = TypeAdapter(UnifiedStreamEvent)
-AgentStreamEventTA: TypeAdapter[AgentStreamEvent] = TypeAdapter(AgentStreamEvent)
 
 
 @dataclass(slots=True, kw_only=True)
@@ -19,28 +18,42 @@ class StreamDelta:
 
     kind: Literal["event"] = "event"
     id: str
-    event: UnifiedStreamEvent | AgentStreamEvent
+    event: UnifiedStreamEvent
 
     def sse(self) -> str:
         return f"id: {self.id}\nevent: delta\ndata: {orjson.dumps(self.event).decode()}\n\n"
 
 
 @dataclass(slots=True, kw_only=True)
-class StreamMessage:
-    """Container for Redis stream payloads and adapter errors."""
+class StreamSessionEvent:
+    """An event addressed to a child session, carried on the parent's stream.
 
-    kind: Literal["message"] = "message"
+    Child events are rendered separately from the root transcript and must never
+    be merged into it.
+    """
+
+    kind: Literal["session-event"] = "session-event"
     id: str
-    message: ModelMessage
+    """Redis entry id of the envelope on the parent's stream."""
+    session_id: uuid.UUID
+    """The child session the event belongs to."""
+    event_id: str
+    """Runtime-assigned stable id for the event, used for client dedupe."""
+    event: UnifiedStreamEvent
 
     def sse(self) -> str:
-        return f"id: {self.id}\nevent: message\ndata: {orjson.dumps(self.message).decode()}\n\n"
+        payload = orjson.dumps(
+            {
+                "session_id": str(self.session_id),
+                "event_id": self.event_id,
+                "event": self.event,
+            }
+        ).decode()
+        return f"id: {self.id}\nevent: session-event\ndata: {payload}\n\n"
 
 
 @dataclass(slots=True, kw_only=True)
 class StreamConnected:
-    """Container for Redis stream payloads and adapter errors."""
-
     kind: Literal["connected"] = "connected"
     id: str
 
@@ -75,12 +88,6 @@ class StreamError:
     def format(err_msg: str) -> str:
         return f"The agent could not complete the request: {err_msg.strip()}"
 
-    @staticmethod
-    def model_response(err_msg: str) -> ModelResponse:
-        return ModelResponse(
-            parts=[TextPart(content=StreamError.format(err_msg))], finish_reason="error"
-        )
-
 
 @dataclass(slots=True, kw_only=True)
 class StreamKeepAlive:
@@ -94,7 +101,12 @@ class StreamKeepAlive:
 
 
 type StreamEvent = Annotated[
-    StreamDelta | StreamMessage | StreamEnd | StreamError | StreamKeepAlive,
+    StreamDelta
+    | StreamSessionEvent
+    | StreamConnected
+    | StreamEnd
+    | StreamError
+    | StreamKeepAlive,
     Discriminator("kind"),
 ]
 

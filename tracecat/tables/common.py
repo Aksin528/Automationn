@@ -11,8 +11,69 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from tracecat.tables.enums import SqlType
 
+INTERNAL_COLUMN_PREFIX = "__tc_"
 POSTGRES_BIGINT_MIN = -(2**63)
 POSTGRES_BIGINT_MAX = 2**63 - 1
+
+
+def sanitize_identifier(identifier: str) -> str:
+    """Normalize a stored identifier to its physical SQL name."""
+    sanitized = "".join(c for c in identifier if c.isalnum() or c == "_")
+    if not sanitized:
+        raise ValueError("Identifier must contain at least one letter")
+    if not (sanitized[0].isalpha() or sanitized[0] == "_"):
+        raise ValueError("Identifier must start with a letter or underscore")
+    return sanitized.lower()
+
+
+def quote_identifier(identifier: str) -> str:
+    """Double-quote a SQL identifier for safe use in DDL statements.
+
+    Prevents syntax errors when identifier names collide with SQL reserved
+    keywords (e.g. ``select``, ``order``, ``group``).  Safe to use because
+    all callers pass values already restricted to ``[a-zA-Z0-9_]`` by
+    ``validate_identifier`` / ``sanitize_identifier``.
+    """
+    return f'"{identifier}"'
+
+
+def is_internal_column_name(column_name: str) -> bool:
+    """Check whether a column is internal/system-managed for dynamic schemas."""
+    return column_name.lower().startswith(INTERNAL_COLUMN_PREFIX)
+
+
+def validate_identifier(identifier: str) -> str:
+    """Validate an external identifier before using it in DDL operations."""
+    if not identifier:
+        raise ValueError("Identifier must contain at least one letter")
+    if not all(c.isalnum() or c == "_" for c in identifier):
+        raise ValueError(
+            "Identifier must contain only letters, numbers, and underscores"
+        )
+    if not (identifier[0].isalpha() or identifier[0] == "_"):
+        raise ValueError("Identifier must start with a letter or underscore")
+    return identifier.lower()
+
+
+def sa_type_for_column(sql_type: SqlType) -> sa.types.TypeEngine[Any]:
+    """Map SqlType to the SQLAlchemy type of the physical column."""
+    match sql_type:
+        case SqlType.TEXT | SqlType.SELECT:
+            return sa.String()
+        case SqlType.INTEGER:
+            return sa.BigInteger()
+        case SqlType.NUMERIC:
+            return sa.Numeric()
+        case SqlType.DATE:
+            return sa.Date()
+        case SqlType.BOOLEAN:
+            return sa.Boolean()
+        case SqlType.TIMESTAMPTZ:
+            return sa.TIMESTAMP(timezone=True)
+        case SqlType.JSONB | SqlType.MULTI_SELECT:
+            return JSONB()
+        case _:
+            return sa.String()
 
 
 def is_valid_sql_type(type: str | SqlType) -> bool:
@@ -91,6 +152,11 @@ class InvalidDefaultValueError(ValueError):
     """Raised when a user-provided table default cannot be coerced safely."""
 
 
+class ColumnHasDuplicateValuesError(Exception):
+    """Raised when a unique index cannot be created because the column already
+    contains duplicate values."""
+
+
 def coerce_integer_value(value: Any) -> int:
     """Coerce a user value to a safe PostgreSQL BIGINT."""
     try:
@@ -117,6 +183,17 @@ def coerce_numeric_value(value: Any) -> Decimal:
     if not decimal_value.is_finite():
         raise ValueError(f"Invalid numeric value: {value!r}")
     return decimal_value
+
+
+def coerce_boolean_value(value: Any) -> bool:
+    """Normalize booleans, 0/1, and their case-insensitive string forms."""
+    match str(value).lower():
+        case "true" | "1":
+            return True
+        case "false" | "0":
+            return False
+        case _:
+            raise TypeError("Expected a boolean, 0/1, or a string true/false/0/1")
 
 
 def _compile_sql_literal(value: Any, sql_type: sa.types.TypeEngine) -> str:
@@ -260,7 +337,8 @@ def to_sql_clause(value: Any, name: str, sql_type: SqlType) -> sa.BindParameter:
         case SqlType.JSONB:
             return sa.bindparam(key=name, value=value, type_=JSONB)
         case SqlType.TEXT:
-            return sa.bindparam(key=name, value=str(value), type_=sa.String)
+            coerced = None if value is None else str(value)
+            return sa.bindparam(key=name, value=coerced, type_=sa.String)
         case SqlType.DATE:
             coerced = coerce_optional_to_date(value)
             return sa.bindparam(key=name, value=coerced, type_=sa.Date)
@@ -270,17 +348,9 @@ def to_sql_clause(value: Any, name: str, sql_type: SqlType) -> sa.BindParameter:
                 key=name, value=coerced, type_=sa.TIMESTAMP(timezone=True)
             )
         case SqlType.BOOLEAN:
-            # Allow bool, 1, 0 as valid boolean values
-            match str(value).lower():
-                case "true" | "1":
-                    bool_value = True
-                case "false" | "0":
-                    bool_value = False
-                case _:
-                    raise TypeError(
-                        f"Expected bool or 0/1, got {type(value).__name__}: {value}"
-                    )
-            return sa.bindparam(key=name, value=bool_value, type_=sa.Boolean)
+            return sa.bindparam(
+                key=name, value=coerce_boolean_value(value), type_=sa.Boolean
+            )
         case SqlType.INTEGER:
             coerced = None if value is None else coerce_integer_value(value)
             return sa.bindparam(key=name, value=coerced, type_=sa.BigInteger)

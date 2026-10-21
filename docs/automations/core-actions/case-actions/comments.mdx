@@ -12,7 +12,7 @@ Add a comment to an existing case.
 
 <ParamField path="case_id" type="string" required>
 
-The ID of the case to comment on.
+The ID or short ID (e.g. CASE-0042) of the case to comment on.
 
 </ParamField>
 
@@ -40,7 +40,7 @@ Default: `null`.
 
 ### Examples
 
-**Manage case comments**
+**Create a comment**
 
 ```yaml
 - ref: create_comment
@@ -48,35 +48,6 @@ Default: `null`.
   args:
     case_id: ${{ TRIGGER.case_id }}
     content: "Initial triage started."
-- ref: reply_to_comment
-  action: core.cases.reply_to_comment
-  depends_on:
-    - create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    parent_comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Added IOC context."
-- ref: update_comment
-  action: core.cases.update_comment
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Initial triage started. Waiting on endpoint data."
-- ref: list_comments
-  action: core.cases.list_comments
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: list_comment_threads
-  action: core.cases.list_comment_threads
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: get_comment_thread
-  action: core.cases.get_comment_thread
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
 ```
 
 ## `core.cases.reply_to_comment`
@@ -87,7 +58,7 @@ Reply to a top-level case comment.
 
 <ParamField path="case_id" type="string" required>
 
-The ID of the case containing the parent comment.
+The ID or short ID (e.g. CASE-0042) of the case containing the parent comment.
 
 </ParamField>
 
@@ -105,43 +76,15 @@ The ID of the top-level comment to reply to.
 
 ### Examples
 
-**Manage case comments**
+**Reply to a comment**
 
 ```yaml
-- ref: create_comment
-  action: core.cases.create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    content: "Initial triage started."
 - ref: reply_to_comment
   action: core.cases.reply_to_comment
-  depends_on:
-    - create_comment
   args:
     case_id: ${{ TRIGGER.case_id }}
-    parent_comment_id: ${{ ACTIONS.create_comment.result.id }}
+    parent_comment_id: ${{ TRIGGER.comment_id }}
     content: "Added IOC context."
-- ref: update_comment
-  action: core.cases.update_comment
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Initial triage started. Waiting on endpoint data."
-- ref: list_comments
-  action: core.cases.list_comments
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: list_comment_threads
-  action: core.cases.list_comment_threads
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: get_comment_thread
-  action: core.cases.get_comment_thread
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
 ```
 
 ## `core.cases.update_comment`
@@ -164,43 +107,14 @@ The updated comment content.
 
 ### Examples
 
-**Manage case comments**
+**Update a comment**
 
 ```yaml
-- ref: create_comment
-  action: core.cases.create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    content: "Initial triage started."
-- ref: reply_to_comment
-  action: core.cases.reply_to_comment
-  depends_on:
-    - create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    parent_comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Added IOC context."
 - ref: update_comment
   action: core.cases.update_comment
-  depends_on:
-    - create_comment
   args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
+    comment_id: ${{ TRIGGER.comment_id }}
     content: "Initial triage started. Waiting on endpoint data."
-- ref: list_comments
-  action: core.cases.list_comments
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: list_comment_threads
-  action: core.cases.list_comment_threads
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: get_comment_thread
-  action: core.cases.get_comment_thread
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
 ```
 
 ## `core.cases.list_comments`
@@ -211,49 +125,19 @@ List all comments for a case.
 
 <ParamField path="case_id" type="string" required>
 
-The ID of the case to get comments for.
+The ID or short ID (e.g. CASE-0042) of the case to get comments for.
 
 </ParamField>
 
 ### Examples
 
-**Manage case comments**
+**List comments**
 
 ```yaml
-- ref: create_comment
-  action: core.cases.create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    content: "Initial triage started."
-- ref: reply_to_comment
-  action: core.cases.reply_to_comment
-  depends_on:
-    - create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    parent_comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Added IOC context."
-- ref: update_comment
-  action: core.cases.update_comment
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Initial triage started. Waiting on endpoint data."
 - ref: list_comments
   action: core.cases.list_comments
   args:
     case_id: ${{ TRIGGER.case_id }}
-- ref: list_comment_threads
-  action: core.cases.list_comment_threads
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: get_comment_thread
-  action: core.cases.get_comment_thread
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
 ```
 
 ## `core.cases.list_comment_threads`
@@ -264,49 +148,19 @@ List comment threads for a case.
 
 <ParamField path="case_id" type="string" required>
 
-The ID of the case to get comment threads for.
+The ID or short ID (e.g. CASE-0042) of the case to get comment threads for.
 
 </ParamField>
 
 ### Examples
 
-**Manage case comments**
+**List comment threads**
 
 ```yaml
-- ref: create_comment
-  action: core.cases.create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    content: "Initial triage started."
-- ref: reply_to_comment
-  action: core.cases.reply_to_comment
-  depends_on:
-    - create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    parent_comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Added IOC context."
-- ref: update_comment
-  action: core.cases.update_comment
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Initial triage started. Waiting on endpoint data."
-- ref: list_comments
-  action: core.cases.list_comments
-  args:
-    case_id: ${{ TRIGGER.case_id }}
 - ref: list_comment_threads
   action: core.cases.list_comment_threads
   args:
     case_id: ${{ TRIGGER.case_id }}
-- ref: get_comment_thread
-  action: core.cases.get_comment_thread
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
 ```
 
 ## `core.cases.get_comment_thread`
@@ -323,41 +177,11 @@ The ID of a comment within the thread.
 
 ### Examples
 
-**Manage case comments**
+**Get a comment thread**
 
 ```yaml
-- ref: create_comment
-  action: core.cases.create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    content: "Initial triage started."
-- ref: reply_to_comment
-  action: core.cases.reply_to_comment
-  depends_on:
-    - create_comment
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-    parent_comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Added IOC context."
-- ref: update_comment
-  action: core.cases.update_comment
-  depends_on:
-    - create_comment
-  args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
-    content: "Initial triage started. Waiting on endpoint data."
-- ref: list_comments
-  action: core.cases.list_comments
-  args:
-    case_id: ${{ TRIGGER.case_id }}
-- ref: list_comment_threads
-  action: core.cases.list_comment_threads
-  args:
-    case_id: ${{ TRIGGER.case_id }}
 - ref: get_comment_thread
   action: core.cases.get_comment_thread
-  depends_on:
-    - create_comment
   args:
-    comment_id: ${{ ACTIONS.create_comment.result.id }}
+    comment_id: ${{ TRIGGER.comment_id }}
 ```

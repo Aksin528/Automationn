@@ -1,17 +1,19 @@
 import type { LucideIcon } from "lucide-react"
 import {
   BlocksIcon,
-  BotIcon,
   BoxIcon,
   DatabaseIcon,
+  GitBranch,
   LayersIcon,
+  MousePointerClickIcon,
   PlusIcon,
   SparklesIcon,
   SquareFunctionIcon,
   Table2Icon,
   WorkflowIcon,
 } from "lucide-react"
-import { useCallback, useMemo, useState } from "react"
+import type { ReactNode } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import type { RegistryActionReadMinimal } from "@/client"
 import { getIcon } from "@/components/icons"
 import { LockedFeatureModal } from "@/components/locked-feature-modal"
@@ -24,6 +26,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command"
+import { Kbd } from "@/components/ui/kbd"
 import {
   Popover,
   PopoverContent,
@@ -35,7 +38,12 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
+import {
+  TOGGLE_CONDITIONS_SHORTCUT,
+  useRunIfDisplay,
+} from "@/hooks/use-run-if-display"
 import { useBuilderRegistryActions } from "@/lib/hooks"
+import { parseShortcutKeys } from "@/lib/tiptap-utils"
 import { cn } from "@/lib/utils"
 
 interface ActionCategory {
@@ -67,7 +75,7 @@ const ACTION_CATEGORIES: ActionCategory[] = [
     id: "agent",
     label: "Agent",
     namespace: "ai",
-    icon: BotIcon,
+    icon: MousePointerClickIcon,
     align: "center",
   },
   {
@@ -277,11 +285,14 @@ export interface CanvasToolbarProps {
    * full category bar on hover (used in the embedded workflow artifact).
    */
   embedded?: boolean
+  /** Extra controls rendered after the action categories, behind a divider. */
+  trailing?: ReactNode
 }
 
 export function CanvasToolbar({
   onAddAction,
   embedded = false,
+  trailing,
 }: CanvasToolbarProps) {
   const { registryActions, registryActionsIsLoading } =
     useBuilderRegistryActions({ includeLocked: true })
@@ -359,6 +370,12 @@ export function CanvasToolbar({
           />
         )
       })}
+      {trailing && (
+        <>
+          <div className="mx-0.5 h-5 w-px bg-border" />
+          {trailing}
+        </>
+      )}
     </div>
   )
 
@@ -411,6 +428,63 @@ interface ToolbarCategoryDropdownProps {
   onOpenChange?: (open: boolean) => void
 }
 
+/**
+ * Toolbar toggle that shows or hides every `run_if` condition on the canvas,
+ * also bound to the {@link TOGGLE_CONDITIONS_SHORTCUT} keyboard shortcut.
+ */
+export function ToggleConditionsButton() {
+  const { showAll, toggleShowAll } = useRunIfDisplay()
+  const shortcutKeys = useMemo(
+    () => parseShortcutKeys({ shortcutKeys: TOGGLE_CONDITIONS_SHORTCUT }),
+    []
+  )
+  const label = showAll ? "Hide all conditions" : "Show all conditions"
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey) || event.repeat) {
+        return
+      }
+      if (event.key === ".") {
+        event.preventDefault()
+        toggleShowAll()
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [toggleShowAll])
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label={label}
+          aria-pressed={showAll}
+          className={cn(
+            "size-9",
+            showAll &&
+              "bg-teal-500/15 text-teal-700 hover:bg-teal-500/25 dark:text-teal-300"
+          )}
+          onClick={toggleShowAll}
+        >
+          <GitBranch className="size-5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="flex items-center gap-2 text-xs">
+        <span>{label}</span>
+        <span className="inline-flex items-center gap-1">
+          {shortcutKeys.map((key) => (
+            <Kbd key={key}>{key}</Kbd>
+          ))}
+        </span>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 function ToolbarCategoryDropdown({
   category,
   actions,
@@ -432,8 +506,6 @@ function ToolbarCategoryDropdown({
     },
     [onOpenChange]
   )
-  const isAiCategory = category.id === "ai"
-  const isAgentCategory = category.id === "agent"
   const categoryStyle = CATEGORY_STYLES[category.id]
 
   const filteredActions = useMemo(() => {
@@ -462,20 +534,6 @@ function ToolbarCategoryDropdown({
   )
 
   function renderActionIcon(action: RegistryActionReadMinimal) {
-    if (isAiCategory) {
-      return (
-        <div className="flex size-8 items-center justify-center rounded-md border border-sky-100 bg-sky-50/80 dark:border-sky-900 dark:bg-sky-500/10">
-          <SparklesIcon className="size-4 text-foreground" />
-        </div>
-      )
-    }
-    if (isAgentCategory) {
-      return (
-        <div className="flex size-8 items-center justify-center rounded-md border border-emerald-100 bg-emerald-50/80 dark:border-emerald-900 dark:bg-emerald-500/10">
-          <BotIcon className="size-4 text-foreground" />
-        </div>
-      )
-    }
     return getIcon(action.action, {
       className: "size-8 rounded-md border p-1.5",
     })

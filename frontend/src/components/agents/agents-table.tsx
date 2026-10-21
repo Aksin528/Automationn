@@ -1,7 +1,6 @@
 "use client"
 
 import { DotsHorizontalIcon } from "@radix-ui/react-icons"
-import { useQuery } from "@tanstack/react-query"
 import type { ColumnDef } from "@tanstack/react-table"
 import { format } from "date-fns"
 import { Copy, CopyPlus, Trash2 } from "lucide-react"
@@ -43,6 +42,7 @@ import { useAuth } from "@/hooks/use-auth"
 import { buildDuplicateAgentPresetPayload } from "@/lib/agent-presets"
 import { retryHandler, type TracecatApiError } from "@/lib/errors"
 import { useListMcpIntegrations } from "@/lib/hooks"
+import { useQuery } from "@/lib/query"
 import {
   capitalizeFirst,
   reconstructActionType,
@@ -170,6 +170,7 @@ function toDuplicateSourcePreset(
     namespaces: preset.namespaces ?? null,
     tool_approvals: preset.tool_approvals ?? null,
     mcp_integrations: preset.mcp_integrations ?? null,
+    library_skills: preset.library_skills ?? null,
     agents: preset.agents,
     retries: preset.retries,
     enable_thinking: preset.enable_thinking,

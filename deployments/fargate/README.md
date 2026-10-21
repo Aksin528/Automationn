@@ -1,6 +1,6 @@
 # Tracecat AWS ECS Fargate stack
 
-Terraform stack for Tracecat on AWS ECS Fargate (`>1.0.0-beta.xx`).
+Terraform stack for Tracecat on AWS ECS Fargate (`>1.2.1-beta.xx`).
 
 ## Services
 
@@ -30,7 +30,6 @@ Terraform stack for Tracecat on AWS ECS Fargate (`>1.0.0-beta.xx`).
 > As a result, script execution uses subprocess isolation without nsjail-level mount/network/cgroup controls.
 > If you need highest isolation for untrusted code execution, deploy Tracecat on Kubernetes with the Helm chart, where `nsjail` is enabled by default.
 
-- `TRACECAT__DISABLE_NSJAIL=true`
 - `TRACECAT__EXECUTOR_BACKEND=direct` (executor + agent-executor)
 
 ## Default sizing
@@ -69,7 +68,7 @@ export TF_VAR_hosted_zone_id=Z1234567890
 export TF_VAR_tracecat_db_encryption_key_arn=arn:aws:secretsmanager:...
 export TF_VAR_tracecat_service_key_arn=arn:aws:secretsmanager:...
 export TF_VAR_tracecat_signing_secret_arn=arn:aws:secretsmanager:...
-export TF_VAR_tracecat_image_tag=1.0.0-beta.48
+export TF_VAR_tracecat_image_tag=1.2.1
 
 terraform apply
 ```
@@ -77,6 +76,18 @@ terraform apply
 For Terraform Cloud direct OIDC runs, the target account and role come from `TFC_AWS_RUN_ROLE_ARN`. This stack now uses the ambient AWS credentials from the execution environment and no longer accepts `aws_account_id` / `aws_role_name` inputs for a second provider-side assume-role hop.
 
 ## Self-contained migrations
+
+Application migrations enable and validate pgvector and `pg_trgm` in the
+application RDS database. The default init container uses the existing managed
+master credentials for `core_database`; no new role or privilege grant is needed.
+The PostgreSQL 16.10 default supports both extensions; no engine-version change
+is required. If an RDS allowlist excludes `vector` or `pg_trgm`, an authorized
+administrator must first allow them in `rds.allowed_extensions`. For restricted
+migration roles, an administrator must preinstall the extensions before rerunning
+migrations. See the
+[application database prerequisite and upgrade guide](../postgres/README.md).
+Use the `core_database` connection, not the Temporal RDS connection; Temporal
+does not need either extension.
 
 - API task startup includes an internal migrations init container.
 - API container starts only if migrations succeed (`dependsOn: SUCCESS`).

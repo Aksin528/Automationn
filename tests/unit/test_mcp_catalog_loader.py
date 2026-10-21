@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 
 import orjson
 import pytest
@@ -11,7 +13,8 @@ from tracecat.db.models import MCPIntegration
 from tracecat.integrations.catalog import loader
 from tracecat.integrations.catalog.service import PlatformMCPCatalogService
 from tracecat.integrations.catalog.types import RawCatalogRow
-from tracecat.integrations.enums import MCPAuthType
+from tracecat.integrations.enums import MCPAuthType, OAuthGrantType
+from tracecat.integrations.schemas import OAuthTokenState
 
 
 class _CatalogResource:
@@ -29,6 +32,14 @@ class _CatalogResource:
 
 def _clear_catalog_cache() -> None:
     loader._cached_platform_mcp_catalog_entries.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def isolate_catalog_cache() -> Iterator[None]:
+    """Keep stubbed catalogs from leaking into later tests on the same worker."""
+    _clear_catalog_cache()
+    yield
+    _clear_catalog_cache()
 
 
 def _stub_catalog_resource(monkeypatch: pytest.MonkeyPatch, payload: bytes) -> None:
@@ -114,6 +125,7 @@ def test_get_platform_mcp_catalog_entries_normalizes_specs_and_drops_malformed_r
                             "server_type": "http",
                             "auth_type": "OAUTH2",
                             "server_uri": "https://mcp.example.com/mcp",
+                            "oauth_resource": "https://mcp.example.com",
                         },
                     },
                     {
@@ -207,6 +219,8 @@ def test_get_platform_mcp_catalog_entries_normalizes_specs_and_drops_malformed_r
                 "target": "server_uri",
                 "required": True,
                 "secret": False,
+                "placeholder": None,
+                "type": "string",
             },
             {
                 "key": "Authorization",
@@ -215,6 +229,8 @@ def test_get_platform_mcp_catalog_entries_normalizes_specs_and_drops_malformed_r
                 "target": "http_header",
                 "required": True,
                 "secret": True,
+                "placeholder": None,
+                "type": "string",
             },
         ],
         "credentials": [
@@ -224,6 +240,9 @@ def test_get_platform_mcp_catalog_entries_normalizes_specs_and_drops_malformed_r
                 "description": "",
                 "required": True,
                 "secret": False,
+                "default_value": None,
+                "placeholder": None,
+                "type": "string",
                 "target": "server_uri",
             },
             {
@@ -232,6 +251,9 @@ def test_get_platform_mcp_catalog_entries_normalizes_specs_and_drops_malformed_r
                 "description": "",
                 "required": True,
                 "secret": True,
+                "default_value": None,
+                "placeholder": None,
+                "type": "string",
                 "target": "http_header",
             },
         ],
@@ -242,6 +264,7 @@ def test_get_platform_mcp_catalog_entries_normalizes_specs_and_drops_malformed_r
     generic_oauth_spec = entries[2].connection_spec
     assert generic_oauth_spec is not None
     assert generic_oauth_spec.auth_type == MCPAuthType.OAUTH2
+    assert generic_oauth_spec.oauth_resource == "https://mcp.example.com"
     assert entries[3].status == "available"
     assert entries[3].provider_id == "runreveal_mcp"
     provider_oauth_spec = entries[3].connection_spec
@@ -331,6 +354,65 @@ def test_get_platform_mcp_catalog_entries_normalizes_connection_options(
         "http",
         "stdio",
     ]
+
+
+def test_get_platform_mcp_catalog_entries_propagates_credential_type_and_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog ``type``/``placeholder`` reach the loaded credentials/config fields."""
+    _stub_catalog_resource(
+        monkeypatch,
+        orjson.dumps(
+            {
+                "servers": [
+                    {
+                        "slug": "typed-stdio-mcp",
+                        "name": "Typed Stdio",
+                        "description": "Has a URL-typed env credential",
+                        "category": "Endpoint",
+                        "connection_spec": {
+                            "server_type": "stdio",
+                            "auth_type": "CUSTOM",
+                            "stdio_command": "uvx",
+                            "stdio_args": ["typed-mcp"],
+                            "stdio_env": ["TOKEN", "CONSOLE_BASE_URL"],
+                            "credentials": [
+                                {
+                                    "key": "TOKEN",
+                                    "secret": True,
+                                    "target": "stdio_env",
+                                },
+                                {
+                                    "key": "CONSOLE_BASE_URL",
+                                    "secret": False,
+                                    "type": "url",
+                                    "placeholder": "https://your-console.example.net",
+                                    "target": "stdio_env",
+                                },
+                            ],
+                        },
+                    },
+                ]
+            }
+        ),
+    )
+
+    entries = loader.get_platform_mcp_catalog_entries(include_private=True)
+    spec = entries[0].connection_spec
+    assert spec is not None
+
+    creds = {cred.key: cred for cred in spec.credentials}
+    # Explicit catalog values flow through.
+    assert creds["CONSOLE_BASE_URL"].type == "url"
+    assert creds["CONSOLE_BASE_URL"].placeholder == "https://your-console.example.net"
+    # Defaults apply when the catalog omits them.
+    assert creds["TOKEN"].type == "string"
+    assert creds["TOKEN"].placeholder is None
+
+    # config_fields mirror the same data for the configure dialog.
+    fields = {field.key: field for field in spec.config_fields}
+    assert fields["CONSOLE_BASE_URL"].type == "url"
+    assert fields["CONSOLE_BASE_URL"].placeholder == "https://your-console.example.net"
 
 
 def test_get_platform_mcp_catalog_entries_merges_private_mcp_catalog(
@@ -519,26 +601,214 @@ def test_private_catalog_overlay_does_not_drop_public_rows() -> None:
     for entry in public_entries:
         assert entry.slug in private_by_slug
 
-    terraform_spec = private_by_slug["terraform-mcp"].connection_spec
-    if terraform_spec is not None:
-        assert terraform_spec.server_type == "stdio"
-        assert terraform_spec.requires_config is True
+    for slug in (
+        "hashicorp-vault-mcp",
+        "palo-alto-mcp",
+        "terraform-mcp",
+    ):
+        coming_soon = private_by_slug[slug]
+        assert coming_soon.status == "coming_soon"
+        assert coming_soon.connection_spec is None
 
-    # jamf-mcp defaults to Jamf's hosted no-auth HTTP server; the local
-    # stdio (device management) option survives alongside it.
+    # jamf-mcp now ships only Jamf's hosted no-auth HTTP docs server; the
+    # local mcp-hub stdio option was retired when its git pin stopped
+    # installing.
     jamf = private_by_slug["jamf-mcp"]
-    if jamf.connection_spec is not None:
-        assert jamf.connection_spec.server_type == "http"
-        assert jamf.connection_spec.requires_config is False
-        assert jamf.connection_options is not None
-        stdio_option = next(
-            option for option in jamf.connection_options if option.id == "local-stdio"
+    assert jamf.connection_spec is not None
+    assert jamf.connection_spec.server_type == "http"
+    assert jamf.connection_spec.requires_config is False
+    assert all(
+        option.connection_spec.server_type != "stdio"
+        for option in (jamf.connection_options or [])
+    )
+
+    servicenow_spec = private_by_slug["servicenow-mcp"].connection_spec
+    assert servicenow_spec is not None
+    assert servicenow_spec.kind == "http_oauth2"
+    assert servicenow_spec.requires_config is True
+    assert "{SERVICENOW_INSTANCE}" in servicenow_spec.server_uri
+    assert servicenow_spec.oauth_authorization_endpoint is None
+    assert {
+        credential.key: credential.target for credential in servicenow_spec.credentials
+    } == {
+        "SERVICENOW_INSTANCE": "server_uri",
+        "MCP_SERVER_NAME": "server_uri",
+        "client_id": "oauth_client",
+        "client_secret": "oauth_client",
+    }
+
+    glean_spec = private_by_slug["glean-mcp"].connection_spec
+    assert glean_spec is not None
+    assert glean_spec.kind == "http_oauth2"
+    assert glean_spec.requires_config is True
+    assert glean_spec.server_uri == (
+        "https://{GLEAN_BACKEND_DOMAIN}/mcp/{MCP_SERVER_NAME}"
+    )
+    # Tenant-hosted OAuth server: endpoints are discovered from the backend host.
+    assert glean_spec.oauth_authorization_endpoint is None
+    assert glean_spec.oauth_token_endpoint is None
+    glean_credentials = {
+        credential.key: credential for credential in glean_spec.credentials
+    }
+    assert {key: cred.target for key, cred in glean_credentials.items()} == {
+        "GLEAN_BACKEND_DOMAIN": "server_uri",
+        "MCP_SERVER_NAME": "server_uri",
+        "client_id": "oauth_client",
+        "client_secret": "oauth_client",
+    }
+    assert glean_credentials["MCP_SERVER_NAME"].default_value == "default"
+    # DCR is greenlisted by Glean, so a static client is optional, not required.
+    assert glean_credentials["client_id"].required is False
+    assert glean_credentials["client_secret"].required is False
+    assert glean_credentials["client_secret"].secret is True
+
+    perplexity = private_by_slug["perplexity-mcp"]
+    assert perplexity.provider_id == "perplexity_mcp"
+    perplexity_spec = perplexity.connection_spec
+    assert perplexity_spec is not None
+    assert perplexity_spec.kind == "http_oauth2"
+    assert perplexity_spec.requires_config is False
+    assert perplexity_spec.credentials == []
+    assert perplexity_spec.server_uri == "https://api.perplexity.ai/mcp"
+    assert perplexity_spec.scopes == ["perplexity_api", "offline_access"]
+    # Protected resource metadata names the origin, not the /mcp path.
+    assert perplexity_spec.oauth_resource == "https://api.perplexity.ai"
+    # api.perplexity.ai is its own authorization server with DCR, so endpoints
+    # are discovered from the well-known metadata.
+    assert perplexity_spec.oauth_authorization_endpoint is None
+    assert perplexity_spec.oauth_token_endpoint is None
+
+    semgrep_spec = private_by_slug["semgrep-mcp"].connection_spec
+    assert semgrep_spec is not None
+    assert semgrep_spec.kind == "http_oauth2"
+    assert semgrep_spec.requires_config is False
+    assert semgrep_spec.credentials == []
+    assert semgrep_spec.server_uri == "https://mcp.semgrep.ai/mcp"
+    # mcp.semgrep.ai mirrors the AS metadata at its own well-known path, so the
+    # login.semgrep.dev endpoint host is pinned to be allowlisted during discovery.
+    assert (
+        semgrep_spec.oauth_authorization_endpoint
+        == "https://login.semgrep.dev/oauth2/authorize"
+    )
+    assert semgrep_spec.oauth_token_endpoint == "https://login.semgrep.dev/oauth2/token"
+
+    wiz = private_by_slug["wiz-mcp"]
+    assert wiz.connection_spec is not None
+    assert wiz.connection_spec.kind == "http_oauth2"
+    assert wiz.connection_options is not None
+    assert [option.id for option in wiz.connection_options] == [
+        "remote-oauth",
+        "client-credentials",
+    ]
+    client_credentials = next(
+        option for option in wiz.connection_options if option.id == "client-credentials"
+    )
+    client_credentials_spec = client_credentials.connection_spec
+    assert client_credentials_spec.kind == "http_custom"
+    assert client_credentials_spec.server_uri == "https://mcp.app.wiz.io/"
+    assert client_credentials_spec.requires_config is True
+    headers = {
+        credential.key: credential
+        for credential in client_credentials_spec.credentials
+        if credential.target == "http_header"
+    }
+    assert set(headers) == {
+        "Wiz-Client-Id",
+        "Wiz-Client-Secret",
+        "Wiz-DataCenter",
+        "X-Wiz-MCP-Mode",
+    }
+    assert headers["X-Wiz-MCP-Mode"].default_value == "gateway"
+
+    # Splunk's MCP Server app is customer-hosted, so both options take the
+    # endpoint from the user. Encrypted tokens work on Cloud and Enterprise;
+    # OAuth is Splunk Cloud only, with a static client and discovered endpoints.
+    splunk = private_by_slug["splunk-mcp"]
+    assert splunk.status == "available"
+    assert splunk.connection_options is not None
+    assert [option.id for option in splunk.connection_options] == [
+        "encrypted-token",
+        "cloud-oauth",
+    ]
+    assert splunk.connection_spec is not None
+    assert splunk.connection_spec.kind == "http_custom"
+    assert splunk.connection_spec.requires_config is True
+    assert {
+        credential.key: credential.target
+        for credential in splunk.connection_spec.credentials
+    } == {"SPLUNK_MCP_ENDPOINT": "server_uri", "Authorization": "http_header"}
+    assert all(credential.required for credential in splunk.connection_spec.credentials)
+    splunk_oauth = next(
+        option for option in splunk.connection_options if option.id == "cloud-oauth"
+    ).connection_spec
+    assert splunk_oauth.kind == "http_oauth2"
+    assert splunk_oauth.requires_config is True
+    assert splunk_oauth.scopes == ["openid", "offline_access"]
+    assert splunk_oauth.oauth_authorization_endpoint is None
+    assert splunk_oauth.oauth_token_endpoint is None
+    splunk_oauth_credentials = {
+        credential.key: credential for credential in splunk_oauth.credentials
+    }
+    assert {key: cred.target for key, cred in splunk_oauth_credentials.items()} == {
+        "SPLUNK_MCP_ENDPOINT": "server_uri",
+        "client_id": "oauth_client",
+        "client_secret": "oauth_client",
+    }
+    assert splunk_oauth_credentials["client_id"].required is True
+    assert splunk_oauth_credentials["client_secret"].required is True
+    assert splunk_oauth_credentials["client_secret"].secret is True
+
+
+def test_google_secops_row_ships_templated_uri_and_pinned_authorize_params() -> None:
+    """Google's managed remote SecOps server needs a region and offline consent."""
+    _clear_catalog_cache()
+    entry = loader.get_platform_mcp_catalog_entry_by_slug(
+        "google-cloud-secops-mcp", include_private=True
+    )
+    assert entry is not None
+    spec = entry.connection_spec
+    assert spec is not None
+    assert spec.kind == "http_oauth2"
+    assert spec.server_uri == "https://chronicle.{REGION}.rep.googleapis.com/mcp"
+    assert spec.requires_config is True
+    assert spec.scopes == ["https://www.googleapis.com/auth/chronicle"]
+    assert (
+        spec.oauth_authorization_endpoint
+        == "https://accounts.google.com/o/oauth2/v2/auth"
+    )
+    assert spec.oauth_token_endpoint == "https://oauth2.googleapis.com/token"
+    # Google only returns a refresh token when both params reach the authorize
+    # request, so the catalog pins them rather than relying on discovery.
+    assert spec.oauth_authorize_params == {
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    assert {credential.key: credential.target for credential in spec.credentials} == {
+        "REGION": "server_uri",
+        "client_id": "oauth_client",
+        "client_secret": "oauth_client",
+        "x-goog-user-project": "http_header",
+    }
+
+
+def test_google_workspace_rows_pin_offline_consent_authorize_params() -> None:
+    """Gmail, Drive and Calendar share the SecOps missing-refresh-token bug."""
+    _clear_catalog_cache()
+    for slug in ("gmail-mcp", "google-drive-mcp", "google-calendar-mcp"):
+        entry = loader.get_platform_mcp_catalog_entry_by_slug(
+            slug, include_private=True
         )
-        assert stdio_option.connection_spec.server_type == "stdio"
-        assert stdio_option.connection_spec.requires_config is True
+        assert entry is not None
+        spec = entry.connection_spec
+        assert spec is not None
+        assert spec.kind == "http_oauth2"
+        assert spec.oauth_authorize_params == {
+            "access_type": "offline",
+            "prompt": "consent",
+        }
 
 
-def test_catalog_state_marks_non_oauth_mcp_rows_connected() -> None:
+def test_catalog_state_marks_unverified_non_oauth_mcp_rows_configured() -> None:
     state = PlatformMCPCatalogService._catalog_state(
         mcp_integration=MCPIntegration(
             id=uuid.uuid4(),
@@ -547,7 +817,95 @@ def test_catalog_state_marks_non_oauth_mcp_rows_connected() -> None:
             slug="no-auth-mcp",
             auth_type=MCPAuthType.NONE,
         ),
-        encrypted_access_token=None,
+        token_state=None,
+        oauth_grant_type=None,
+    )
+
+    assert state == "configured"
+
+
+def test_catalog_state_marks_verified_non_oauth_mcp_rows_connected() -> None:
+    state = PlatformMCPCatalogService._catalog_state(
+        mcp_integration=MCPIntegration(
+            id=uuid.uuid4(),
+            workspace_id=uuid.uuid4(),
+            name="No Auth MCP",
+            slug="no-auth-mcp",
+            auth_type=MCPAuthType.NONE,
+            tools=[],
+        ),
+        token_state=None,
+        oauth_grant_type=None,
+    )
+
+    assert state == "connected"
+
+
+def _oauth_mcp_row() -> MCPIntegration:
+    return MCPIntegration(
+        id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        name="OAuth MCP",
+        slug="oauth-mcp",
+        auth_type=MCPAuthType.OAUTH2,
+        tools=[],
+    )
+
+
+def test_catalog_state_flags_dead_oauth_token_as_reauth_required() -> None:
+    """Expired access token with no refresh token cannot self-heal."""
+    state = PlatformMCPCatalogService._catalog_state(
+        mcp_integration=_oauth_mcp_row(),
+        token_state=OAuthTokenState(
+            encrypted_access_token=b"token",
+            encrypted_refresh_token=None,
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        ),
+        oauth_grant_type=OAuthGrantType.AUTHORIZATION_CODE,
+    )
+
+    assert state == "reauth_required"
+
+
+def test_catalog_state_keeps_refreshable_expired_oauth_token_connected() -> None:
+    """An expired access token with a refresh token self-heals on next use."""
+    state = PlatformMCPCatalogService._catalog_state(
+        mcp_integration=_oauth_mcp_row(),
+        token_state=OAuthTokenState(
+            encrypted_access_token=b"token",
+            encrypted_refresh_token=b"refresh",
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        ),
+        oauth_grant_type=OAuthGrantType.AUTHORIZATION_CODE,
+    )
+
+    assert state == "connected"
+
+
+def test_catalog_state_keeps_non_expiring_oauth_token_connected() -> None:
+    state = PlatformMCPCatalogService._catalog_state(
+        mcp_integration=_oauth_mcp_row(),
+        token_state=OAuthTokenState(
+            encrypted_access_token=b"token",
+            encrypted_refresh_token=None,
+            expires_at=None,
+        ),
+        oauth_grant_type=OAuthGrantType.AUTHORIZATION_CODE,
+    )
+
+    assert state == "connected"
+
+
+def test_catalog_state_keeps_expired_client_credentials_connected() -> None:
+    """Client credentials renew without an interactive reauthorization flow."""
+    state = PlatformMCPCatalogService._catalog_state(
+        mcp_integration=_oauth_mcp_row(),
+        token_state=OAuthTokenState(
+            encrypted_access_token=b"token",
+            encrypted_refresh_token=None,
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        ),
+        oauth_grant_type=OAuthGrantType.CLIENT_CREDENTIALS,
     )
 
     assert state == "connected"

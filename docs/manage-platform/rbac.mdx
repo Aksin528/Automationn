@@ -1,0 +1,106 @@
+---
+title: Roles and permissions
+description: "Review each member's roles, workspaces, and groups, change a member's roles, and look up what each built-in role can do."
+---
+
+## Overview
+
+A scope is one permission on one resource, named `resource:action`. A role bundles scopes. You assign a role to a user or a group, organization-wide or on one workspace.
+
+Open `Members` in the organization sidebar (`/organization/members`) to manage members and their roles. The sidebar entry needs `org:member:read`.
+
+## Built-in roles
+
+Every organization has six preset roles. Tracecat rejects scope changes to a preset role and rejects deleting it.
+
+| Role | Level | What it can do | Scopes |
+| --- | --- | --- | --- |
+| `workspace-intake` | Workspace | Open and submit [forms](/automations/triggers/forms#permissions). Shown as `Intake only`. | 2 |
+| `workspace-viewer` | Workspace | Read workflows, integrations, cases, tables, schedules, agents, secrets, tags, variables, the inbox, the workspace, and its member list. Open and submit forms and read form submissions. | 16 |
+| `workspace-editor` | Workspace | Everything `workspace-viewer` can, plus create and update those resources, run workflows, agents, and any action, terminate workflow runs, and run workflow sync and workspace sync. | 42 |
+| `workspace-admin` | Workspace | Everything `workspace-editor` can, plus delete those resources and form submissions, update or delete the workspace, remove members, and manage workspace service accounts. | 64 |
+| `organization-admin` | Organization | Everything `workspace-admin` can in every workspace, plus create workspaces, manage organization settings, members and invitations, roles, groups, and assignments, SCIM, organization service accounts, the custom registry, and organization secrets, and read billing. | 93 |
+| `organization-owner` | Organization | Everything `organization-admin` can, plus `org:delete`, `org:billing:update`, and `org:owner:assign`. | 96 |
+
+The Scopes column counts the current definition. Startup seeding adds scopes a preset role is missing and removes none, so an organization created before a scope was renamed also keeps the old name.
+
+Every member holds six baseline scopes without any role: `org:read`, `org:member:read`, `org:registry:read`, `org:secret:read`, `agent:read`, and `agent:execute`. The baseline grants no workspace access.
+
+`organization-owner` and `organization-admin` reach every workspace in the organization. Every other member needs a workspace role, assigned on that workspace or organization-wide.
+
+## Review members
+
+The Members tab lists members and pending invitations.
+
+<Frame>
+  ![Members tab with Organization, Roles, Workspace, and Groups columns](/img/manage-platform/rbac-members.png)
+</Frame>
+
+| Column | Shows | Requires |
+| --- | --- | --- |
+| `Organization` | `Owner`, `Admin`, or `Member`, from the member's organization-wide role. | |
+| `Roles` | Every role the member holds, directly or through a group. | `org:rbac:read` |
+| `Workspace` | Every workspace the member can open. | `org:rbac:read` |
+| `Groups` | The member's groups. | `org:rbac:read` on Enterprise |
+| `Status` | `Active`, `Inactive`, or `Invited`. | |
+
+Badges are abbreviated: role names to their initials, workspace and group names to their first three characters. Hover a badge for the full name. A cell shows three badges, then `+N` for the rest.
+
+An invited row shows the roles, workspaces, and groups the invitation grants.
+
+`Filter by email...` narrows the table by email. The `Role`, `Workspace`, and `Group` filters each take several values and match members that hold any of them.
+
+## Change a member's roles
+
+Changing roles requires `org:rbac:read` to open the dialog, `org:rbac:create` to add a role, `org:rbac:update` to replace one, and `org:rbac:delete` to remove one.
+
+<Steps>
+  <Step title="Open Manage roles">
+    On the Members tab, open the member's row menu and choose `Manage roles`.
+
+    <Frame>
+      ![Manage roles dialog with a direct role and two roles from a group](/img/manage-platform/rbac-manage-roles.png)
+    </Frame>
+
+    `Direct roles` lists roles assigned to the user. `Roles from groups` lists roles the user holds through a group, with the group name. Change those on the group.
+  </Step>
+  <Step title="Add or replace a role">
+    Under `Add role assignment`, select a scope of `Organization` or one workspace, select a role, then click the plus button. A user holds one direct role per scope, so a new role replaces the existing one at that scope.
+  </Step>
+  <Step title="Remove a role">
+    Click the minus button on a direct role.
+  </Step>
+  <Step title="Save">
+    Click `Done`. Tracecat saves all staged changes together. When the changes remove a role, confirm with `Confirm changes`. `Cancel` discards the staged changes.
+  </Step>
+</Steps>
+
+A member with no roles stays in the organization with the baseline scopes. Use `Remove from organization` in the row menu to remove them.
+
+## Assignment rules
+
+| Rule | Detail |
+| --- | --- |
+| Role level | A role that holds any `org:*` scope is an organization role and is assigned organization-wide only. Every other role is a workspace role: assign it on one workspace, or organization-wide to grant it in every workspace. |
+| One role per scope | A user holds one direct role per workspace and one organization-wide. The same limit applies to each group. |
+| Effective scopes | A user's scopes are the union of their direct roles, the roles of every group they belong to, and the baseline scopes. |
+| Granting | You can assign a role only when you hold every scope in it. Tracecat refuses the rest with `Cannot grant scopes not held by the caller`. Platform superusers are exempt. |
+| Membership | You can assign roles and groups only to organization members. Tracecat refuses other users with `User not found in organization`. |
+
+Tracecat rejects a role edit that would switch a role between organization and workspace level while it is assigned or offered in a pending invitation.
+
+Without Enterprise, you manage access with the preset roles. See [Custom roles and groups](/manage-platform/custom-roles) for custom roles, groups, and scopes.
+
+## Organization membership
+
+Registration and sign-in without an invitation create no membership. A signed-in user without a membership sees `No organization access yet`, with any pending invitations listed. On a single-tenant deployment, registration or sign-in enrolls a superuser into the default organization.
+
+Accepting an invitation creates the membership and applies its role grants at their selected scopes. Existing assignments at those scopes stay unchanged. A platform admin console invitation with the `Organization member` role creates the membership with the baseline scopes and no role. See [User management](/manage-platform/users#invite-a-member) for invitations.
+
+## Related pages
+
+- See [User management](/manage-platform/users) for registration, invitations, and organization membership.
+- See [Custom roles and groups](/manage-platform/custom-roles) for custom roles, groups, custom scopes, and inviting members into groups.
+- See [Service accounts](/manage-platform/service-accounts) for machine identities that hold scopes directly, with no role.
+- See [Architecture](/security/architecture#role-based-access-control) for how RBAC fits the identity and trust model.
+- See [Organization audit logs](/audit-logs/organization) for the `rbac_role`, `rbac_group`, `rbac_assignment`, and `rbac_user_assignment` events.

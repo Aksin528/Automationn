@@ -8,3 +8,9 @@ APPROVAL_DATA_PART_TYPE = "data-approval-request"
 
 COMPACTION_DATA_PART_TYPE = "data-compaction"
 """UI data part identifier for transient compaction status payloads."""
+
+CANCELLED_DATA_PART_TYPE = "data-cancelled"
+"""UI data part identifier for turn-cancelled notice payloads."""
+
+AGENT_CHUNK_DATA_PART_TYPE = "data-agent-chunk"
+"""UI data part identifier for transient child-session UI chunks."""

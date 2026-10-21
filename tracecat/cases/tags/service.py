@@ -39,7 +39,10 @@ class CaseTagsService(BaseWorkspaceService):
         tag: CaseTag,
         event_type: CaseEventType,
     ) -> None:
-        from tracecat.cases.schemas import TagAddedEvent, TagRemovedEvent
+        from tracecat.cases.event_schemas import (
+            TagAddedEvent,
+            TagRemovedEvent,
+        )
         from tracecat.cases.service import CaseEventsService
 
         match event_type:
@@ -321,7 +324,9 @@ class CaseTagsService(BaseWorkspaceService):
 
         case_tag = await self.get_case_tag(case_id, tag.id)
         if not case_tag:
-            raise ValueError(f"Tag {tag_identifier} not found on case {case_id}")
+            raise TracecatNotFoundError(
+                f"Tag {tag_identifier} not found on case {case_id}"
+            )
         await self.session.delete(case_tag)
         await self._create_tag_event(
             case=case, tag=tag, event_type=CaseEventType.TAG_REMOVED

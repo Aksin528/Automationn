@@ -8,12 +8,19 @@ using the already-resolved ActionImplementation (module/name/origin).
 
 from __future__ import annotations
 
+import asyncio
+import sys
+import threading
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from tracecat_registry import secrets as registry_secrets
 
+from tests.support.executor_backend import TestBackend
 from tracecat.auth.types import Role
 from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.dsl.schemas import (
@@ -22,8 +29,11 @@ from tracecat.dsl.schemas import (
     RunActionInput,
     RunContext,
 )
-from tracecat.executor.backends.test import TestBackend
-from tracecat.executor.schemas import ActionImplementation, ResolvedContext
+from tracecat.executor.schemas import (
+    ActionImplementation,
+    ExecutorResult,
+    ResolvedContext,
+)
 from tracecat.executor.secret_preprocessors import SecretEnvProjection
 from tracecat.identifiers.workflow import ExecutionUUID, WorkflowUUID
 from tracecat.registry.lock.types import RegistryLock
@@ -129,7 +139,7 @@ class TestTestBackendNoRegistryAction:
 
         # Also patch in the backend module in case of any direct imports
         # (though we've removed them, this ensures the test catches any regression)
-        import tracecat.executor.backends.test as test_module
+        import tests.support.executor_backend as test_module
 
         # Verify the import was removed (should raise AttributeError)
         assert not hasattr(test_module, "RegistryActionsService"), (
@@ -243,6 +253,182 @@ class TestTestBackendNoRegistryAction:
             await backend.shutdown()
 
     @pytest.mark.anyio
+    async def test_execute_holds_artifact_leases_for_the_whole_execution(
+        self,
+        test_role: Role,
+        test_resolved_context: ResolvedContext,
+        test_run_action_input: RunActionInput,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Leases span execution, and one bad artifact does not drop the others."""
+        good_path = tmp_path / "good-artifact"
+        good_path.mkdir()
+        broken_uri = "s3://bucket/broken.tar.gz"
+        good_uri = "s3://bucket/good.tar.gz"
+
+        class FakeRegistryArtifacts:
+            def __init__(self) -> None:
+                self.active = 0
+
+            @asynccontextmanager
+            async def lease(
+                self,
+                artifact_uris: list[str] | None = None,
+            ) -> AsyncIterator[list[Path]]:
+                if artifact_uris == [broken_uri]:
+                    raise RuntimeError("artifact unavailable")
+                self.active += 1
+                try:
+                    yield [good_path]
+                finally:
+                    self.active -= 1
+
+        class FakeActionRunner:
+            def __init__(self) -> None:
+                self.registry_artifacts = FakeRegistryArtifacts()
+
+        fake_runner = FakeActionRunner()
+        observed: list[tuple[int, bool]] = []
+
+        async def _get_artifact_uris(_input: RunActionInput, _role: Role) -> list[str]:
+            return [broken_uri, good_uri]
+
+        backend = TestBackend()
+        await backend.start()
+
+        try:
+            monkeypatch.setattr(
+                "tests.support.executor_backend.config"
+                ".TRACECAT__LOCAL_REPOSITORY_ENABLED",
+                False,
+            )
+            monkeypatch.setattr(
+                "tests.support.executor_backend.get_action_runner",
+                lambda: fake_runner,
+            )
+            monkeypatch.setattr(backend, "_get_artifact_uris", _get_artifact_uris)
+            monkeypatch.setattr(
+                backend,
+                "_load_udf_callable",
+                lambda _action_impl: (
+                    lambda **_kwargs: observed.append(
+                        (
+                            fake_runner.registry_artifacts.active,
+                            str(good_path) in sys.path,
+                        )
+                    )
+                ),
+            )
+
+            result = await backend.execute(
+                input=test_run_action_input,
+                role=test_role,
+                resolved_context=test_resolved_context,
+                timeout=30.0,
+            )
+
+            assert result.type == "success"
+            assert observed == [(1, True)]
+            assert fake_runner.registry_artifacts.active == 0
+            assert str(good_path) not in sys.path
+        finally:
+            await backend.shutdown()
+
+    @pytest.mark.anyio
+    async def test_timed_out_sync_udf_keeps_artifact_lease_until_thread_finishes(
+        self,
+        test_role: Role,
+        test_resolved_context: ResolvedContext,
+        test_run_action_input: RunActionInput,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A soft timeout cannot release paths beneath a live UDF thread."""
+        artifact_path = tmp_path / "artifact"
+        artifact_path.mkdir()
+        artifact_uri = "s3://bucket/sync-timeout.tar.gz"
+        worker_started = threading.Event()
+        finish_worker = threading.Event()
+
+        class FakeRegistryArtifacts:
+            def __init__(self) -> None:
+                self.active = 0
+
+            @asynccontextmanager
+            async def lease(
+                self,
+                artifact_uris: list[str] | None = None,
+            ) -> AsyncIterator[list[Path]]:
+                assert artifact_uris == [artifact_uri]
+                self.active += 1
+                try:
+                    yield [artifact_path]
+                finally:
+                    self.active -= 1
+
+        class FakeActionRunner:
+            def __init__(self) -> None:
+                self.registry_artifacts = FakeRegistryArtifacts()
+
+        fake_runner = FakeActionRunner()
+
+        async def _get_artifact_uris(_input: RunActionInput, _role: Role) -> list[str]:
+            return [artifact_uri]
+
+        def blocking_udf(**_kwargs: object) -> str:
+            worker_started.set()
+            assert finish_worker.wait(timeout=5)
+            return "finished"
+
+        backend = TestBackend()
+        await backend.start()
+        execution: asyncio.Task[ExecutorResult] | None = None
+        try:
+            monkeypatch.setattr(
+                "tests.support.executor_backend.config"
+                ".TRACECAT__LOCAL_REPOSITORY_ENABLED",
+                False,
+            )
+            monkeypatch.setattr(
+                "tests.support.executor_backend.get_action_runner",
+                lambda: fake_runner,
+            )
+            monkeypatch.setattr(backend, "_get_artifact_uris", _get_artifact_uris)
+            monkeypatch.setattr(
+                backend,
+                "_load_udf_callable",
+                lambda _action_impl: blocking_udf,
+            )
+
+            execution = asyncio.create_task(
+                backend.execute(
+                    input=test_run_action_input,
+                    role=test_role,
+                    resolved_context=test_resolved_context,
+                    timeout=0.01,
+                )
+            )
+            assert await asyncio.to_thread(worker_started.wait, 1)
+            await asyncio.sleep(0.05)
+
+            assert not execution.done()
+            assert fake_runner.registry_artifacts.active == 1
+            assert str(artifact_path) in sys.path
+
+            finish_worker.set()
+            result = await execution
+            assert result.type == "failure"
+            assert result.error.type == "TimeoutError"
+            assert fake_runner.registry_artifacts.active == 0
+            assert str(artifact_path) not in sys.path
+        finally:
+            finish_worker.set()
+            if execution is not None:
+                await execution
+            await backend.shutdown()
+
+    @pytest.mark.anyio
     async def test_execute_udf_reuses_cached_secret_projection(
         self,
         test_role: Role,
@@ -266,7 +452,7 @@ class TestTestBackendNoRegistryAction:
 
         try:
             monkeypatch.setattr(
-                "tracecat.executor.backends.test.project_secret_env",
+                "tests.support.executor_backend.project_secret_env",
                 _unexpected_project_secret_env,
             )
             monkeypatch.setattr(

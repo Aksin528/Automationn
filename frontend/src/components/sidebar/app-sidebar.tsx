@@ -5,6 +5,8 @@ import {
   BotIcon,
   BoxIcon,
   ChevronDown,
+  ClipboardListIcon,
+  GitBranchIcon,
   KeyRound,
   LayersIcon,
   LayoutDashboardIcon,
@@ -13,6 +15,7 @@ import {
   LockIcon,
   type LucideIcon,
   MousePointerClickIcon,
+  NetworkIcon,
   Pyramid,
   Sparkles,
   Table2Icon,
@@ -25,7 +28,7 @@ import Link from "next/link"
 import { useParams, usePathname } from "next/navigation"
 import { env } from "next-runtime-env"
 import type * as React from "react"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useMemo, useState } from "react"
 import { useScopeCheck } from "@/components/auth/scope-guard"
 import {
   LockedFeatureChip,
@@ -54,10 +57,10 @@ import {
   SidebarMenuSubButton,
   SidebarMenuSubItem,
   SidebarRail,
-  useSidebar,
 } from "@/components/ui/sidebar"
 import { toast } from "@/components/ui/use-toast"
 import { useEntitlements } from "@/hooks/use-entitlements"
+import { useFormsAccess } from "@/hooks/use-forms-access"
 import { usePendingApprovalsCount } from "@/hooks/use-pending-approvals-count"
 import { formatPendingApprovalCount } from "@/lib/approvals"
 import { useWorkspaceId } from "@/providers/workspace-id"
@@ -72,6 +75,7 @@ type NavItem = {
   icon: LucideIcon
   isActive?: boolean
   isLocked?: boolean
+  isPendingEntitlement?: boolean
   onSelect?: () => void
   locked?: boolean
   visible?: boolean
@@ -92,27 +96,8 @@ type NavItem = {
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const pathname = usePathname()
   const workspaceId = useWorkspaceId()
-  const params = useParams<{ caseId?: string }>()
-  const { setOpen: setSidebarOpen } = useSidebar()
-  const setSidebarOpenRef = useRef(setSidebarOpen)
   const basePath = `/workspaces/${workspaceId}`
-  const caseId = params?.caseId
-  const casesListPath = `${basePath}/cases`
-  const isCasesList = pathname === casesListPath
   const [lockedFeatureDialogOpen, setLockedFeatureDialogOpen] = useState(false)
-
-  useEffect(() => {
-    setSidebarOpenRef.current = setSidebarOpen
-  }, [setSidebarOpen])
-
-  useEffect(() => {
-    const updateSidebarOpen = setSidebarOpenRef.current
-    if (caseId) {
-      updateSidebarOpen(false)
-    } else if (isCasesList) {
-      updateSidebarOpen(true)
-    }
-  }, [caseId, isCasesList])
 
   // Scope checks for sidebar items
   const canViewWorkflows = useScopeCheck("workflow:read")
@@ -128,24 +113,46 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const canViewServiceAccounts = useScopeCheck("workspace:service_account:read")
   const canViewMcpAccess = useScopeCheck("workspace:read")
   const canViewCases = useScopeCheck("case:read")
+  // The builder pages need one of these on top of `form:read`; a requester
+  // who can only fill in forms has no use for the list.
+  const canReadForms = useScopeCheck("form:read")
+  const canBuildForms = useScopeCheck(undefined, [
+    "form:update",
+    "form:submission:read",
+  ])
+  // Hidden with the feature flag off. Without the entitlement the link stays
+  // and the page explains why Forms is unavailable.
+  const formsAccess = useFormsAccess()
+  const formsVisible = formsAccess === "enabled" || formsAccess === "locked"
+  const canViewTunnels = useScopeCheck("tunnel:read")
+  // Sync users push/pull; workspace admins manage the repository connection.
+  const canOpenGitSync = useScopeCheck(undefined, [
+    "workspace_sync:sync",
+    "workspace:update",
+  ])
   const canAccessMissionControl =
     canExecuteAgents === true && canViewAgents === true
   const shouldLoadEntitlements =
     canViewAgents === true ||
     canExecuteAgents === true ||
     canViewServiceAccounts === true ||
-    canViewInbox === true
-  const { hasEntitlement, isLoading: entitlementsIsLoading } = useEntitlements({
+    canViewInbox === true ||
+    canOpenGitSync === true
+  const {
+    hasEntitlement,
+    hasEntitlementData,
+    isLoading: entitlementsIsLoading,
+  } = useEntitlements({
     enabled: shouldLoadEntitlements,
   })
-  const agentAddonsEnabled = hasEntitlement("agent_addons")
+  const entitlementsKnown = !entitlementsIsLoading && hasEntitlementData
   const workspaceChatEnabled = hasEntitlement("workspace_chat")
   const serviceAccountsEnabled = hasEntitlement("service_accounts")
+  const gitSyncEnabled = hasEntitlement("git_sync")
   const { data: pendingApprovalsCount = 0 } = usePendingApprovalsCount(
     workspaceId,
     {
-      enabled:
-        canViewInbox === true && !entitlementsIsLoading && agentAddonsEnabled,
+      enabled: canViewInbox === true,
     }
   )
 
@@ -155,13 +162,14 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         title: "Chat",
         url: `${basePath}/chat`,
         icon: BotIcon,
-        tag: "Beta",
         isActive: pathname?.startsWith(`${basePath}/chat`),
         visible: canAccessMissionControl,
-        isLocked: entitlementsIsLoading || !workspaceChatEnabled,
-        onSelect: entitlementsIsLoading
-          ? undefined
-          : () => setLockedFeatureDialogOpen(true),
+        isLocked: entitlementsKnown && !workspaceChatEnabled,
+        isPendingEntitlement: !entitlementsKnown,
+        onSelect:
+          entitlementsKnown && !workspaceChatEnabled
+            ? () => setLockedFeatureDialogOpen(true)
+            : undefined,
       },
       {
         title: "Workflows",
@@ -169,6 +177,14 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         icon: WorkflowIcon,
         isActive: pathname?.startsWith(`${basePath}/workflows`),
         visible: canViewWorkflows === true,
+      },
+      {
+        title: "Forms",
+        url: `${basePath}/forms`,
+        icon: ClipboardListIcon,
+        isActive: pathname?.startsWith(`${basePath}/forms`),
+        visible:
+          formsVisible && canReadForms === true && canBuildForms === true,
       },
       {
         title: "Cases",
@@ -183,10 +199,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         icon: MousePointerClickIcon,
         isActive: pathname?.startsWith(`${basePath}/agents`),
         visible: canViewAgents === true,
-        isLocked: entitlementsIsLoading || !agentAddonsEnabled,
-        onSelect: entitlementsIsLoading
-          ? undefined
-          : () => setLockedFeatureDialogOpen(true),
       },
       {
         title: "Tables",
@@ -228,10 +240,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         url: `${basePath}/skills`,
         icon: Pyramid,
         isActive: pathname?.startsWith(`${basePath}/skills`),
-        isLocked: entitlementsIsLoading || !agentAddonsEnabled,
-        onSelect: entitlementsIsLoading
-          ? undefined
-          : () => setLockedFeatureDialogOpen(true),
         visible: canViewAgents === true,
       },
       {
@@ -241,22 +249,35 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         isActive: pathname?.startsWith(`${basePath}/actions`),
         visible: canViewActions === true,
       },
+      {
+        title: "Git sync",
+        url: `${basePath}/git-sync`,
+        icon: GitBranchIcon,
+        isActive: pathname?.startsWith(`${basePath}/git-sync`),
+        visible: canOpenGitSync === true,
+        // Stays visible without the entitlement so the page can offer the upgrade.
+        locked: entitlementsKnown && !gitSyncEnabled,
+      },
     ],
     [
       basePath,
       pathname,
       canViewWorkflows,
+      formsVisible,
+      canReadForms,
+      canBuildForms,
       canViewCases,
       canAccessMissionControl,
       canViewTables,
       canViewVariables,
       canViewSecrets,
       canViewIntegrations,
-      entitlementsIsLoading,
-      agentAddonsEnabled,
+      entitlementsKnown,
       workspaceChatEnabled,
       canViewAgents,
       canViewActions,
+      canOpenGitSync,
+      gitSyncEnabled,
     ]
   )
 
@@ -269,7 +290,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       visible: canViewWorkflows === true,
     },
     {
-      title: "Approvals",
+      title: "Inbox",
       url: `${basePath}/inbox`,
       icon: ListChecksIcon,
       isActive: pathname?.startsWith(`${basePath}/inbox`),
@@ -350,6 +371,20 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                               <span>{item.title}</span>
                               <LockedFeatureChip className="ml-auto shrink-0" />
                             </SidebarMenuButton>
+                          ) : item.isPendingEntitlement ? (
+                            <SidebarMenuButton
+                              type="button"
+                              isActive={item.isActive}
+                              disabled
+                            >
+                              <item.icon />
+                              <span>{item.title}</span>
+                              {item.tag ? (
+                                <span className="ml-auto shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium leading-none text-muted-foreground">
+                                  {item.tag}
+                                </span>
+                              ) : null}
+                            </SidebarMenuButton>
                           ) : (
                             <SidebarMenuButton asChild isActive={item.isActive}>
                               <Link href={item.url!}>
@@ -409,7 +444,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                           {item.badgeCount ? (
                             <SidebarMenuBadge
                               aria-label={item.badgeLabel}
-                              className="top-1/2 -translate-y-1/2 bg-violet-500/10 text-violet-700 peer-data-[size=default]/menu-button:top-1/2 peer-data-[size=lg]/menu-button:top-1/2 peer-data-[size=sm]/menu-button:top-1/2 dark:text-violet-300"
+                              className="bg-violet-500/10 text-violet-700 dark:text-violet-300"
                             >
                               {formatPendingApprovalCount(item.badgeCount)}
                             </SidebarMenuBadge>
@@ -490,12 +525,22 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                   ),
                 }
               : null,
+            canViewTunnels === true
+              ? {
+                  title: "Tunnels",
+                  href: `${basePath}/tunnels`,
+                  icon: NetworkIcon,
+                  isActive: pathname?.startsWith(`${basePath}/tunnels`),
+                }
+              : null,
             canViewMcpAccess === true
               ? {
                   title: "MCP access",
                   href: `${basePath}/mcp`,
                   icon: TerminalIcon,
-                  isActive: pathname?.startsWith(`${basePath}/mcp`),
+                  isActive:
+                    pathname === `${basePath}/mcp` ||
+                    pathname?.startsWith(`${basePath}/mcp/`),
                 }
               : null,
           ].filter((item) => item !== null)}

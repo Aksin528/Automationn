@@ -1,6 +1,7 @@
+import posixpath
 import uuid
 from itertools import batched
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from fastapi import (
     APIRouter,
@@ -14,20 +15,26 @@ from fastapi import (
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from temporalio.service import RPCError
+from temporalio.client import WorkflowFailureError
 
 from tracecat import config
 from tracecat.concurrency import cooperative
 from tracecat.contexts import ctx_role
-from tracecat.dsl.client import get_temporal_client
 from tracecat.dsl.common import DSLInput
 from tracecat.dsl.schemas import TriggerInputs
-from tracecat.dsl.workflow import DSLWorkflow
-from tracecat.ee.interactions.enums import InteractionCategory
-from tracecat.ee.interactions.schemas import InteractionInput
-from tracecat.identifiers.workflow import AnyWorkflowIDPath, generate_exec_id
+from tracecat.identifiers.workflow import (
+    AnyWorkflowIDPath,
+    WorkflowExecutionID,
+    WorkflowID,
+    generate_exec_id,
+)
 from tracecat.logger import logger
+from tracecat.observability.otel import (
+    current_trace_id,
+    set_current_span_attributes,
+)
 from tracecat.registry.lock.types import RegistryLock
+from tracecat.runtime.errors import RuntimeErrorOwner, select_error_classification
 from tracecat.storage import blob
 from tracecat.storage.collection import get_collection_page
 from tracecat.storage.object import (
@@ -43,18 +50,21 @@ from tracecat.storage.utils import (
     deserialize_object,
     serialize_object,
 )
+from tracecat.temporal.errors import extract_error_classifications
 from tracecat.webhooks.dependencies import (
     DraftWorkflowDep,
     PayloadDep,
     ValidWorkflowDefinitionDep,
     parse_content_type,
-    parse_interaction_payload,
     validate_incoming_webhook,
 )
-from tracecat.webhooks.schemas import NDJSON_CONTENT_TYPES
+from tracecat.webhooks.schemas import (
+    NDJSON_CONTENT_TYPES,
+    WebhookWaitErrorResponse,
+    WebhookWaitFailureDetail,
+)
 from tracecat.workflow.executions.enums import TriggerType
 from tracecat.workflow.executions.schemas import (
-    ReceiveInteractionResponse,
     WorkflowExecutionCreateResponse,
 )
 from tracecat.workflow.executions.service import WorkflowExecutionsService
@@ -102,6 +112,35 @@ type WebhookResponse = (
 )
 
 
+def _annotate_webhook_trace(
+    *,
+    wf_id: WorkflowID,
+    wf_exec_id: WorkflowExecutionID,
+    response: WorkflowExecutionCreateResponse | None = None,
+) -> None:
+    """Best-effort correlation that never blocks dispatch on tracing errors."""
+    try:
+        role = ctx_role.get()
+        set_current_span_attributes(
+            {
+                "tracecat.organization.id": (
+                    role.organization_id if role is not None else None
+                ),
+                "tracecat.workspace.id": role.workspace_id
+                if role is not None
+                else None,
+                "tracecat.workflow.id": wf_id,
+                "tracecat.workflow.execution.id": wf_exec_id,
+                "tracecat.trigger.type": TriggerType.WEBHOOK,
+            }
+        )
+        if response is not None and (trace_id := current_trace_id()):
+            response["trace_id"] = trace_id
+    except Exception:
+        # Tracing is optional; omit exception details that may contain request data.
+        logger.warning("Could not annotate webhook trace")
+
+
 async def _to_external_download_response(
     external: ExternalObject,
 ) -> WebhookStoredObjectDownloadResponse:
@@ -128,7 +167,7 @@ async def _to_collection_download_response(
 ) -> WebhookStoredObjectDownloadResponse:
     materialized = await _materialize_collection_values_for_wait(collection)
     serialized = serialize_object(materialized)
-    prefix = collection.manifest_ref.key.removesuffix("/manifest.json")
+    prefix = posixpath.dirname(collection.manifest_ref.key)
     export_key = f"{prefix}/downloads/{uuid.uuid4().hex}.json"
 
     await blob.upload_file(
@@ -327,10 +366,16 @@ class WebhookTriggerEnvelope(TypedDict):
     status_code: int
     headers: dict[str, str]
     data: TriggerInputs | None
+    raw_body: NotRequired[str]
 
 
-def _wrap_with_headers(
-    payload: TriggerInputs | None, request: Request
+def _include_raw_body(input_schema: dict[str, Any] | None) -> bool:
+    """Preserve legacy include_headers schemas that forbid unknown fields."""
+    return not input_schema or "raw_body" in input_schema
+
+
+async def _wrap_with_headers(
+    payload: TriggerInputs | None, request: Request, *, include_raw_body: bool = True
 ) -> WebhookTriggerEnvelope:
     """Wrap the parsed body in a `core.http.request`-style envelope.
 
@@ -340,11 +385,22 @@ def _wrap_with_headers(
     headers = {
         k: v for k, v in request.headers.items() if k.lower() not in _REDACTED_HEADERS
     }
-    return WebhookTriggerEnvelope(status_code=200, headers=headers, data=payload)
+    envelope = WebhookTriggerEnvelope(
+        status_code=200,
+        headers=headers,
+        data=payload,
+    )
+    if include_raw_body:
+        body = await request.body()
+        envelope["raw_body"] = body.decode("utf-8")
+    return envelope
 
 
 async def _wrapped_payload(
-    request: Request, payload: PayloadDep
+    request: Request,
+    payload: TriggerInputs | None,
+    *,
+    include_raw_body: bool = True,
 ) -> TriggerInputs | None:
     """Wrap the parsed body in the request envelope when the webhook opts in.
 
@@ -353,11 +409,10 @@ async def _wrapped_payload(
     wraps per-batch-item inside ``_incoming_webhook`` instead.
     """
     if getattr(request.state, "webhook_include_headers", False):
-        return _wrap_with_headers(payload, request)
+        return await _wrap_with_headers(
+            payload, request, include_raw_body=include_raw_body
+        )
     return payload
-
-
-WrappedPayloadDep = Annotated[TriggerInputs | None, Depends(_wrapped_payload)]
 
 
 async def _incoming_webhook(
@@ -376,6 +431,7 @@ async def _incoming_webhook(
     logger.trace("Webhook payload", payload=payload)
 
     dsl_input = DSLInput(**defn.content)
+    include_raw_body = _include_raw_body(dsl_input.entrypoint.expects)
 
     service = await WorkflowExecutionsService.connect()
     # If this was a ndjson, automatically batch the requests
@@ -389,7 +445,11 @@ async def _incoming_webhook(
             one_response = await service.create_workflow_execution_wait_for_start(
                 dsl=dsl_input,
                 wf_id=workflow_id,
-                payload=_wrap_with_headers(p, request) if include_headers else p,
+                payload=await _wrap_with_headers(
+                    p, request, include_raw_body=include_raw_body
+                )
+                if include_headers
+                else p,
                 trigger_type=TriggerType.WEBHOOK,
                 registry_lock=RegistryLock.model_validate(defn.registry_lock)
                 if defn.registry_lock
@@ -408,7 +468,9 @@ async def _incoming_webhook(
         response = await service.create_workflow_execution_wait_for_start(
             dsl=dsl_input,
             wf_id=workflow_id,
-            payload=_wrap_with_headers(payload, request)
+            payload=await _wrap_with_headers(
+                payload, request, include_raw_body=include_raw_body
+            )
             if include_headers
             else payload,
             trigger_type=TriggerType.WEBHOOK,
@@ -416,6 +478,12 @@ async def _incoming_webhook(
             if defn.registry_lock
             else None,
         )
+
+    _annotate_webhook_trace(
+        wf_id=response["wf_id"],
+        wf_exec_id=response["wf_exec_id"],
+        response=response,
+    )
 
     # Response handling
     if echo:
@@ -454,13 +522,18 @@ async def _incoming_webhook(
                 "Unwrapped workflow result exceeded inline response limits. "
                 "Use `detail.download_url` to fetch the externalized result."
             ),
-        }
+        },
+        status.HTTP_422_UNPROCESSABLE_CONTENT: {
+            "model": WebhookWaitErrorResponse,
+            "description": "Invalid request parameters or a user-owned workflow failure.",
+        },
     },
 )
 async def incoming_webhook_wait(
     workflow_id: AnyWorkflowIDPath,
     defn: ValidWorkflowDefinitionDep,
-    payload: WrappedPayloadDep,
+    payload: PayloadDep,
+    request: Request,
     unwrap: Annotated[
         bool,
         Query(
@@ -484,18 +557,53 @@ async def incoming_webhook_wait(
     logger.trace("Webhook payload received")
 
     dsl_input = DSLInput(**defn.content)
-
-    service = await WorkflowExecutionsService.connect()
-    response = await service.create_workflow_execution(
-        dsl=dsl_input,
-        wf_id=workflow_id,
+    payload = await _wrapped_payload(
+        request=request,
         payload=payload,
-        trigger_type=TriggerType.WEBHOOK,
-        registry_lock=RegistryLock.model_validate(defn.registry_lock)
-        if defn.registry_lock
-        else None,
+        include_raw_body=_include_raw_body(dsl_input.entrypoint.expects),
     )
 
+    service = await WorkflowExecutionsService.connect()
+    wf_exec_id = generate_exec_id(workflow_id)
+    try:
+        response = await service.create_workflow_execution(
+            dsl=dsl_input,
+            wf_id=workflow_id,
+            wf_exec_id=wf_exec_id,
+            payload=payload,
+            trigger_type=TriggerType.WEBHOOK,
+            registry_lock=RegistryLock.model_validate(defn.registry_lock)
+            if defn.registry_lock
+            else None,
+        )
+    except WorkflowFailureError as error:
+        classifications = extract_error_classifications(
+            error, include_implicit_context=False
+        )
+        if not classifications:
+            raise
+        classification = select_error_classification(classifications)
+        if classification.owner is not RuntimeErrorOwner.USER:
+            raise
+        logger.warning(
+            "User workflow execution failed",
+            kind=classification.kind,
+            wf_exec_id=wf_exec_id,
+        )
+        # Workflow messages and diagnostics can contain payload or secret values.
+        # Return only stable metadata; keep detailed errors in the workflow run.
+        failure = WebhookWaitErrorResponse(
+            detail=WebhookWaitFailureDetail(
+                code=classification.kind,
+                wf_exec_id=wf_exec_id,
+            )
+        )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content=failure.model_dump(mode="json"),
+        )
+
+    _annotate_webhook_trace(wf_id=workflow_id, wf_exec_id=wf_exec_id)
     result = response["result"]
     if unwrap:
         if isinstance(result, InlineObject):
@@ -512,7 +620,8 @@ async def incoming_webhook_wait(
 async def incoming_webhook_draft(
     workflow_id: AnyWorkflowIDPath,
     draft_ctx: DraftWorkflowDep,
-    payload: WrappedPayloadDep,
+    payload: PayloadDep,
+    request: Request,
 ) -> WorkflowExecutionCreateResponse:
     """Draft webhook endpoint to trigger a workflow execution using the draft workflow graph.
 
@@ -524,6 +633,12 @@ async def incoming_webhook_draft(
     # (include_headers), which can contain auth/signature values.
     logger.trace("Draft webhook payload received")
 
+    payload = await _wrapped_payload(
+        request=request,
+        payload=payload,
+        include_raw_body=_include_raw_body(draft_ctx.dsl.entrypoint.expects),
+    )
+
     service = await WorkflowExecutionsService.connect()
     response = await service.create_draft_workflow_execution_wait_for_start(
         dsl=draft_ctx.dsl,
@@ -534,60 +649,9 @@ async def incoming_webhook_draft(
         if draft_ctx.registry_lock
         else None,
     )
-    return response
-
-
-@router.post("/interactions/{category}")
-async def receive_interaction(
-    workflow_id: AnyWorkflowIDPath,
-    input: Annotated[InteractionInput, Depends(parse_interaction_payload)],
-    category: InteractionCategory,
-) -> ReceiveInteractionResponse:
-    """Process incoming workflow interactions from external services.
-
-    Args:
-        workflow_id: ID of the workflow to interact with
-        payload: Raw interaction payload from the external service
-        category: Category of interaction (e.g., slack)
-
-    Returns:
-        Response confirming the interaction was processed
-
-    Raises:
-        HTTPException: If payload is invalid or workflow interaction fails
-    """
-    logger.info(
-        "Received interaction",
-        workflow_id=workflow_id,
-        category=category,
-        role=ctx_role.get(),
+    _annotate_webhook_trace(
+        wf_id=response["wf_id"],
+        wf_exec_id=response["wf_exec_id"],
+        response=response,
     )
-    logger.trace("Interaction input", input=input)
-
-    try:
-        # Get temporal client and workflow handle
-        client = await get_temporal_client()
-        handle = client.get_workflow_handle_for(DSLWorkflow.run, input.execution_id)
-
-        # Convert to internal interaction format
-        # Execute workflow interaction handler
-        result = await handle.execute_update(DSLWorkflow.interaction_handler, input)
-        logger.info("Interaction processed", result=result)
-
-        return ReceiveInteractionResponse(
-            message="Interaction processed successfully",
-        )
-
-    except RPCError as e:
-        if "workflow not found" in str(e).lower():
-            logger.error("Workflow not found", error=e)
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found"
-            ) from e
-        raise
-    except Exception as e:
-        logger.error("Failed to process interaction", error=e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to process interaction: {str(e)}",
-        ) from e
+    return response

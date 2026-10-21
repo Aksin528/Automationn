@@ -1,9 +1,117 @@
 import {
+  AGENT_PRESET_PUBLISHING_FIELDS,
+  buildAgentPresetUpdatePayload,
   buildDuplicateAgentPresetPayload,
   buildDuplicateAgentSlug,
   buildSkillCommandItemValue,
   canSubmitAgentPresetForm,
+  getAgentPresetErrorMessage,
 } from "@/lib/agent-presets"
+
+describe("getAgentPresetErrorMessage", () => {
+  it("explains the effective tool count and limit", () => {
+    const error = Object.assign(new Error("Bad request"), {
+      body: {
+        detail: {
+          code: "agent_tool_limit_exceeded",
+          message: "Invalid preset configuration",
+          tool_count: 140,
+          max_tools: 128,
+        },
+      },
+    })
+
+    expect(getAgentPresetErrorMessage(error, "Save failed.")).toBe(
+      "This agent has 140 tools; the limit is 128."
+    )
+  })
+
+  it("shows the message from a structured validation detail", () => {
+    const error = Object.assign(new Error("Bad request"), {
+      body: {
+        detail: {
+          code: "skill_not_published",
+          message: "Only published skills can be attached.",
+        },
+      },
+    })
+    expect(getAgentPresetErrorMessage(error, "Save failed.")).toBe(
+      "Only published skills can be attached."
+    )
+  })
+
+  it("preserves a string API detail", () => {
+    const error = Object.assign(new Error("Bad request"), {
+      body: { detail: "Agent preset slug already exists" },
+    })
+
+    expect(getAgentPresetErrorMessage(error, "Save failed.")).toBe(
+      "Agent preset slug already exists"
+    )
+  })
+
+  it.each([null, undefined, {}, "unknown error"])(
+    "uses the fallback when no API message is available: %p",
+    (error) => {
+      expect(getAgentPresetErrorMessage(error, "Save failed.")).toBe(
+        "Save failed."
+      )
+    }
+  )
+})
+
+const presetPayload = {
+  name: "Triage agent",
+  model_name: "gpt-4o-mini",
+  model_provider: "openai",
+  skills: [{ skill_id: "784dd826-072e-46f1-95a4-08d3417c784f" }],
+}
+
+// Mirrors `AgentPresetService.EXECUTION_FIELDS` in
+// `tracecat/agent/preset/service.py`. Update both sides together.
+const BACKEND_EXECUTION_FIELDS = [
+  "instructions",
+  "model_name",
+  "model_provider",
+  "catalog_id",
+  "base_url",
+  "output_type",
+  "actions",
+  "namespaces",
+  "tool_approvals",
+  "mcp_integrations",
+  "library_skills",
+  "agents",
+  "retries",
+  "enable_thinking",
+  "enable_internet_access",
+]
+
+describe("AGENT_PRESET_PUBLISHING_FIELDS", () => {
+  it("matches the backend execution fields that cut a new preset version", () => {
+    expect([...AGENT_PRESET_PUBLISHING_FIELDS].sort()).toEqual(
+      [...BACKEND_EXECUTION_FIELDS].sort()
+    )
+  })
+})
+
+describe("buildAgentPresetUpdatePayload", () => {
+  it("omits unchanged skill bindings from preset updates", () => {
+    const update = buildAgentPresetUpdatePayload(presetPayload, {
+      skillsChanged: false,
+    })
+
+    expect(update).not.toHaveProperty("skills")
+  })
+
+  it("includes changed skill bindings in preset updates", () => {
+    const update = buildAgentPresetUpdatePayload(presetPayload, {
+      skillsChanged: true,
+    })
+
+    expect(update.skills).toEqual(presetPayload.skills)
+  })
+})
 
 describe("canSubmitAgentPresetForm", () => {
   it("keeps save disabled for new presets until model config is present", () => {
@@ -86,6 +194,7 @@ describe("canSubmitAgentPresetForm", () => {
         namespaces: ["core.http_request"],
         tool_approvals: { "core.http_request": true },
         mcp_integrations: ["mcp-1"],
+        library_skills: ["phishing-triage"],
         retries: 2,
         enable_internet_access: true,
         created_at: "2026-03-13T12:00:00Z",
@@ -98,6 +207,7 @@ describe("canSubmitAgentPresetForm", () => {
     expect(duplicated.slug).toBe("copy-of-triage-agent")
     expect(duplicated.instructions).toBe("Investigate alerts")
     expect(duplicated.actions).toEqual(["core.http_request"])
+    expect(duplicated.library_skills).toEqual(["phishing-triage"])
     expect(duplicated.enable_internet_access).toBe(true)
   })
 

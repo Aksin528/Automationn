@@ -7,14 +7,43 @@ import textwrap
 from datetime import datetime
 from importlib.machinery import ModuleSpec
 from types import ModuleType
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from tracecat.exceptions import RegistryValidationError
 from tracecat.git.utils import GitUrl, parse_git_url
+from tracecat.registry.actions.schemas import RegistryActionReadMinimal
 from tracecat.registry.actions.service import RegistryActionsService
+from tracecat.registry.actions.types import IndexEntry
 from tracecat.registry.repository import Repository
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"requires_approval": True}, True),
+        ({"requires_approval": False}, False),
+        ({}, False),
+    ],
+)
+def test_registry_action_read_minimal_from_index_requires_approval(
+    options: dict[str, bool], expected: bool
+) -> None:
+    entry = IndexEntry(
+        id=uuid4(),
+        namespace="tools.test",
+        name="action",
+        action_type="udf",
+        description="Test action",
+        default_title=None,
+        display_group=None,
+        options=options,
+    )
+
+    action = RegistryActionReadMinimal.from_index(entry, origin="builtin")
+
+    assert action.requires_approval is expected
 
 
 @pytest.mark.anyio
@@ -80,11 +109,11 @@ async def test_registry_actions_include_locked_marks_missing_entitlements(
 
 @pytest.mark.anyio
 @pytest.mark.usefixtures("registry_version_with_manifest")
-async def test_registry_actions_include_locked_shows_agent_preset_crud(
+async def test_registry_actions_agent_preset_crud_unlocked_without_agent_addons(
     test_role,
     monkeypatch,
 ) -> None:
-    """Ensure agent preset CRUD actions show as locked when agent add-ons are disabled."""
+    """Agent preset CRUD actions are open source and never locked by agent add-ons."""
     from tracecat.tiers import defaults as tier_defaults
 
     monkeypatch.setattr(
@@ -99,11 +128,14 @@ async def test_registry_actions_include_locked_shows_agent_preset_crud(
         )
 
     actions = {f"{entry.namespace}.{entry.name}": entry for entry, _ in entries}
-    assert actions["ai.agent.create_preset"].missing_entitlements == ("agent_addons",)
-    assert actions["ai.agent.get_preset"].missing_entitlements == ("agent_addons",)
-    assert actions["ai.agent.list_presets"].missing_entitlements == ("agent_addons",)
-    assert actions["ai.agent.update_preset"].missing_entitlements == ("agent_addons",)
-    assert actions["ai.agent.delete_preset"].missing_entitlements == ("agent_addons",)
+    for name in (
+        "ai.agent.create_preset",
+        "ai.agent.get_preset",
+        "ai.agent.list_presets",
+        "ai.agent.update_preset",
+        "ai.agent.delete_preset",
+    ):
+        assert actions[name].missing_entitlements == ()
 
 
 def test_ai_agent_registry_schema_hides_unsupported_agents_config() -> None:
