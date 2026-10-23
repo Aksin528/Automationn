@@ -1694,8 +1694,13 @@ class ClaudeAgentRuntime:
         # and opaque inference profiles. Explicitly disable it for Bedrock roots
         # so the CLI sends full tool definitions without tool_reference blocks.
         # Bedrock subagents are handled through their per-agent disallowed tools.
+        # fork: a self-hosted vLLM gateway rejects tool_reference blocks with
+        # "Unexpected item type in content", so custom model providers get full
+        # tool definitions too.
         env["ENABLE_TOOL_SEARCH"] = (
-            "false" if payload.config.model_provider == "bedrock" else "true"
+            "false"
+            if payload.config.model_provider in {"bedrock", "custom-model-provider"}
+            else "true"
         )
         # The CLI backgrounds subagents and Bash by default, ending the turn
         # before results arrive. The sandbox never re-invokes the agent, so

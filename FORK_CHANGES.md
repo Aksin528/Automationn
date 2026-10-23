@@ -52,6 +52,15 @@ Used by: Telegram approval workflows and the DB workflow `Auto-reject stale appr
 Check after a merge: upstream now has `catalog/service.py::resolve_catalog_id_by_model`; the fork's
 `resolve_catalog_id` may be redundant.
 
+`agent/runtime/claude_code/runtime.py::_sdk_env` (+5, added after the 1.2.1 merge): upstream 1.2.1 sets
+`ENABLE_TOOL_SEARCH=true` for every provider except Bedrock. With tool search the Claude CLI sends
+`tool_reference` blocks inside `tool_result`, and a vLLM `/v1/messages` endpoint (our Qwen) answers HTTP 400
+`Unexpected item type in content`. The fork also turns tool search off for `custom-model-provider`. Upstream
+comment in `llm_proxy.py` assumed gateways tolerate these blocks ("verified against LiteLLM and Ollama").
+**Upstream PR candidate** (generic fix, drop the fork copy once merged). Not covered: a subagent that uses
+`custom-model-provider` under a root with another provider still gets tool search (upstream only handles
+Bedrock subagents through `disallowed_tools`).
+
 ### 1.4 Structured output of agents
 `tracecat/agent/runtime/claude_code/runtime.py` (+96: stop hook that requires `StructuredOutput`, post-tool
 hook that ends the turn after it) and `frontend/.../chat/chat-session-pane.tsx` (+543: readable
@@ -75,6 +84,22 @@ The generated client (`frontend/src/client/*.gen.ts`) must be regenerated from t
 HTTPS to MinIO with the public `Host` header), `.github/workflows/build-push-images.yml`, `ca_wrapper*.sh`,
 `certs/`, `defaults.py`. Prod runs `git pull origin master` and builds from these.
 Upstream added `TRACECAT__TRUSTED_PROXY_CIDRS` (default `127.0.0.1/32`): set it if a proxy sits in front of Caddy.
+
+Files that exist only in the fork and are bind-mounted into containers by `docker-compose.override.yml`
+(none of them is in upstream, so they never conflict, but they depend on upstream internals):
+- `ca_wrapper.sh` (api, agent-executor, agent-worker, litellm) and `ca_wrapper_minio_only.sh` (worker, executor):
+  entrypoint that appends `certs/dgk_ca.pem` (company CA) and/or `caddy_certs/server.crt` (self-signed MinIO/Caddy
+  certificate) to the `certifi` bundle on every start, then runs the original command with `exec "$@"`.
+  Until 1.0.x the last line called `/app/entrypoint.sh`; upstream deleted that script (#3147), so 1.2.1 images
+  fail with `/app/entrypoint.sh: No such file or directory` (exit 127) unless the wrapper ends with `exec "$@"`.
+- `defaults.py` is mounted over `tracecat/tiers/defaults.py` (both `/app/tracecat/...` and the venv copy). It is
+  upstream's file with two changes: `service_accounts=True` and `watchtower=True` on both paths. It is a full
+  copy, so it must be re-copied from upstream on every update (1.2.1 added `multi_workspace`, `agent_channels`,
+  `semantic_search`, `forms`, `tunnels`, `external_secret_stores`; the old copy did not know them).
+- `minio` is pinned to `minio/minio:RELEASE.2025-09-07T16-13-09Z` in the override: upstream 1.2.1 moved MinIO to
+  a Chainguard image that runs as UID 65532, while our TLS certificate is mounted at `/root/.minio/certs`.
+- Also mounted from the repo: `tracecat/agent/gateway.py`, `tracecat/agent/litellm_config.yaml`,
+  `tracecat/agent/sandbox/llm_proxy.py` (same files as in the image, kept for quick edits without a rebuild).
 
 ### 1.8 Fork-only code (no merge conflict possible)
 `soc-mcp/` (Cortex, Splunk, PMG, Check Point tools), `docker/minio/`, and everything stored in the Tracecat
@@ -112,3 +137,13 @@ DB (workflows, `run_python` scripts, tables, presets), which is not in git.
 5. Rebuild and restart `api`, `executor`, `worker`, `agent-worker`, `agent-executor`, `ui`.
 6. Smoke test: an approval-gated agent tool (approve and reject), the case Report tab and the PDF link, the
    `Auto-reject stale approvals` workflow with `dry_run: true`, a Splunk and a Cortex sync run.
+7. `defaults.py`: `diff <(git show <tag>:tracecat/tiers/defaults.py) defaults.py` must show only the two
+   `# fork:` lines (and the header). Re-copy the upstream file and re-apply them if upstream changed it.
+8. `ca_wrapper*.sh`: check that the upstream `Dockerfile` still has no `ENTRYPOINT` (or that the wrapper still
+   hands over to it correctly); after `up -d` no container may be in `Restarting`.
+9. `docker-compose.override.yml`: compare the pinned MinIO image and the list of mounted files with upstream's
+   `docker-compose.yml` (a renamed service or a moved file breaks the mount silently).
+10. Custom LLM source (Qwen/vLLM): 1.2.1 added a per-source `passthrough` flag (`agent_custom_provider.passthrough`,
+    default false). Sources created before 1.2.1 keep `false`, so agent requests go through the managed LiteLLM and
+    vLLM answers `System message must be at the beginning` (HTTP 400, `invalid_request_error`). After the update:
+    Organization settings > Agent > Configuration > Custom sources > Edit > enable **Passthrough mode**, Save, Refresh.
