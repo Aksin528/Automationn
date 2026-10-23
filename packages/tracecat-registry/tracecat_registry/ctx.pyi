@@ -311,6 +311,9 @@ class _CasesAsync:
         order_by: str | Unset = ...,
         sort: Literal["asc", "desc"] | Unset = ...,
         include_rows: bool | Unset = ...,
+        include_payload: bool | Unset = ...,
+        payload_fields: list[str] | Unset = ...,
+        payload_paths: list[list[str]] | Unset = ...,
     ) -> types.CaseListResponse: ...
     async def search_cases(
         self,
@@ -319,6 +322,13 @@ class _CasesAsync:
         cursor: str | Unset = ...,
         reverse: bool | Unset = ...,
         search_term: str | Unset = ...,
+        search_mode: Literal["full_text", "literal"] | Unset = ...,
+        search_columns: list[Literal["summary", "description"]] | Unset = ...,
+        short_id: str | Unset = ...,
+        case_id: str | Unset = ...,
+        filters: dict[str, Any] | Unset = ...,
+        hierarchy: Literal["all", "top_level"] | Unset = ...,
+        parent_id: str | Unset = ...,
         status: list[CaseStatus] | Unset = ...,
         priority: list[CasePriority] | Unset = ...,
         severity: list[CaseSeverity] | Unset = ...,
@@ -332,6 +342,12 @@ class _CasesAsync:
         updated_after: datetime | str | Unset = ...,
         updated_before: datetime | str | Unset = ...,
         include_rows: bool | Unset = ...,
+        include_payload: bool | Unset = ...,
+        payload_fields: list[str] | Unset = ...,
+        payload_paths: list[list[str]] | Unset = ...,
+        include_durations: bool | Unset = ...,
+        include_count: bool | Unset = ...,
+        field_ids: list[str] | Unset = ...,
     ) -> types.CaseListResponse: ...
     async def list_comments(
         self,
@@ -644,6 +660,9 @@ class _Cases:
         order_by: str | Unset = ...,
         sort: Literal["asc", "desc"] | Unset = ...,
         include_rows: bool | Unset = ...,
+        include_payload: bool | Unset = ...,
+        payload_fields: list[str] | Unset = ...,
+        payload_paths: list[list[str]] | Unset = ...,
     ) -> types.CaseListResponse: ...
     def search_cases(
         self,
@@ -652,6 +671,13 @@ class _Cases:
         cursor: str | Unset = ...,
         reverse: bool | Unset = ...,
         search_term: str | Unset = ...,
+        search_mode: Literal["full_text", "literal"] | Unset = ...,
+        search_columns: list[Literal["summary", "description"]] | Unset = ...,
+        short_id: str | Unset = ...,
+        case_id: str | Unset = ...,
+        filters: dict[str, Any] | Unset = ...,
+        hierarchy: Literal["all", "top_level"] | Unset = ...,
+        parent_id: str | Unset = ...,
         status: list[CaseStatus] | Unset = ...,
         priority: list[CasePriority] | Unset = ...,
         severity: list[CaseSeverity] | Unset = ...,
@@ -665,6 +691,12 @@ class _Cases:
         updated_after: datetime | str | Unset = ...,
         updated_before: datetime | str | Unset = ...,
         include_rows: bool | Unset = ...,
+        include_payload: bool | Unset = ...,
+        payload_fields: list[str] | Unset = ...,
+        payload_paths: list[list[str]] | Unset = ...,
+        include_durations: bool | Unset = ...,
+        include_count: bool | Unset = ...,
+        field_ids: list[str] | Unset = ...,
     ) -> types.CaseListResponse: ...
     def list_comments(
         self,

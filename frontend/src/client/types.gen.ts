@@ -734,6 +734,9 @@ export type AgentPresetCreate = {
   tool_approvals?: {
     [key: string]: boolean
   } | null
+  tool_tunnels?: {
+    [key: string]: string
+  } | null
   mcp_integrations?: Array<string> | null
   library_skills?: Array<string> | null
   agents?: AgentSubagentsConfig_Input
@@ -788,6 +791,9 @@ export type AgentPresetRead = {
   tool_approvals?: {
     [key: string]: boolean
   } | null
+  tool_tunnels?: {
+    [key: string]: string
+  } | null
   mcp_integrations?: Array<string> | null
   library_skills?: Array<string> | null
   agents?: AgentSubagentsConfig_Output
@@ -825,6 +831,10 @@ export type AgentPresetReadMinimal = {
   current_version_id?: string | null
   capabilities?: Array<AgentPresetCapability>
   tool_summary?: AgentPresetToolSummary
+  /**
+   * Workspace skills bound to the preset head.
+   */
+  skill_ids?: Array<string>
   current_version_subagent_eligibility?: AgentPresetSubagentEligibility
   created_at: string
   updated_at: string
@@ -939,6 +949,9 @@ export type AgentPresetUpdate = {
   tool_approvals?: {
     [key: string]: boolean
   } | null
+  tool_tunnels?: {
+    [key: string]: string
+  } | null
   mcp_integrations?: Array<string> | null
   library_skills?: Array<string> | null
   agents?: AgentSubagentsConfig_Input | null
@@ -990,6 +1003,7 @@ export type AgentPresetVersionDiff = {
   scalar_changes?: Array<ScalarFieldChange>
   list_changes?: Array<StringListFieldChange>
   tool_approval_changes?: Array<ToolApprovalFieldChange>
+  tool_tunnel_changes?: Array<ToolTunnelFieldChange>
   skill_changes?: Array<AgentPresetSkillBindingChange>
   total_changes?: number
 }
@@ -1008,6 +1022,9 @@ export type AgentPresetVersionRead = {
   namespaces?: Array<string> | null
   tool_approvals?: {
     [key: string]: boolean
+  } | null
+  tool_tunnels?: {
+    [key: string]: string
   } | null
   mcp_integrations?: Array<string> | null
   library_skills?: Array<string> | null
@@ -1373,6 +1390,13 @@ export type AlertArtifact = {
   title: string
   scope?: ArtifactScope | null
   type?: "alert"
+}
+
+/**
+ * A conjunction of one or more filters.
+ */
+export type AndClause = {
+  and: Array<Filter>
 }
 
 export type AnyAttachedSubagentRef =
@@ -2759,6 +2783,31 @@ export type CaseFieldUpdate = {
 }
 
 /**
+ * Server-defined operators and input metadata for one searchable field.
+ */
+export type CaseFilterField = {
+  field: string
+  label: string
+  kind: FieldKind
+  operators: Array<FilterOp>
+  choices?: Array<string> | null
+  range_choices?: Array<string> | null
+  input_type?: "text" | "number" | "date" | "datetime-local"
+}
+
+export type input_type = "text" | "number" | "date" | "datetime-local"
+
+/**
+ * Discoverable filter fields and shared query limits.
+ */
+export type CaseFilterMetadata = {
+  fields: Array<CaseFilterField>
+  max_depth?: number
+  max_conditions?: number
+  max_values?: number
+}
+
+/**
  * One table with at least one row linked to a case.
  *
  * ``row_count`` counts links, including links whose source row was deleted.
@@ -2803,6 +2852,50 @@ export type CasePriority =
   | "critical"
   | "other"
 
+/**
+ * Matching criteria shared by case search and filtered status counts.
+ *
+ * Explicit text, identity, and hierarchy constraints are combined with
+ * ``filters`` using AND. Workspace and entitlement checks belong to the
+ * service and cannot be supplied or negated by this request.
+ *
+ * Tag membership uses existing filter nodes: ``in`` matches any tag, an
+ * ``and`` of ``contains`` conditions requires all tags, and ``not`` around
+ * ``in`` excludes the selected tags. ``is_null`` matches no tags.
+ *
+ * Scalar dropdown/custom-field exclusions retain SQL NULL semantics:
+ * ``ne``, ``not_in``, and negated comparisons exclude unset values. Include
+ * unset values explicitly with an ``or`` containing ``is_null``.
+ */
+export type CaseQuery = {
+  /**
+   * AND/OR/NOT conditions. Payload scalar equality uses field="payload.metadata.product.vendor_name", op="eq", value="Microsoft". Dot-separated literal keys or numeric array indices; keys containing dots are unsupported. Equality preserves JSON types. Payload is_null matches a missing path; explicit JSON null is a present value. Exclusions omit missing paths unless ORed with is_null.
+   */
+  filters?: Filter | null
+  search_term?: string | null
+  /**
+   * Explicit word/phrase or escaped substring search. Omitted mode retains legacy matching and ordering.
+   */
+  search_mode?: SearchMode | null
+  search_columns?: Array<"summary" | "description"> | null
+  short_id?: string | null
+  case_id?: string | null
+  hierarchy?: "all" | "top_level"
+  parent_id?: string | null
+  status?: Array<CaseStatus> | null
+  priority?: Array<CasePriority> | null
+  severity?: Array<CaseSeverity> | null
+  assignee_id?: Array<string | "unassigned" | "__UNASSIGNED__"> | null
+  tags?: Array<string> | null
+  dropdown?: Array<string> | null
+  start_time?: string | null
+  end_time?: string | null
+  updated_after?: string | null
+  updated_before?: string | null
+}
+
+export type hierarchy = "all" | "top_level"
+
 export type CaseRead = {
   id: string
   short_id: string
@@ -2836,6 +2929,7 @@ export type CaseReadMinimal = {
   is_outside_filters?: boolean
   id: string
   short_id: string
+  search_match?: CaseSearchMatchRead | null
   created_at: string
   updated_at: string
   summary: string
@@ -2870,6 +2964,87 @@ export type CaseRef = {
 export type CaseSearchAggregateRead = {
   total: number
   status_groups: CaseStatusGroupCounts
+}
+
+/**
+ * Bounded lexical metadata beside case fields; excerpts are untrusted text.
+ */
+export type CaseSearchMatchRead = {
+  score?: number | null
+  matched_columns?: Array<"summary" | "description" | "id" | "short_id">
+  excerpts?: Array<string>
+}
+
+export type CaseSearchOrder =
+  | "relevance"
+  | "created_at"
+  | "updated_at"
+  | "priority"
+  | "severity"
+  | "status"
+  | "tasks"
+  | "id"
+  | "short_id"
+  | "assignee"
+  | "tags"
+
+/**
+ * A case query with pagination, sorting, and independent result details.
+ */
+export type CaseSearchRequest = {
+  /**
+   * Maximum items per page
+   */
+  limit?: number
+  /**
+   * Cursor for pagination
+   */
+  cursor?: string | null
+  /**
+   * Reverse pagination direction
+   */
+  reverse?: boolean
+  /**
+   * AND/OR/NOT conditions. Payload scalar equality uses field="payload.metadata.product.vendor_name", op="eq", value="Microsoft". Dot-separated literal keys or numeric array indices; keys containing dots are unsupported. Equality preserves JSON types. Payload is_null matches a missing path; explicit JSON null is a present value. Exclusions omit missing paths unless ORed with is_null.
+   */
+  filters?: Filter | null
+  search_term?: string | null
+  /**
+   * Explicit word/phrase or escaped substring search. Omitted mode retains legacy matching and ordering.
+   */
+  search_mode?: SearchMode | null
+  search_columns?: Array<"summary" | "description"> | null
+  short_id?: string | null
+  case_id?: string | null
+  hierarchy?: "all" | "top_level"
+  parent_id?: string | null
+  status?: Array<CaseStatus> | null
+  priority?: Array<CasePriority> | null
+  severity?: Array<CaseSeverity> | null
+  assignee_id?: Array<string | "unassigned" | "__UNASSIGNED__"> | null
+  tags?: Array<string> | null
+  dropdown?: Array<string> | null
+  start_time?: string | null
+  end_time?: string | null
+  updated_after?: string | null
+  updated_before?: string | null
+  order_by?: CaseSearchOrder | null
+  sort?: "asc" | "desc" | null
+  include_rows?: boolean
+  field_ids?: Array<string> | null
+  include_durations?: boolean
+  include_payload?: boolean
+  payload_fields?: Array<string> | null
+  payload_paths?: Array<Array<string>> | null
+  include_count?: boolean
+  /**
+   * Place complete case references before filtered text matches within the authorized workspace.
+   */
+  promote_exact_match?: boolean
+  /**
+   * The ordinary filter population matches no cases.
+   */
+  match_none?: boolean
 }
 
 /**
@@ -3247,6 +3422,10 @@ export type ChatMessage = {
   cancelled?: {
     [key: string]: unknown
   } | null
+  /**
+   * When the agent runtime recorded the message
+   */
+  created_at?: string | null
 }
 
 /**
@@ -3650,6 +3829,15 @@ export type CommitInfo = {
   pr_number?: number | null
   pr_reused?: boolean
   message?: string
+}
+
+/**
+ * A predicate over one resolver-defined field.
+ */
+export type Condition = {
+  field: string
+  op: FilterOp
+  value?: FilterValue | null
 }
 
 /**
@@ -5062,6 +5250,19 @@ export type FieldDiff = {
 }
 
 /**
+ * Value families understood by the shared filter compiler.
+ */
+export type FieldKind =
+  | "text"
+  | "number"
+  | "boolean"
+  | "temporal"
+  | "enum"
+  | "uuid"
+  | "tag"
+  | "json_scalar"
+
+/**
  * A file part of a message.
  */
 export type FileUIPart = {
@@ -5075,6 +5276,28 @@ export type FileUIPart = {
     }
   }
 }
+
+export type Filter = Condition | AndClause | OrClause | NotClause
+
+/**
+ * Operations supported by the shared filter language.
+ */
+export type FilterOp =
+  | "eq"
+  | "ne"
+  | "in"
+  | "not_in"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "contains"
+  | "starts_with"
+  | "is_null"
+
+export type FilterScalar = string | number | boolean
+
+export type FilterValue = FilterScalar | Array<FilterScalar>
 
 /**
  * An action result reused from a previous run of the workflow.
@@ -6748,6 +6971,10 @@ export type MCPHttpIntegrationCreate = {
    */
   oauth_integration_id?: string | null
   /**
+   * Workspace tunnel that every request to this server goes through
+   */
+  tunnel_id?: string | null
+  /**
    * HTTP headers as a JSON object. Required for custom auth type; optional additional headers for OAuth2 auth type.
    */
   custom_credentials?: string | null
@@ -6767,6 +6994,7 @@ export type MCPHttpIntegrationTestConnectionRequest = {
   server_uri: string
   auth_type?: MCPAuthType
   oauth_integration_id?: string | null
+  tunnel_id?: string | null
   /**
    * JSON object of custom headers; falls back to stored headers when omitted
    */
@@ -6799,6 +7027,8 @@ export type MCPHttpServerConfig = {
   timeout?: number
   id?: string
   tools?: Array<MCPServerToolSummary>
+  tunnel_id?: string
+  tunnel_proxy?: string
 }
 
 export type transport = "http" | "sse"
@@ -6825,6 +7055,7 @@ export type MCPIntegrationRead = {
   server_uri: string | null
   auth_type: MCPAuthType
   oauth_integration_id: string | null
+  tunnel_id?: string | null
   state:
     | "not_configured"
     | "configured"
@@ -6875,6 +7106,10 @@ export type MCPIntegrationUpdate = {
   server_uri?: string | null
   auth_type?: MCPAuthType | null
   oauth_integration_id?: string | null
+  /**
+   * Workspace tunnel for this HTTP server. Send null to stop using one.
+   */
+  tunnel_id?: string | null
   /**
    * Custom credentials as JSON headers. Required for custom auth type; optional additional headers for OAuth2 auth type.
    */
@@ -7317,6 +7552,13 @@ export type ModelUsage = {
   provider?: string
 }
 
+/**
+ * The negation of one filter.
+ */
+export type NotClause = {
+  not: Filter
+}
+
 export type OAuth2AuthorizeResponse = {
   authorization_url: string
 }
@@ -7344,6 +7586,13 @@ export type ObjectRef = {
 }
 
 export type encoding = "json" | "json+zstd" | "json+gzip"
+
+/**
+ * A disjunction of one or more filters.
+ */
+export type OrClause = {
+  or: Array<Filter>
+}
 
 /**
  * Create organization request.
@@ -7782,6 +8031,30 @@ export type PlatformRegistrySettingsUpdate = {
   git_repo_url?: string | null
   git_repo_package_name?: string | null
   git_allowed_domains?: Array<string> | null
+}
+
+/**
+ * Platform admin IP allowlist settings response.
+ */
+export type PlatformSecuritySettingsRead = {
+  ip_allowlist_enabled: boolean
+  ip_allowlists: Array<IPAllowlist>
+}
+
+/**
+ * Update the platform admin IP allowlist.
+ *
+ * Applies only to the platform admin API, not to organizations.
+ */
+export type PlatformSecuritySettingsUpdate = {
+  /**
+   * Restrict organization API access to the configured IP allowlists. Has no effect while no allowlists exist.
+   */
+  ip_allowlist_enabled?: boolean
+  /**
+   * Named groups of allowed IP addresses or CIDR ranges.
+   */
+  ip_allowlists?: Array<IPAllowlist>
 }
 
 export type Position = {
@@ -8723,6 +8996,7 @@ export type RuntimeErrorKind =
   | "sandbox.resource_limit_exceeded"
   | "workflow.definition.not_found"
   | "workflow.definition.lookup_unavailable"
+  | "workflow.definition.invalid"
   | "workflow.definition.invalid_data"
   | "workflow.trigger.input_invalid"
   | "workflow.subflow.input_invalid"
@@ -8743,6 +9017,7 @@ export type RuntimeErrorKind =
   | "agent.llm.budget_exceeded"
   | "agent.llm.rate_limited"
   | "agent.llm.read_timeout"
+  | "agent.llm.stream_interrupted"
   | "agent.mcp.auth_failed"
   | "agent.mcp.unavailable"
   | "agent.execution.failed"
@@ -9192,6 +9467,11 @@ export type SearchIndexStatus = {
   backfill_complete?: boolean
   partial?: boolean
 }
+
+/**
+ * Explicit lexical modes; omitted table mode remains a legacy policy.
+ */
+export type SearchMode = "full_text" | "literal"
 
 /**
  * Workspace availability states controlling search and indexing.
@@ -10997,6 +11277,15 @@ export type ToolResultBlock = {
   is_error?: boolean | null
 }
 
+/**
+ * Tunnel routing diff for a single tool.
+ */
+export type ToolTunnelFieldChange = {
+  tool: string
+  old_value?: string | null
+  new_value?: string | null
+}
+
 export type ToolUIPartInputAvailable = {
   type: string
   toolCallId: string
@@ -11077,6 +11366,16 @@ export type type6 = "schedule" | "webhook"
  */
 export type TriggerType = "manual" | "scheduled" | "webhook" | "case" | "form"
 
+/**
+ * Whether this deployment can run tunnel gateways.
+ */
+export type TunnelAvailabilityRead = {
+  /**
+   * False when Tracecat runs without the Kubernetes gateway backend, e.g. on Docker Compose or Fargate.
+   */
+  available: boolean
+}
+
 export type TunnelCreate = {
   name: string
   description?: string | null
@@ -11089,6 +11388,29 @@ export type TunnelCreate = {
   client_secret: string
   allowed_targets: Array<TunnelTarget>
   enabled?: boolean
+}
+
+/**
+ * A tunnel and the resources that reference it.
+ */
+export type TunnelDetailRead = {
+  id: string
+  workspace_id: string
+  name: string
+  description: string | null
+  provider: TunnelProvider
+  endpoint: string
+  client_id: string
+  allowed_targets: Array<TunnelTarget>
+  enabled: boolean
+  has_gateway_key: boolean
+  managed: boolean
+  created_at: string
+  updated_at: string
+  /**
+   * MCP integrations, current agent preset versions and workflows that route through the tunnel. Each kind is capped at 200 entries.
+   */
+  referenced_by: Array<TunnelReference>
 }
 
 /**
@@ -11122,6 +11444,24 @@ export type TunnelRead = {
   created_at: string
   updated_at: string
 }
+
+/**
+ * A workspace resource that routes traffic through a tunnel.
+ */
+export type TunnelReference = {
+  kind: TunnelReferenceKind
+  id: string
+  name: string
+  /**
+   * Where in the resource the tunnel is set, e.g. an action or tool
+   */
+  detail?: string | null
+}
+
+export type TunnelReferenceKind =
+  | "mcp_integration"
+  | "agent_preset"
+  | "workflow"
 
 export type TunnelStatusRead = {
   tunnel_id: string
@@ -11344,6 +11684,16 @@ export type UserScopesRead = {
    * List of effective scope strings for the user
    */
   scopes: Array<string>
+}
+
+/**
+ * Identity fields returned by the org-scoped user email search.
+ */
+export type UserSearchRead = {
+  id: string
+  email: string
+  first_name?: string | null
+  last_name?: string | null
 }
 
 /**
@@ -12063,6 +12413,10 @@ export type WorkflowExecutionCreate = {
   workflow_id: string
   inputs?: unknown | null
   /**
+   * Case task that started this run. The run is then listed under the task's workflow runs.
+   */
+  case_task_id?: string | null
+  /**
    * Override the workflow's time anchor for FN.now() and related functions. If not provided, computed from TemporalScheduledStartTime (for schedules) or workflow start_time (for other triggers).
    */
   time_anchor?: string | null
@@ -12677,6 +13031,82 @@ export type WorkflowUpdate = {
   config?: DSLConfig_Input | null
   alias?: string | null
   error_handler?: string | null
+}
+
+/**
+ * A workspace's model subset and the organization models it can pick from.
+ */
+export type WorkspaceAgentModelAccessRead = {
+  /**
+   * True when the workspace has no subset and uses every organization-enabled model.
+   */
+  inherit_all: boolean
+  /**
+   * Catalog IDs in the workspace's subset. Empty when inherit_all is true.
+   */
+  catalog_ids: Array<string>
+  /**
+   * Models enabled for the organization. Provider URLs are left out: they can carry credentials, and a candidate may sit outside the workspace's subset.
+   */
+  candidates: Array<WorkspaceAgentModelCandidate>
+}
+
+/**
+ * Replace a workspace's model subset, or clear it to inherit every org model.
+ */
+export type WorkspaceAgentModelAccessUpdate = {
+  inherit_all: boolean
+  catalog_ids?: Array<string>
+}
+
+/**
+ * Catalog entry a workspace can pick, labelled with its custom provider.
+ */
+export type WorkspaceAgentModelCandidate = {
+  id: string
+  custom_provider_id: string | null
+  organization_id: string | null
+  model_provider: string
+  model_name: string
+  model_metadata: {
+    [key: string]: unknown
+  } | null
+  custom_provider_name?: string | null
+}
+
+/**
+ * Models a workspace can use, and its default model.
+ */
+export type WorkspaceAgentModelListResponse = {
+  items: Array<WorkspaceAgentModelRead>
+  /**
+   * The organization's default model, if it is enabled for this workspace.
+   */
+  default_catalog_id?: string | null
+  /**
+   * Whether the organization has a default model, enabled here or not.
+   */
+  has_org_default?: boolean
+  /**
+   * True when the workspace has a model subset and the organization has disabled every model in it.
+   */
+  workspace_subset_disabled?: boolean
+}
+
+/**
+ * Catalog entry a workspace can use, with its provider's runtime URL.
+ */
+export type WorkspaceAgentModelRead = {
+  id: string
+  custom_provider_id: string | null
+  organization_id: string | null
+  model_provider: string
+  model_name: string
+  model_metadata: {
+    [key: string]: unknown
+  } | null
+  custom_provider_name?: string | null
+  custom_provider_base_url?: string | null
 }
 
 export type WorkspaceCreate = {
@@ -13523,6 +13953,10 @@ export type WorkflowExecutionsCreateWorkflowExecutionResponse =
   WorkflowExecutionCreateResponse
 
 export type WorkflowExecutionsSearchWorkflowExecutionsData = {
+  /**
+   * Filter by the case task that started the run.
+   */
+  caseTaskId?: string | null
   closeTimeFrom?: string | null
   closeTimeTo?: string | null
   cursor?: string | null
@@ -13972,6 +14406,12 @@ export type TunnelsCreateTunnelData = {
 
 export type TunnelsCreateTunnelResponse = TunnelRead
 
+export type TunnelsGetTunnelAvailabilityData = {
+  workspaceId: string
+}
+
+export type TunnelsGetTunnelAvailabilityResponse = TunnelAvailabilityRead
+
 export type TunnelsCreateManagedTunnelData = {
   requestBody: ManagedTunnelCreate
   workspaceId: string
@@ -13991,7 +14431,7 @@ export type TunnelsGetTunnelData = {
   workspaceId: string
 }
 
-export type TunnelsGetTunnelResponse = TunnelRead
+export type TunnelsGetTunnelResponse = TunnelDetailRead
 
 export type TunnelsUpdateTunnelData = {
   requestBody: TunnelUpdate
@@ -14098,7 +14538,7 @@ export type UsersSearchUserData = {
   workspaceId?: string | null
 }
 
-export type UsersSearchUserResponse = UserRead
+export type UsersSearchUserResponse = UserSearchRead
 
 export type OrganizationGetOrganizationResponse =
   tracecat__organization__schemas__OrgRead
@@ -14384,7 +14824,20 @@ export type GetWorkspaceModelsData = {
   workspaceId: string
 }
 
-export type GetWorkspaceModelsResponse = AgentCatalogListResponse
+export type GetWorkspaceModelsResponse = WorkspaceAgentModelListResponse
+
+export type GetWorkspaceModelAccessData = {
+  workspaceId: string
+}
+
+export type GetWorkspaceModelAccessResponse = WorkspaceAgentModelAccessRead
+
+export type UpdateWorkspaceModelAccessData = {
+  requestBody: WorkspaceAgentModelAccessUpdate
+  workspaceId: string
+}
+
+export type UpdateWorkspaceModelAccessResponse = WorkspaceAgentModelAccessRead
 
 export type EnableModelData = {
   requestBody: AgentModelAccessCreate
@@ -15431,6 +15884,20 @@ export type AdminUpdateRegistrySettingsData = {
 
 export type AdminUpdateRegistrySettingsResponse = PlatformRegistrySettingsRead
 
+export type AdminGetSecuritySettingsResponse = PlatformSecuritySettingsRead
+
+export type AdminUpdateSecuritySettingsData = {
+  requestBody: PlatformSecuritySettingsUpdate
+}
+
+export type AdminUpdateSecuritySettingsResponse = PlatformSecuritySettingsRead
+
+export type AdminCheckIpAllowlistData = {
+  requestBody: IPAllowlistCheckRequest
+}
+
+export type AdminCheckIpAllowlistResponse = IPAllowlistCheckResult
+
 export type AdminListTiersData = {
   /**
    * Include inactive tiers in results
@@ -16278,6 +16745,10 @@ export type CasesListCasesData = {
    */
   hierarchy?: "all" | "top_level"
   /**
+   * Include the exact filtered total_estimate for compatibility. Set false when fetching aggregate counts separately; total_estimate will be null.
+   */
+  includeCount?: boolean
+  /**
    * Include case duration values
    */
   includeDurations?: boolean
@@ -16294,7 +16765,7 @@ export type CasesListCasesData = {
    */
   limit?: number
   /**
-   * Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks). Default: created_at
+   * Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks, assignee, tags). Default: created_at
    */
   orderBy?:
     | "created_at"
@@ -16303,7 +16774,17 @@ export type CasesListCasesData = {
     | "severity"
     | "status"
     | "tasks"
+    | "assignee"
+    | "tags"
     | null
+  /**
+   * Return only these literal top-level payload keys, automatically including the subset regardless of include_payload. Dots are literal; nested values are returned whole. Missing keys are omitted and null values preserved. An empty list acts as omitted; an empty string selects the literal empty key.
+   */
+  payloadFields?: Array<string> | null
+  /**
+   * JSON-encoded array of up to 100 object paths, e.g. [["alert","source","ip"]]. Each path contains 1 to 32 literal keys. Preserves nesting, combines with payload_fields, and includes the subset automatically. Selected parents include their whole value. Missing paths are omitted; nulls are preserved. Arrays can be selected whole, without index traversal. An empty list acts as omitted.
+   */
+  payloadPaths?: string | null
   /**
    * Reverse pagination direction
    */
@@ -16323,6 +16804,19 @@ export type CasesCreateCaseData = {
 }
 
 export type CasesCreateCaseResponse = CaseRead
+
+export type CasesListCaseFilterFieldsData = {
+  workspaceId: string
+}
+
+export type CasesListCaseFilterFieldsResponse = CaseFilterMetadata
+
+export type CasesQueryCasesData = {
+  requestBody: CaseSearchRequest
+  workspaceId: string
+}
+
+export type CasesQueryCasesResponse = CursorPaginatedResponse_CaseReadMinimal_
 
 export type CasesSearchCasesData = {
   /**
@@ -16354,6 +16848,10 @@ export type CasesSearchCasesData = {
    */
   hierarchy?: "all" | "top_level"
   /**
+   * Include the exact filtered total_estimate for compatibility. Set false on all pages when fetching aggregate counts separately; total_estimate will be null.
+   */
+  includeCount?: boolean
+  /**
    * Include case duration values
    */
   includeDurations?: boolean
@@ -16374,20 +16872,21 @@ export type CasesSearchCasesData = {
    */
   matchNone?: boolean
   /**
-   * Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks). Default: created_at
+   * Full-text defaults to relevance; legacy/literal defaults to created_at. Explicit columns preserve their ordering.
    */
-  orderBy?:
-    | "created_at"
-    | "updated_at"
-    | "priority"
-    | "severity"
-    | "status"
-    | "tasks"
-    | null
+  orderBy?: CaseSearchOrder | null
   /**
    * Return only the sub-cases of this parent case
    */
   parentId?: string | null
+  /**
+   * Return only these literal top-level payload keys, automatically including the subset regardless of include_payload. Dots are literal; nested values are returned whole. Missing keys are omitted and null values preserved. An empty list acts as omitted; an empty string selects the literal empty key.
+   */
+  payloadFields?: Array<string> | null
+  /**
+   * JSON-encoded array of up to 100 object paths, e.g. [["alert","source","ip"]]. Each path contains 1 to 32 literal keys. Preserves nesting, combines with payload_fields, and includes the subset automatically. Selected parents include their whole value. Missing paths are omitted; nulls are preserved. Arrays can be selected whole, without index traversal. An empty list acts as omitted.
+   */
+  payloadPaths?: string | null
   /**
    * Filter by case priority
    */
@@ -16400,6 +16899,14 @@ export type CasesSearchCasesData = {
    * Reverse pagination direction
    */
   reverse?: boolean
+  /**
+   * Selected text fields; omitted searches both.
+   */
+  searchColumns?: Array<"summary" | "description"> | null
+  /**
+   * Explicit full_text or literal; omitted mode preserves legacy search.
+   */
+  searchMode?: SearchMode | null
   /**
    * Text to search for in case summary, description, short ID, or case UUID
    */
@@ -16441,11 +16948,19 @@ export type CasesSearchCasesData = {
 
 export type CasesSearchCasesResponse = CursorPaginatedResponse_CaseReadMinimal_
 
+export type CasesQueryCaseAggregatesData = {
+  requestBody: CaseQuery
+  workspaceId: string
+}
+
+export type CasesQueryCaseAggregatesResponse = CaseSearchAggregateRead
+
 export type CasesSearchCaseAggregatesData = {
   /**
    * Filter by assignee ID or 'unassigned'
    */
   assigneeId?: Array<string> | null
+  caseId?: string | null
   /**
    * Filter by dropdown values. Format: definition_ref:option_ref (AND across definitions, OR within)
    */
@@ -16467,6 +16982,14 @@ export type CasesSearchCaseAggregatesData = {
    */
   priority?: Array<CasePriority> | null
   /**
+   * Selected text fields; omitted searches both.
+   */
+  searchColumns?: Array<"summary" | "description"> | null
+  /**
+   * Explicit full_text or literal; omitted mode preserves legacy search.
+   */
+  searchMode?: SearchMode | null
+  /**
    * Text to search for in case summary, description, short ID, or case UUID
    */
   searchTerm?: string | null
@@ -16474,6 +16997,7 @@ export type CasesSearchCaseAggregatesData = {
    * Filter by case severity
    */
   severity?: Array<CaseSeverity> | null
+  shortId?: string | null
   /**
    * Return cases created at or after this timestamp
    */
@@ -16782,6 +17306,8 @@ export type CasesListLinkedCasesData = {
     | "severity"
     | "status"
     | "tasks"
+    | "assignee"
+    | "tags"
     | null
   reverse?: boolean
   rowId: string
@@ -19476,6 +20002,21 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/workspaces/{workspace_id}/tunnels/availability": {
+    get: {
+      req: TunnelsGetTunnelAvailabilityData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: TunnelAvailabilityRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/workspaces/{workspace_id}/tunnels/managed": {
     post: {
       req: TunnelsCreateManagedTunnelData
@@ -19513,7 +20054,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: TunnelRead
+        200: TunnelDetailRead
         /**
          * Validation Error
          */
@@ -19722,7 +20263,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: UserRead
+        200: UserSearchRead
         /**
          * Validation Error
          */
@@ -20378,7 +20919,35 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: AgentCatalogListResponse
+        200: WorkspaceAgentModelListResponse
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/workspaces/{workspace_id}/agent-model-access": {
+    get: {
+      req: GetWorkspaceModelAccessData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: WorkspaceAgentModelAccessRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    put: {
+      req: UpdateWorkspaceModelAccessData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: WorkspaceAgentModelAccessRead
         /**
          * Validation Error
          */
@@ -22275,6 +22844,44 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/admin/settings/security": {
+    get: {
+      res: {
+        /**
+         * Successful Response
+         */
+        200: PlatformSecuritySettingsRead
+      }
+    }
+    patch: {
+      req: AdminUpdateSecuritySettingsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: PlatformSecuritySettingsRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/settings/security/ip-allowlist/check": {
+    post: {
+      req: AdminCheckIpAllowlistData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: IPAllowlistCheckResult
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/admin/tiers": {
     get: {
       req: AdminListTiersData
@@ -23968,7 +24575,35 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/workspaces/{workspace_id}/cases/search/fields": {
+    get: {
+      req: CasesListCaseFilterFieldsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: CaseFilterMetadata
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/workspaces/{workspace_id}/cases/search": {
+    post: {
+      req: CasesQueryCasesData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: CursorPaginatedResponse_CaseReadMinimal_
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
     get: {
       req: CasesSearchCasesData
       res: {
@@ -23984,6 +24619,19 @@ export type $OpenApiTs = {
     }
   }
   "/workspaces/{workspace_id}/cases/search/aggregate": {
+    post: {
+      req: CasesQueryCaseAggregatesData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: CaseSearchAggregateRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
     get: {
       req: CasesSearchCaseAggregatesData
       res: {

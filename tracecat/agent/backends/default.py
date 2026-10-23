@@ -17,6 +17,7 @@ from tracecat.agent.backends.types import (
 )
 from tracecat.agent.common.stream_types import HarnessType
 from tracecat.agent.schemas import AgentOutput, RunAgentArgs
+from tracecat.agent.types import clamp_agent_timeout_seconds
 from tracecat.dsl.common import RETRY_POLICIES
 
 
@@ -45,6 +46,8 @@ class DefaultBackend(AgentBackend[AgentWorkflowArgs, AgentOutput]):
             active_stream_id=context.stream_id,
             curr_run_id=context.run_id,
             config=context.config,
+            # Chat turns always get the agent default, never the ceiling.
+            timeout_seconds=clamp_agent_timeout_seconds(None),
         )
         return AgentWorkflowArgs(
             role=context.role,

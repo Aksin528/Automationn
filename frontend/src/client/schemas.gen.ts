@@ -2479,6 +2479,20 @@ export const $AgentPresetCreate = {
       ],
       title: "Tool Approvals",
     },
+    tool_tunnels: {
+      anyOf: [
+        {
+          additionalProperties: {
+            type: "string",
+          },
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tool Tunnels",
+    },
     mcp_integrations: {
       anyOf: [
         {
@@ -2799,6 +2813,20 @@ export const $AgentPresetRead = {
       ],
       title: "Tool Approvals",
     },
+    tool_tunnels: {
+      anyOf: [
+        {
+          additionalProperties: {
+            type: "string",
+          },
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tool Tunnels",
+    },
     mcp_integrations: {
       anyOf: [
         {
@@ -3025,6 +3053,15 @@ export const $AgentPresetReadMinimal = {
     },
     tool_summary: {
       $ref: "#/components/schemas/AgentPresetToolSummary",
+    },
+    skill_ids: {
+      items: {
+        type: "string",
+        format: "uuid",
+      },
+      type: "array",
+      title: "Skill Ids",
+      description: "Workspace skills bound to the preset head.",
     },
     current_version_subagent_eligibility: {
       $ref: "#/components/schemas/AgentPresetSubagentEligibility",
@@ -3511,6 +3548,20 @@ export const $AgentPresetUpdate = {
       ],
       title: "Tool Approvals",
     },
+    tool_tunnels: {
+      anyOf: [
+        {
+          additionalProperties: {
+            type: "string",
+          },
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tool Tunnels",
+    },
     mcp_integrations: {
       anyOf: [
         {
@@ -3879,6 +3930,13 @@ export const $AgentPresetVersionDiff = {
       type: "array",
       title: "Tool Approval Changes",
     },
+    tool_tunnel_changes: {
+      items: {
+        $ref: "#/components/schemas/ToolTunnelFieldChange",
+      },
+      type: "array",
+      title: "Tool Tunnel Changes",
+    },
     skill_changes: {
       items: {
         $ref: "#/components/schemas/AgentPresetSkillBindingChange",
@@ -4001,6 +4059,20 @@ export const $AgentPresetVersionRead = {
         },
       ],
       title: "Tool Approvals",
+    },
+    tool_tunnels: {
+      anyOf: [
+        {
+          additionalProperties: {
+            type: "string",
+          },
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tool Tunnels",
     },
     mcp_integrations: {
       anyOf: [
@@ -5475,6 +5547,24 @@ export const $AlertArtifact = {
   required: ["id", "title"],
   title: "AlertArtifact",
   description: "Alert artifact stub. Extend when alert surfaces are wired.",
+} as const
+
+export const $AndClause = {
+  properties: {
+    and: {
+      items: {
+        $ref: "#/components/schemas/Filter",
+      },
+      type: "array",
+      minItems: 1,
+      title: "And",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  required: ["and"],
+  title: "AndClause",
+  description: "A conjunction of one or more filters.",
 } as const
 
 export const $AnyAttachedSubagentRef = {
@@ -10126,6 +10216,99 @@ export const $CaseFieldUpdate = {
   description: "Update a case field.",
 } as const
 
+export const $CaseFilterField = {
+  properties: {
+    field: {
+      type: "string",
+      title: "Field",
+    },
+    label: {
+      type: "string",
+      title: "Label",
+    },
+    kind: {
+      $ref: "#/components/schemas/FieldKind",
+    },
+    operators: {
+      items: {
+        $ref: "#/components/schemas/FilterOp",
+      },
+      type: "array",
+      title: "Operators",
+    },
+    choices: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Choices",
+    },
+    range_choices: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Range Choices",
+    },
+    input_type: {
+      type: "string",
+      enum: ["text", "number", "date", "datetime-local"],
+      title: "Input Type",
+      default: "text",
+    },
+  },
+  type: "object",
+  required: ["field", "label", "kind", "operators"],
+  title: "CaseFilterField",
+  description:
+    "Server-defined operators and input metadata for one searchable field.",
+} as const
+
+export const $CaseFilterMetadata = {
+  properties: {
+    fields: {
+      items: {
+        $ref: "#/components/schemas/CaseFilterField",
+      },
+      type: "array",
+      title: "Fields",
+    },
+    max_depth: {
+      type: "integer",
+      title: "Max Depth",
+      default: 4,
+    },
+    max_conditions: {
+      type: "integer",
+      title: "Max Conditions",
+      default: 50,
+    },
+    max_values: {
+      type: "integer",
+      title: "Max Values",
+      default: 1000,
+    },
+  },
+  type: "object",
+  required: ["fields"],
+  title: "CaseFilterMetadata",
+  description: "Discoverable filter fields and shared query limits.",
+} as const
+
 export const $CaseLinkedTableRead = {
   properties: {
     table_id: {
@@ -10204,6 +10387,265 @@ Values:
     HIGH (3): Critical functionality or network access is interrupted, degraded or unusable, having a severe impact on services availability. No acceptable alternative is possible
     CRITICAL (4): Interruption making a critical functionality inaccessible or a complete network interruption causing a severe impact on services availability. There is no possible alternative
     OTHER (99): The priority is not normalized`,
+} as const
+
+export const $CaseQuery = {
+  properties: {
+    filters: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/Filter",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description:
+        'AND/OR/NOT conditions. Payload scalar equality uses field="payload.metadata.product.vendor_name", op="eq", value="Microsoft". Dot-separated literal keys or numeric array indices; keys containing dots are unsupported. Equality preserves JSON types. Payload is_null matches a missing path; explicit JSON null is a present value. Exclusions omit missing paths unless ORed with is_null.',
+    },
+    search_term: {
+      anyOf: [
+        {
+          type: "string",
+          maxLength: 1000,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Search Term",
+    },
+    search_mode: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/SearchMode",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description:
+        "Explicit word/phrase or escaped substring search. Omitted mode retains legacy matching and ordering.",
+    },
+    search_columns: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+            enum: ["summary", "description"],
+          },
+          type: "array",
+          maxItems: 2,
+          minItems: 1,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Search Columns",
+    },
+    short_id: {
+      anyOf: [
+        {
+          type: "string",
+          maxLength: 1000,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Short Id",
+    },
+    case_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Case Id",
+    },
+    hierarchy: {
+      type: "string",
+      enum: ["all", "top_level"],
+      title: "Hierarchy",
+      default: "all",
+    },
+    parent_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Parent Id",
+    },
+    status: {
+      anyOf: [
+        {
+          items: {
+            $ref: "#/components/schemas/CaseStatus",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Status",
+    },
+    priority: {
+      anyOf: [
+        {
+          items: {
+            $ref: "#/components/schemas/CasePriority",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Priority",
+    },
+    severity: {
+      anyOf: [
+        {
+          items: {
+            $ref: "#/components/schemas/CaseSeverity",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Severity",
+    },
+    assignee_id: {
+      anyOf: [
+        {
+          items: {
+            anyOf: [
+              {
+                type: "string",
+                format: "uuid",
+              },
+              {
+                type: "string",
+                enum: ["unassigned", "__UNASSIGNED__"],
+              },
+            ],
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Assignee Id",
+    },
+    tags: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+          maxItems: 1000,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tags",
+    },
+    dropdown: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+          maxItems: 50,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Dropdown",
+    },
+    start_time: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Start Time",
+    },
+    end_time: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "End Time",
+    },
+    updated_after: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Updated After",
+    },
+    updated_before: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Updated Before",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  title: "CaseQuery",
+  description: `Matching criteria shared by case search and filtered status counts.
+
+Explicit text, identity, and hierarchy constraints are combined with
+\`\`filters\`\` using AND. Workspace and entitlement checks belong to the
+service and cannot be supplied or negated by this request.
+
+Tag membership uses existing filter nodes: \`\`in\`\` matches any tag, an
+\`\`and\`\` of \`\`contains\`\` conditions requires all tags, and \`\`not\`\` around
+\`\`in\`\` excludes the selected tags. \`\`is_null\`\` matches no tags.
+
+Scalar dropdown/custom-field exclusions retain SQL NULL semantics:
+\`\`ne\`\`, \`\`not_in\`\`, and negated comparisons exclude unset values. Include
+unset values explicitly with an \`\`or\`\` containing \`\`is_null\`\`.`,
 } as const
 
 export const $CaseRead = {
@@ -10350,6 +10792,16 @@ export const $CaseReadMinimal = {
     short_id: {
       type: "string",
       title: "Short Id",
+    },
+    search_match: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/CaseSearchMatchRead",
+        },
+        {
+          type: "null",
+        },
+      ],
     },
     created_at: {
       type: "string",
@@ -10515,6 +10967,440 @@ export const $CaseSearchAggregateRead = {
   type: "object",
   required: ["total", "status_groups"],
   title: "CaseSearchAggregateRead",
+} as const
+
+export const $CaseSearchMatchRead = {
+  properties: {
+    score: {
+      anyOf: [
+        {
+          type: "number",
+          minimum: 0,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Score",
+    },
+    matched_columns: {
+      items: {
+        type: "string",
+        enum: ["summary", "description", "id", "short_id"],
+      },
+      type: "array",
+      maxItems: 4,
+      title: "Matched Columns",
+    },
+    excerpts: {
+      items: {
+        type: "string",
+        maxLength: 240,
+      },
+      type: "array",
+      maxItems: 2,
+      title: "Excerpts",
+    },
+  },
+  type: "object",
+  title: "CaseSearchMatchRead",
+  description:
+    "Bounded lexical metadata beside case fields; excerpts are untrusted text.",
+} as const
+
+export const $CaseSearchOrder = {
+  type: "string",
+  enum: [
+    "relevance",
+    "created_at",
+    "updated_at",
+    "priority",
+    "severity",
+    "status",
+    "tasks",
+    "id",
+    "short_id",
+    "assignee",
+    "tags",
+  ],
+} as const
+
+export const $CaseSearchRequest = {
+  properties: {
+    limit: {
+      type: "integer",
+      maximum: 200,
+      minimum: 1,
+      title: "Limit",
+      description: "Maximum items per page",
+      default: 20,
+    },
+    cursor: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Cursor",
+      description: "Cursor for pagination",
+    },
+    reverse: {
+      type: "boolean",
+      title: "Reverse",
+      description: "Reverse pagination direction",
+      default: false,
+    },
+    filters: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/Filter",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description:
+        'AND/OR/NOT conditions. Payload scalar equality uses field="payload.metadata.product.vendor_name", op="eq", value="Microsoft". Dot-separated literal keys or numeric array indices; keys containing dots are unsupported. Equality preserves JSON types. Payload is_null matches a missing path; explicit JSON null is a present value. Exclusions omit missing paths unless ORed with is_null.',
+    },
+    search_term: {
+      anyOf: [
+        {
+          type: "string",
+          maxLength: 1000,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Search Term",
+    },
+    search_mode: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/SearchMode",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description:
+        "Explicit word/phrase or escaped substring search. Omitted mode retains legacy matching and ordering.",
+    },
+    search_columns: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+            enum: ["summary", "description"],
+          },
+          type: "array",
+          maxItems: 2,
+          minItems: 1,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Search Columns",
+    },
+    short_id: {
+      anyOf: [
+        {
+          type: "string",
+          maxLength: 1000,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Short Id",
+    },
+    case_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Case Id",
+    },
+    hierarchy: {
+      type: "string",
+      enum: ["all", "top_level"],
+      title: "Hierarchy",
+      default: "all",
+    },
+    parent_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Parent Id",
+    },
+    status: {
+      anyOf: [
+        {
+          items: {
+            $ref: "#/components/schemas/CaseStatus",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Status",
+    },
+    priority: {
+      anyOf: [
+        {
+          items: {
+            $ref: "#/components/schemas/CasePriority",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Priority",
+    },
+    severity: {
+      anyOf: [
+        {
+          items: {
+            $ref: "#/components/schemas/CaseSeverity",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Severity",
+    },
+    assignee_id: {
+      anyOf: [
+        {
+          items: {
+            anyOf: [
+              {
+                type: "string",
+                format: "uuid",
+              },
+              {
+                type: "string",
+                enum: ["unassigned", "__UNASSIGNED__"],
+              },
+            ],
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Assignee Id",
+    },
+    tags: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+          maxItems: 1000,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tags",
+    },
+    dropdown: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+          maxItems: 50,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Dropdown",
+    },
+    start_time: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Start Time",
+    },
+    end_time: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "End Time",
+    },
+    updated_after: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Updated After",
+    },
+    updated_before: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Updated Before",
+    },
+    order_by: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/CaseSearchOrder",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+    sort: {
+      anyOf: [
+        {
+          type: "string",
+          enum: ["asc", "desc"],
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Sort",
+    },
+    include_rows: {
+      type: "boolean",
+      title: "Include Rows",
+      default: false,
+    },
+    field_ids: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Field Ids",
+    },
+    include_durations: {
+      type: "boolean",
+      title: "Include Durations",
+      default: false,
+    },
+    include_payload: {
+      type: "boolean",
+      title: "Include Payload",
+      default: false,
+    },
+    payload_fields: {
+      anyOf: [
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+          maxItems: 100,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Payload Fields",
+    },
+    payload_paths: {
+      anyOf: [
+        {
+          items: {
+            items: {
+              type: "string",
+            },
+            type: "array",
+            maxItems: 32,
+            minItems: 1,
+          },
+          type: "array",
+          maxItems: 100,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Payload Paths",
+    },
+    include_count: {
+      type: "boolean",
+      title: "Include Count",
+      default: true,
+    },
+    promote_exact_match: {
+      type: "boolean",
+      title: "Promote Exact Match",
+      description:
+        "Place complete case references before filtered text matches within the authorized workspace.",
+      default: false,
+    },
+    match_none: {
+      type: "boolean",
+      title: "Match None",
+      description: "The ordinary filter population matches no cases.",
+      default: false,
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  title: "CaseSearchRequest",
+  description:
+    "A case query with pagination, sorting, and independent result details.",
 } as const
 
 export const $CaseSeverity = {
@@ -11846,6 +12732,19 @@ export const $ChatMessage = {
       title: "Cancelled",
       description: "Turn-cancelled marker data (for kind=CANCELLED)",
     },
+    created_at: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Created At",
+      description: "When the agent runtime recorded the message",
+    },
   },
   type: "object",
   required: ["id"],
@@ -12871,6 +13770,34 @@ export const $CommitInfo = {
   type: "object",
   required: ["status", "sha", "ref", "base_ref"],
   title: "CommitInfo",
+} as const
+
+export const $Condition = {
+  properties: {
+    field: {
+      type: "string",
+      minLength: 1,
+      title: "Field",
+    },
+    op: {
+      $ref: "#/components/schemas/FilterOp",
+    },
+    value: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/FilterValue",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  required: ["field", "op"],
+  title: "Condition",
+  description: "A predicate over one resolver-defined field.",
 } as const
 
 export const $ContinueRunRequest = {
@@ -16613,6 +17540,22 @@ export const $FieldDiff = {
   title: "FieldDiff",
 } as const
 
+export const $FieldKind = {
+  type: "string",
+  enum: [
+    "text",
+    "number",
+    "boolean",
+    "temporal",
+    "enum",
+    "uuid",
+    "tag",
+    "json_scalar",
+  ],
+  title: "FieldKind",
+  description: "Value families understood by the shared filter compiler.",
+} as const
+
 export const $FileUIPart = {
   properties: {
     type: {
@@ -16646,6 +17589,89 @@ export const $FileUIPart = {
   required: ["type", "mediaType", "url"],
   title: "FileUIPart",
   description: "A file part of a message.",
+} as const
+
+export const $Filter = {
+  oneOf: [
+    {
+      $ref: "#/components/schemas/Condition",
+    },
+    {
+      $ref: "#/components/schemas/AndClause",
+    },
+    {
+      $ref: "#/components/schemas/OrClause",
+    },
+    {
+      $ref: "#/components/schemas/NotClause",
+    },
+  ],
+} as const
+
+export const $FilterOp = {
+  type: "string",
+  enum: [
+    "eq",
+    "ne",
+    "in",
+    "not_in",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "contains",
+    "starts_with",
+    "is_null",
+  ],
+  title: "FilterOp",
+  description: "Operations supported by the shared filter language.",
+} as const
+
+export const $FilterScalar = {
+  anyOf: [
+    {
+      type: "string",
+    },
+    {
+      type: "integer",
+    },
+    {
+      type: "number",
+    },
+    {
+      type: "boolean",
+    },
+    {
+      type: "string",
+      pattern: "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+    },
+    {
+      type: "string",
+      format: "date-time",
+    },
+    {
+      type: "string",
+      format: "date",
+    },
+    {
+      type: "string",
+      format: "uuid",
+    },
+  ],
+} as const
+
+export const $FilterValue = {
+  anyOf: [
+    {
+      $ref: "#/components/schemas/FilterScalar",
+    },
+    {
+      items: {
+        $ref: "#/components/schemas/FilterScalar",
+      },
+      type: "array",
+    },
+  ],
 } as const
 
 export const $FixedActionResult = {
@@ -21697,6 +22723,20 @@ export const $MCPHttpIntegrationCreate = {
       title: "Oauth Integration Id",
       description: "OAuth integration ID (required for oauth2 auth_type)",
     },
+    tunnel_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tunnel Id",
+      description:
+        "Workspace tunnel that every request to this server goes through",
+    },
     custom_credentials: {
       anyOf: [
         {
@@ -21789,6 +22829,18 @@ export const $MCPHttpIntegrationTestConnectionRequest = {
       ],
       title: "Oauth Integration Id",
     },
+    tunnel_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid4",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tunnel Id",
+    },
     custom_credentials: {
       anyOf: [
         {
@@ -21853,6 +22905,14 @@ export const $MCPHttpServerConfig = {
       },
       type: "array",
       title: "Tools",
+    },
+    tunnel_id: {
+      type: "string",
+      title: "Tunnel Id",
+    },
+    tunnel_proxy: {
+      type: "string",
+      title: "Tunnel Proxy",
     },
   },
   type: "object",
@@ -21961,6 +23021,18 @@ export const $MCPIntegrationRead = {
         },
       ],
       title: "Oauth Integration Id",
+    },
+    tunnel_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid4",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tunnel Id",
     },
     state: {
       type: "string",
@@ -22197,6 +23269,20 @@ export const $MCPIntegrationUpdate = {
         },
       ],
       title: "Oauth Integration Id",
+    },
+    tunnel_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tunnel Id",
+      description:
+        "Workspace tunnel for this HTTP server. Send null to stop using one.",
     },
     custom_credentials: {
       anyOf: [
@@ -23627,6 +24713,19 @@ Keys match the TypeScript SDK's \`\`ModelUsage\`\` shape (camelCase), since
 the value is passed through verbatim from the CLI's \`\`modelUsage\`\` field.`,
 } as const
 
+export const $NotClause = {
+  properties: {
+    not: {
+      $ref: "#/components/schemas/Filter",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  required: ["not"],
+  title: "NotClause",
+  description: "The negation of one filter.",
+} as const
+
 export const $OAuth2AuthorizeResponse = {
   properties: {
     authorization_url: {
@@ -23694,6 +24793,24 @@ export const $ObjectRef = {
 
 This is a typed reference that replaces large payloads in workflow context.
 Only dereference ObjectRef instances created by Tracecat - never arbitrary URIs.`,
+} as const
+
+export const $OrClause = {
+  properties: {
+    or: {
+      items: {
+        $ref: "#/components/schemas/Filter",
+      },
+      type: "array",
+      minItems: 1,
+      title: "Or",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  required: ["or"],
+  title: "OrClause",
+  description: "A disjunction of one or more filters.",
 } as const
 
 export const $OrgCreate = {
@@ -25542,6 +26659,52 @@ export const $PlatformRegistrySettingsUpdate = {
   type: "object",
   title: "PlatformRegistrySettingsUpdate",
   description: "Update platform registry settings.",
+} as const
+
+export const $PlatformSecuritySettingsRead = {
+  properties: {
+    ip_allowlist_enabled: {
+      type: "boolean",
+      title: "Ip Allowlist Enabled",
+    },
+    ip_allowlists: {
+      items: {
+        $ref: "#/components/schemas/IPAllowlist",
+      },
+      type: "array",
+      title: "Ip Allowlists",
+    },
+  },
+  type: "object",
+  required: ["ip_allowlist_enabled", "ip_allowlists"],
+  title: "PlatformSecuritySettingsRead",
+  description: "Platform admin IP allowlist settings response.",
+} as const
+
+export const $PlatformSecuritySettingsUpdate = {
+  properties: {
+    ip_allowlist_enabled: {
+      type: "boolean",
+      title: "Ip Allowlist Enabled",
+      description:
+        "Restrict organization API access to the configured IP allowlists. Has no effect while no allowlists exist.",
+      default: false,
+    },
+    ip_allowlists: {
+      items: {
+        $ref: "#/components/schemas/IPAllowlist",
+      },
+      type: "array",
+      maxItems: 100,
+      title: "Ip Allowlists",
+      description: "Named groups of allowed IP addresses or CIDR ranges.",
+    },
+  },
+  type: "object",
+  title: "PlatformSecuritySettingsUpdate",
+  description: `Update the platform admin IP allowlist.
+
+Applies only to the platform admin API, not to organizations.`,
 } as const
 
 export const $Position = {
@@ -28370,6 +29533,7 @@ export const $RuntimeErrorKind = {
     "sandbox.resource_limit_exceeded",
     "workflow.definition.not_found",
     "workflow.definition.lookup_unavailable",
+    "workflow.definition.invalid",
     "workflow.definition.invalid_data",
     "workflow.trigger.input_invalid",
     "workflow.subflow.input_invalid",
@@ -28390,6 +29554,7 @@ export const $RuntimeErrorKind = {
     "agent.llm.budget_exceeded",
     "agent.llm.rate_limited",
     "agent.llm.read_timeout",
+    "agent.llm.stream_interrupted",
     "agent.mcp.auth_failed",
     "agent.mcp.unavailable",
     "agent.execution.failed",
@@ -29960,6 +31125,14 @@ Attributes:
     ready: Current documents whose complete embeddings are published.
     backfill_complete: Whether all source rows have been enumerated.
     partial: Whether the index is unavailable or results may be incomplete.`,
+} as const
+
+export const $SearchMode = {
+  type: "string",
+  enum: ["full_text", "literal"],
+  title: "SearchMode",
+  description:
+    "Explicit lexical modes; omitted table mode remains a legacy policy.",
 } as const
 
 export const $SearchState = {
@@ -35981,6 +37154,41 @@ export const $ToolResultBlock = {
   title: "ToolResultBlock",
 } as const
 
+export const $ToolTunnelFieldChange = {
+  properties: {
+    tool: {
+      type: "string",
+      title: "Tool",
+    },
+    old_value: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Old Value",
+    },
+    new_value: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "New Value",
+    },
+  },
+  type: "object",
+  required: ["tool"],
+  title: "ToolTunnelFieldChange",
+  description: "Tunnel routing diff for a single tool.",
+} as const
+
 export const $ToolUIPartInputAvailable = {
   properties: {
     type: {
@@ -36210,6 +37418,21 @@ export const $TriggerType = {
   description: "Trigger type for a workflow execution.",
 } as const
 
+export const $TunnelAvailabilityRead = {
+  properties: {
+    available: {
+      type: "boolean",
+      title: "Available",
+      description:
+        "False when Tracecat runs without the Kubernetes gateway backend, e.g. on Docker Compose or Fargate.",
+    },
+  },
+  type: "object",
+  required: ["available"],
+  title: "TunnelAvailabilityRead",
+  description: "Whether this deployment can run tunnel gateways.",
+} as const
+
 export const $TunnelCreate = {
   properties: {
     name: {
@@ -36282,6 +37505,104 @@ export const $TunnelCreate = {
     "allowed_targets",
   ],
   title: "TunnelCreate",
+} as const
+
+export const $TunnelDetailRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    workspace_id: {
+      type: "string",
+      format: "uuid",
+      title: "Workspace Id",
+    },
+    name: {
+      type: "string",
+      title: "Name",
+    },
+    description: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Description",
+    },
+    provider: {
+      $ref: "#/components/schemas/TunnelProvider",
+    },
+    endpoint: {
+      type: "string",
+      title: "Endpoint",
+    },
+    client_id: {
+      type: "string",
+      title: "Client Id",
+    },
+    allowed_targets: {
+      items: {
+        $ref: "#/components/schemas/TunnelTarget",
+      },
+      type: "array",
+      title: "Allowed Targets",
+    },
+    enabled: {
+      type: "boolean",
+      title: "Enabled",
+    },
+    has_gateway_key: {
+      type: "boolean",
+      title: "Has Gateway Key",
+    },
+    managed: {
+      type: "boolean",
+      title: "Managed",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+    updated_at: {
+      type: "string",
+      format: "date-time",
+      title: "Updated At",
+    },
+    referenced_by: {
+      items: {
+        $ref: "#/components/schemas/TunnelReference",
+      },
+      type: "array",
+      title: "Referenced By",
+      description:
+        "MCP integrations, current agent preset versions and workflows that route through the tunnel. Each kind is capped at 200 entries.",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "workspace_id",
+    "name",
+    "description",
+    "provider",
+    "endpoint",
+    "client_id",
+    "allowed_targets",
+    "enabled",
+    "has_gateway_key",
+    "managed",
+    "created_at",
+    "updated_at",
+    "referenced_by",
+  ],
+  title: "TunnelDetailRead",
+  description: "A tunnel and the resources that reference it.",
 } as const
 
 export const $TunnelGatewayKeyRead = {
@@ -36398,6 +37719,46 @@ export const $TunnelRead = {
   title: "TunnelRead",
   description:
     "Tunnel metadata. The client secret is write-only and never returned.",
+} as const
+
+export const $TunnelReference = {
+  properties: {
+    kind: {
+      $ref: "#/components/schemas/TunnelReferenceKind",
+    },
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    name: {
+      type: "string",
+      title: "Name",
+    },
+    detail: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Detail",
+      description:
+        "Where in the resource the tunnel is set, e.g. an action or tool",
+    },
+  },
+  type: "object",
+  required: ["kind", "id", "name"],
+  title: "TunnelReference",
+  description: "A workspace resource that routes traffic through a tunnel.",
+} as const
+
+export const $TunnelReferenceKind = {
+  type: "string",
+  enum: ["mcp_integration", "agent_preset", "workflow"],
+  title: "TunnelReferenceKind",
 } as const
 
 export const $TunnelStatusRead = {
@@ -37278,6 +38639,47 @@ export const $UserScopesRead = {
   required: ["scopes"],
   title: "UserScopesRead",
   description: "Read schema for a user's effective scopes.",
+} as const
+
+export const $UserSearchRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    email: {
+      type: "string",
+      format: "email",
+      title: "Email",
+    },
+    first_name: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "First Name",
+    },
+    last_name: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Last Name",
+    },
+  },
+  type: "object",
+  required: ["id", "email"],
+  title: "UserSearchRead",
+  description: "Identity fields returned by the org-scoped user email search.",
 } as const
 
 export const $UserSummary = {
@@ -40096,6 +41498,20 @@ export const $WorkflowExecutionCreate = {
       ],
       title: "Inputs",
     },
+    case_task_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Case Task Id",
+      description:
+        "Case task that started this run. The run is then listed under the task's workflow runs.",
+    },
     time_anchor: {
       anyOf: [
         {
@@ -42228,6 +43644,272 @@ export const $WorkflowUpdate = {
   },
   type: "object",
   title: "WorkflowUpdate",
+} as const
+
+export const $WorkspaceAgentModelAccessRead = {
+  properties: {
+    inherit_all: {
+      type: "boolean",
+      title: "Inherit All",
+      description:
+        "True when the workspace has no subset and uses every organization-enabled model.",
+    },
+    catalog_ids: {
+      items: {
+        type: "string",
+        format: "uuid",
+      },
+      type: "array",
+      title: "Catalog Ids",
+      description:
+        "Catalog IDs in the workspace's subset. Empty when inherit_all is true.",
+    },
+    candidates: {
+      items: {
+        $ref: "#/components/schemas/WorkspaceAgentModelCandidate",
+      },
+      type: "array",
+      title: "Candidates",
+      description:
+        "Models enabled for the organization. Provider URLs are left out: they can carry credentials, and a candidate may sit outside the workspace's subset.",
+    },
+  },
+  type: "object",
+  required: ["inherit_all", "catalog_ids", "candidates"],
+  title: "WorkspaceAgentModelAccessRead",
+  description:
+    "A workspace's model subset and the organization models it can pick from.",
+} as const
+
+export const $WorkspaceAgentModelAccessUpdate = {
+  properties: {
+    inherit_all: {
+      type: "boolean",
+      title: "Inherit All",
+    },
+    catalog_ids: {
+      items: {
+        type: "string",
+        format: "uuid",
+      },
+      type: "array",
+      title: "Catalog Ids",
+    },
+  },
+  type: "object",
+  required: ["inherit_all"],
+  title: "WorkspaceAgentModelAccessUpdate",
+  description:
+    "Replace a workspace's model subset, or clear it to inherit every org model.",
+} as const
+
+export const $WorkspaceAgentModelCandidate = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    custom_provider_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Custom Provider Id",
+    },
+    organization_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Organization Id",
+    },
+    model_provider: {
+      type: "string",
+      title: "Model Provider",
+    },
+    model_name: {
+      type: "string",
+      title: "Model Name",
+    },
+    model_metadata: {
+      anyOf: [
+        {
+          additionalProperties: true,
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Model Metadata",
+    },
+    custom_provider_name: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Custom Provider Name",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "custom_provider_id",
+    "organization_id",
+    "model_provider",
+    "model_name",
+    "model_metadata",
+  ],
+  title: "WorkspaceAgentModelCandidate",
+  description:
+    "Catalog entry a workspace can pick, labelled with its custom provider.",
+} as const
+
+export const $WorkspaceAgentModelListResponse = {
+  properties: {
+    items: {
+      items: {
+        $ref: "#/components/schemas/WorkspaceAgentModelRead",
+      },
+      type: "array",
+      title: "Items",
+    },
+    default_catalog_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Default Catalog Id",
+      description:
+        "The organization's default model, if it is enabled for this workspace.",
+    },
+    has_org_default: {
+      type: "boolean",
+      title: "Has Org Default",
+      description:
+        "Whether the organization has a default model, enabled here or not.",
+      default: false,
+    },
+    workspace_subset_disabled: {
+      type: "boolean",
+      title: "Workspace Subset Disabled",
+      description:
+        "True when the workspace has a model subset and the organization has disabled every model in it.",
+      default: false,
+    },
+  },
+  type: "object",
+  required: ["items"],
+  title: "WorkspaceAgentModelListResponse",
+  description: "Models a workspace can use, and its default model.",
+} as const
+
+export const $WorkspaceAgentModelRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    custom_provider_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Custom Provider Id",
+    },
+    organization_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Organization Id",
+    },
+    model_provider: {
+      type: "string",
+      title: "Model Provider",
+    },
+    model_name: {
+      type: "string",
+      title: "Model Name",
+    },
+    model_metadata: {
+      anyOf: [
+        {
+          additionalProperties: true,
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Model Metadata",
+    },
+    custom_provider_name: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Custom Provider Name",
+    },
+    custom_provider_base_url: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Custom Provider Base Url",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "custom_provider_id",
+    "organization_id",
+    "model_provider",
+    "model_name",
+    "model_metadata",
+  ],
+  title: "WorkspaceAgentModelRead",
+  description:
+    "Catalog entry a workspace can use, with its provider's runtime URL.",
 } as const
 
 export const $WorkspaceCreate = {

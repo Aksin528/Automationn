@@ -8,6 +8,7 @@ import type {
   CaseDurationDefinitionRead,
   CaseFieldReadMinimal,
   CasePriority,
+  CaseQuery,
   CaseReadMinimal,
   CaseSearchAggregateRead,
   CaseSeverity,
@@ -35,6 +36,7 @@ import type {
   SortDirection,
 } from "@/components/filters/filter-multi-select"
 import { CenteredSpinner } from "@/components/loading/spinner"
+import { Button } from "@/components/ui/button"
 import { useToast } from "@/components/ui/use-toast"
 import type { CaseDateFilterValue, UseCasesFilters } from "@/hooks/use-cases"
 import { useEntitlements } from "@/hooks/use-entitlements"
@@ -60,6 +62,7 @@ interface CasesLayoutProps {
   isSearchPending: boolean
   members?: WorkspaceMember[]
   tags?: CaseTagRead[]
+  onSearchModeChange?: (mode: "full_text" | "literal") => void
   onSearchChange: (query: string) => void
   onSortByChange: (value: CaseSortValue) => void
   onStatusChange: (status: CaseStatus[]) => void
@@ -84,6 +87,7 @@ interface CasesLayoutProps {
   durationDefinitions?: CaseDurationDefinitionRead[]
   visibleColumnIds?: string[]
   onToggleColumn?: (columnId: string) => void
+  onStructuredFiltersChange?: (filters: CaseQuery["filters"]) => void
   onDropdownFilterChange: (ref: string, values: string[]) => void
   onDropdownModeChange: (ref: string, mode: FilterMode) => void
   onDropdownSortDirectionChange: (ref: string, direction: SortDirection) => void
@@ -91,6 +95,7 @@ interface CasesLayoutProps {
   stageCounts: CaseSearchAggregateRead["status_groups"] | null
   isCountsLoading: boolean
   isCountsFetching: boolean
+  isCountsError?: boolean
   hasNextPage: boolean
   isFetchingNextPage: boolean
   onLoadMore: () => void
@@ -107,6 +112,7 @@ export function CasesLayout({
   isSearchPending,
   members,
   tags,
+  onSearchModeChange,
   onSearchChange,
   onSortByChange,
   onStatusChange,
@@ -131,6 +137,7 @@ export function CasesLayout({
   durationDefinitions,
   visibleColumnIds,
   onToggleColumn,
+  onStructuredFiltersChange,
   onDropdownFilterChange,
   onDropdownModeChange,
   onDropdownSortDirectionChange,
@@ -138,6 +145,7 @@ export function CasesLayout({
   stageCounts,
   isCountsLoading,
   isCountsFetching,
+  isCountsError = false,
   hasNextPage,
   isFetchingNextPage,
   onLoadMore,
@@ -406,6 +414,8 @@ export function CasesLayout({
     effectiveHierarchy,
     isSearchPending,
     onSearchChange,
+    searchMode: filters.searchMode,
+    onSearchModeChange,
     sortBy: filters.sortBy,
     onSortByChange,
     statusFilter: filters.statusFilter,
@@ -450,11 +460,14 @@ export function CasesLayout({
     visibleColumnIds,
     onToggleColumn,
     dropdownFilters: filters.dropdownFilters,
+    structuredFilters: filters.structuredFilters,
+    onStructuredFiltersChange,
     onDropdownFilterChange,
     onDropdownModeChange,
     onDropdownSortDirectionChange,
     totalCaseCount: cases.length,
     displayCaseCount: totalFilteredCaseEstimate,
+    isCountsError,
     selectedCount: selectedCaseIds.size,
     onSelectAll: handleSelectAll,
     onDeselectAll: handleDeselectAll,
@@ -543,8 +556,20 @@ export function CasesLayout({
         {cases.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 p-4">
             <p className="text-sm text-muted-foreground">
-              No cases match the current filters.
+              {hasNextPage
+                ? "No cases loaded yet."
+                : "No cases match the current filters."}
             </p>
+            {hasNextPage && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={isFetchingNextPage}
+                onClick={onLoadMore}
+              >
+                {isFetchingNextPage ? "Loading cases..." : "Load more cases"}
+              </Button>
+            )}
           </div>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col">

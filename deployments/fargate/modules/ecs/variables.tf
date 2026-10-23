@@ -171,7 +171,7 @@ variable "tracecat_ui_image" {
 
 variable "tracecat_image_tag" {
   type    = string
-  default = "1.2.1"
+  default = "1.3.0-alpha.3"
 }
 
 variable "tracecat_migrations_image" {
@@ -305,6 +305,12 @@ variable "result_externalization_enabled" {
   type        = bool
   description = "Enable externalization of large workflow payloads to blob storage"
   default     = true
+}
+
+variable "platform_admin_ip_allowlist_bypass" {
+  type        = bool
+  description = "Break-glass: skip the platform admin IP allowlist so platform admins can recover after a lockout. Organization IP allowlists are unaffected."
+  default     = false
 }
 
 variable "unsafe_disable_secret_error_withholding" {
@@ -683,7 +689,7 @@ variable "executor_client_timeout" {
 variable "agent_sandbox_timeout" {
   type        = string
   description = "Ceiling for agent execution timeouts in seconds"
-  default     = "3600"
+  default     = "10800"
 }
 
 variable "executor_queue" {

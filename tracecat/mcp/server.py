@@ -11,6 +11,7 @@ import base64
 import csv
 import hashlib
 import json
+import re
 import uuid
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Collection, Mapping, Sequence
@@ -134,6 +135,7 @@ from tracecat.cases.event_schemas import (
     TaskAssigneeChangedEventRead,
 )
 from tracecat.cases.schemas import (
+    CaseBatchResponse,
     CaseCommentCreate,
     CaseCommentRead,
     CaseCommentThreadRead,
@@ -143,11 +145,13 @@ from tracecat.cases.schemas import (
     CaseFieldRead,
     CaseFieldReadMinimal,
     CaseFieldUpdate,
+    CaseParentRead,
     CaseReadMinimal,
     CaseTaskCreate,
     CaseTaskUpdate,
     CaseUpdate,
 )
+from tracecat.cases.search_schemas import CaseSearchRequest
 from tracecat.cases.service import (
     CaseCommentsService,
     CaseFieldsService,
@@ -295,6 +299,7 @@ from tracecat.workflow.case_triggers.schemas import (
     CaseTriggerUpdate,
 )
 from tracecat.workflow.case_triggers.service import CaseTriggersService
+from tracecat.workflow.executions.correlation import build_case_task_correlation_id
 from tracecat.workflow.executions.rerun import WorkflowRerunPlan
 from tracecat.workflow.executions.schemas import (
     WorkflowExecutionActionResultResponse,
@@ -343,6 +348,12 @@ from tracecat.workflow.schedules.schemas import (
 )
 from tracecat.workflow.schedules.service import WorkflowSchedulesService
 from tracecat.workflow.tags.service import WorkflowTagsService
+from tracecat.workspaces.schemas import (
+    WorkspaceSettingsRead,
+    WorkspaceSettingsUpdate,
+    WorkspaceUpdate,
+)
+from tracecat.workspaces.service import WorkspaceService
 
 type MCPWorkflowUUID = Annotated[
     WorkflowUUID,
@@ -359,6 +370,11 @@ type MCPWorkflowUUID = Annotated[
 _PRESET_USE_IN_CHAT_DESCRIPTION = (
     "Make this preset selectable in workspace chat. Only set this when the user "
     "explicitly asks to enable or disable the preset in chat; otherwise omit it."
+)
+_PRESET_TOOL_TUNNELS_DESCRIPTION = (
+    "Workspace tunnel name keyed by registry action name, for actions that "
+    "reach private hosts (e.g. an on-prem API). MCP servers set their tunnel "
+    "on the MCP integration instead."
 )
 
 
@@ -658,6 +674,7 @@ async def _build_integrations_inventory(role: Role) -> IntegrationsInventoryResp
                     server_type=integration.server_type,
                     auth_type=integration.auth_type.value,
                     oauth_integration_id=integration.oauth_integration_id,
+                    tunnel_id=integration.tunnel_id,
                     timeout=integration.timeout,
                     attachable_to_agent_preset=True,
                 )
@@ -760,6 +777,57 @@ class WorkspaceSummaryResponse(BaseModel):
     name: str
     org_id: uuid.UUID
     org_slug: str
+
+
+class WorkspaceAttachmentTypesResponse(BaseModel):
+    """Attachment file types allowed in a workspace."""
+
+    workspace_id: uuid.UUID
+    allowed_extensions: list[str] | None = Field(
+        description="Workspace override, or null when using system defaults."
+    )
+    allowed_mime_types: list[str] | None = Field(
+        description="Workspace override, or null when using system defaults."
+    )
+    effective_allowed_extensions: list[str]
+    effective_allowed_mime_types: list[str]
+
+
+_ATTACHMENT_EXTENSION_PATTERN = re.compile(r"^\.[a-z0-9][a-z0-9_+-]*$")
+_ATTACHMENT_MIME_TYPE_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"
+)
+
+
+def _normalize_attachment_extensions(values: list[str]) -> list[str]:
+    """Lowercase, dot-prefix, validate, and dedupe attachment extensions."""
+    normalized: list[str] = []
+    for value in values:
+        ext = value.strip().lower()
+        if ext and not ext.startswith("."):
+            ext = f".{ext}"
+        if not _ATTACHMENT_EXTENSION_PATTERN.fullmatch(ext):
+            raise ToolError(
+                f"Invalid file extension {value!r}. Use a value like '.pdf' or 'pdf'."
+            )
+        if ext not in normalized:
+            normalized.append(ext)
+    return normalized
+
+
+def _normalize_attachment_mime_types(values: list[str]) -> list[str]:
+    """Lowercase, validate, and dedupe attachment MIME types."""
+    normalized: list[str] = []
+    for value in values:
+        mime_type = value.strip().lower()
+        if not _ATTACHMENT_MIME_TYPE_PATTERN.fullmatch(mime_type):
+            raise ToolError(
+                f"Invalid MIME type {value!r}. Use a value like 'application/pdf' "
+                "without wildcards or parameters."
+            )
+        if mime_type not in normalized:
+            normalized.append(mime_type)
+    return normalized
 
 
 class MCPValidationDetailPayload(TypedDict):
@@ -1176,6 +1244,8 @@ class CaseFullResponse(BaseModel):
     fields: list[CaseFieldRead] = Field(default_factory=list)
     tags: list[CaseTagRead] = Field(default_factory=list)
     dropdown_values: list[CaseDropdownValueRead] = Field(default_factory=list)
+    parent: CaseParentRead | None = None
+    num_sub_cases: int = 0
 
 
 class CaseTaskResponse(BaseModel):
@@ -1337,6 +1407,7 @@ class IntegrationMCPItem(BaseModel):
     server_type: str
     auth_type: str
     oauth_integration_id: uuid.UUID | None = None
+    tunnel_id: uuid.UUID | None = None
     timeout: float | None = None
     attachable_to_agent_preset: bool = True
 
@@ -2792,13 +2863,10 @@ Require/Python: `core.require`, `core.script.run_python`
 
 AI: `ai.action`, `ai.agent`, `ai.preset_agent`, `ai.agent.create_preset`,
 `ai.agent.delete_preset`, `ai.agent.get_preset`, `ai.agent.list_presets`,
-`ai.agent.update_preset`, `ai.skill.archive_skill`, `ai.skill.create_skill`,
-`ai.skill.get_skill`, `ai.skill.get_skill_draft`,
-`ai.skill.get_skill_draft_file`, `ai.skill.get_skill_version`,
-`ai.skill.list_skill_versions`, `ai.skill.list_skills`,
-`ai.skill.publish_skill_draft`, `ai.skill.publish_skill_version`,
-`ai.skill.restore_skill_version`, `ai.skill.update_skill`,
-`ai.skill.update_skill_draft`
+`ai.agent.update_preset`, `ai.skill.create_skill`, `ai.skill.delete_skill`,
+`ai.skill.get_skill`, `ai.skill.list_skill_versions`, `ai.skill.list_skills`,
+`ai.skill.publish_skill`, `ai.skill.restore_skill_version`,
+`ai.skill.update_skill`
 
 ## Third-Party Integration Action Syntax
 
@@ -3589,6 +3657,8 @@ def _case_full_payload(
     fields: list[CaseFieldRead] | None = None,
     tags: list[CaseTagRead] | None = None,
     dropdown_values: list[CaseDropdownValueRead] | None = None,
+    parent: CaseParentRead | None = None,
+    num_sub_cases: int = 0,
 ) -> CaseFullResponse:
     """Serialize a case to a full MCP-friendly dict."""
     assignee = None
@@ -3613,6 +3683,8 @@ def _case_full_payload(
         fields=fields or [],
         tags=tags or [],
         dropdown_values=dropdown_values or [],
+        parent=parent,
+        num_sub_cases=num_sub_cases,
     )
 
 
@@ -3818,6 +3890,79 @@ async def list_workspaces(
     except Exception as e:
         logger.error("Failed to list workspaces", error=str(e))
         raise ToolError(f"Failed to list workspaces: {e}") from None
+
+
+@mcp.tool()
+async def update_workspace_attachment_types(
+    workspace_id: uuid.UUID,
+    allowed_extensions: list[str] | None = None,
+    allowed_mime_types: list[str] | None = None,
+) -> WorkspaceAttachmentTypesResponse:
+    """Configure which file extensions and MIME types case attachments may use.
+
+    A list replaces the workspace's current allowlist; it does not append. To
+    add or remove one entry, call this tool without arguments first, edit the
+    returned effective list, and pass the full list back. An empty list clears
+    the workspace override so the system defaults apply again. Omitted
+    arguments are left unchanged, and calling with no arguments only reads the
+    current settings. An upload must match both an allowed extension and an
+    allowed MIME type, so update both lists together when adding a file type.
+    Changing settings requires the `workspace:update` scope.
+
+    Args:
+        workspace_id: The workspace ID.
+        allowed_extensions: File extensions such as `[".pdf", ".zip"]`. A
+            missing leading dot is added and values are lowercased.
+        allowed_mime_types: MIME types such as
+            `["application/pdf", "application/zip"]`. Wildcards like
+            `image/*` are not supported.
+
+    Returns the workspace override (null when using system defaults) and the
+    effective allowlists for extensions and MIME types.
+    """
+    try:
+        workspace_id, role = await _resolve_workspace_role(workspace_id)
+        settings_update: dict[str, list[str] | None] = {}
+        if allowed_extensions is not None:
+            settings_update["allowed_attachment_extensions"] = (
+                _normalize_attachment_extensions(allowed_extensions) or None
+            )
+        if allowed_mime_types is not None:
+            settings_update["allowed_attachment_mime_types"] = (
+                _normalize_attachment_mime_types(allowed_mime_types) or None
+            )
+        check_scopes(role, "workspace:update" if settings_update else "workspace:read")
+
+        async with get_async_session_context_manager() as session:
+            service = WorkspaceService(session, role=role)
+            workspace = await service.get_workspace(workspace_id)
+            if workspace is None:
+                raise ToolError(f"Workspace {workspace_id} not found")
+            if settings_update:
+                workspace = await service.update_workspace(
+                    workspace,
+                    params=WorkspaceUpdate(
+                        settings=WorkspaceSettingsUpdate.model_validate(settings_update)
+                    ),
+                )
+            settings = WorkspaceSettingsRead.model_validate(workspace.settings or {})
+        return WorkspaceAttachmentTypesResponse(
+            workspace_id=workspace_id,
+            allowed_extensions=settings.allowed_attachment_extensions,
+            allowed_mime_types=settings.allowed_attachment_mime_types,
+            effective_allowed_extensions=settings.effective_allowed_attachment_extensions,
+            effective_allowed_mime_types=settings.effective_allowed_attachment_mime_types,
+        )
+    except ToolError:
+        raise
+    except ScopeDeniedError as e:
+        required = ", ".join(e.required_scopes)
+        raise ToolError(f"Missing required scope: {required}") from e
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    except Exception as e:
+        logger.error("Failed to update workspace attachment types", error=str(e))
+        raise ToolError(f"Failed to update workspace attachment types: {e}") from None
 
 
 @mcp.tool()
@@ -6658,7 +6803,9 @@ async def list_cases(
         limit: Maximum items per page.
         cursor: Cursor for pagination.
         order_by: Column to order by. One of: created_at, updated_at,
-            priority, severity, status, tasks.
+            priority, severity, status, tasks, assignee, tags. Assignee uses
+            lowercase email; tags uses the first normalized tag alphabetically.
+            Missing assignees and tags sort last in either direction.
         sort: Sort direction. One of: asc, desc.
 
     Returns a paginated JSON array of case objects.
@@ -6691,12 +6838,30 @@ async def search_cases(
     limit: int = config.TRACECAT__LIMIT_DEFAULT,
     cursor: str | None = None,
     search_term: str | None = None,
+    search_mode: Literal["full_text", "literal"] | None = None,
+    search_columns: list[Literal["summary", "description"]] | None = None,
     short_id: str | None = None,
     status: str | None = None,
     priority: str | None = None,
     severity: str | None = None,
     order_by: str | None = None,
-    sort: str | None = None,
+    sort: Literal["asc", "desc"] | None = None,
+    case_id: uuid.UUID | None = None,
+    filters: dict[str, Any] | None = None,
+    hierarchy: Literal["all", "top_level"] = "all",
+    parent_id: uuid.UUID | None = None,
+    tags: list[str] | None = None,
+    dropdown: list[str] | None = None,
+    assignee_id: list[str] | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    updated_after: datetime | None = None,
+    updated_before: datetime | None = None,
+    include_rows: bool = False,
+    field_ids: list[str] | None = None,
+    include_durations: bool = False,
+    include_payload: bool = False,
+    include_count: bool = True,
 ) -> CursorPaginatedResponse[CaseReadMinimal]:
     """Search cases with filtering and sorting.
 
@@ -6706,6 +6871,8 @@ async def search_cases(
         cursor: Cursor for pagination.
         search_term: Text to search for in case summary, description, short
             ID, or case UUID.
+        search_mode: Explicit full_text words/phrases or literal substring; omitted preserves legacy behavior.
+        search_columns: Summary/description fields to search; omitted uses both.
         short_id: Search by exact case short ID (e.g. ``42`` or
             ``CASE-0042``).
         status: Comma-separated case statuses to filter by. Values: new,
@@ -6715,13 +6882,42 @@ async def search_cases(
         severity: Comma-separated case severities to filter by. Values:
             unknown, informational, low, medium, high, critical, fatal, other.
         order_by: Column to order by. One of: created_at, updated_at,
-            priority, severity, status, tasks.
+            priority, severity, status, tasks, assignee, tags. Assignee uses
+            lowercase email; tags uses the first normalized tag alphabetically.
+            Missing assignees and tags sort last in either direction.
         sort: Sort direction. One of: asc, desc.
+        case_id: Exact case UUID, ANDed with all matching conditions.
+        filters: Shared AND/OR/NOT JSON filter tree. Tag in matches any tag,
+            AND of contains requires all, NOT in excludes selected tags, and
+            is_null matches untagged cases. Scalar exclusions omit unset values
+            unless ORed with is_null. Payload equality uses
+            field="payload.metadata.product.vendor_name", op="eq", value="Microsoft".
+            Payload paths support only eq/ne/is_null. Use dot-separated literal
+            keys or numeric array indices; keys containing dots are unsupported.
+            Combine with and/or/not; JSON scalar types are preserved. is_null
+            matches missing paths, not explicit JSON null.
+        hierarchy: Return all cases or top-level cases.
+        parent_id: Return sub-cases of this parent UUID.
+        tags: Legacy tag IDs or refs with any-tag semantics.
+        dropdown: Legacy definition_ref:option_ref selections.
+        assignee_id: User UUIDs or unassigned.
+        start_time: Inclusive creation lower bound.
+        end_time: Inclusive creation upper bound.
+        updated_after: Inclusive update lower bound.
+        updated_before: Inclusive update upper bound.
+        include_rows: Include linked table rows.
+        field_ids: Include these custom field values.
+        include_durations: Include durations when entitled.
+        include_payload: Include payload.
+        include_count: Include exact total_estimate.
 
-    Returns a paginated JSON array of case objects.
+    Returns a paginated JSON array of case objects. Each case includes
+    ``parent`` (set on sub-cases) and ``num_sub_cases``.
     """
 
     try:
+        if parent_id is not None:
+            parent_id = _coerce_uuid_arg(parent_id, "parent_id")
         _, role = await _resolve_workspace_role(workspace_id)
 
         parsed_status: list[CaseStatus] | None = None
@@ -6734,25 +6930,50 @@ async def search_cases(
         if severity:
             parsed_severity = [CaseSeverity(s.strip()) for s in severity.split(",")]
 
-        async with CasesService.with_session(role=role) as svc:
-            result = await svc.search_cases(
-                params=CursorPaginationParams(
-                    limit=_normalize_limit(
-                        limit,
-                        default=config.TRACECAT__LIMIT_DEFAULT,
-                        max_limit=config.TRACECAT__LIMIT_CURSOR_MAX,
-                    ),
-                    cursor=cursor,
+        check_scopes(role, "case:read")
+        request = CaseSearchRequest.model_validate(
+            {
+                "limit": _normalize_limit(
+                    limit,
+                    default=config.TRACECAT__LIMIT_DEFAULT,
+                    max_limit=config.TRACECAT__LIMIT_CURSOR_MAX,
                 ),
-                search_term=search_term,
-                short_id=short_id,
-                status=parsed_status,
-                priority=parsed_priority,
-                severity=parsed_severity,
-                order_by=cast(Any, order_by),
-                sort=cast(Any, sort),
-            )
-            return result
+                "cursor": cursor,
+                "search_term": search_term,
+                "search_mode": search_mode,
+                "search_columns": search_columns,
+                "short_id": short_id,
+                "case_id": case_id,
+                "filters": filters,
+                "status": parsed_status,
+                "priority": parsed_priority,
+                "severity": parsed_severity,
+                "order_by": order_by,
+                "sort": sort,
+                "hierarchy": hierarchy,
+                "parent_id": parent_id,
+                "tags": tags,
+                "dropdown": dropdown,
+                "assignee_id": assignee_id,
+                "start_time": start_time,
+                "end_time": end_time,
+                "updated_after": updated_after,
+                "updated_before": updated_before,
+                "include_rows": include_rows,
+                "field_ids": field_ids,
+                "include_durations": include_durations,
+                "include_payload": include_payload,
+                "include_count": include_count,
+            }
+        )
+        async with CasesService.with_session(role=role) as svc:
+            return await svc.query_cases(request)
+    except ScopeDeniedError as e:
+        raise ToolError(
+            f"Missing required scope: {', '.join(e.required_scopes)}"
+        ) from e
+    except (EntitlementRequired, TracecatValidationError) as e:
+        raise ToolError(str(e)) from e
     except ValueError as e:
         raise ToolError(str(e)) from e
     except Exception as e:
@@ -6772,7 +6993,8 @@ async def get_case(
         workspace_id: The workspace ID.
         case_id: Case UUID.
 
-    Returns JSON with full case details.
+    Returns JSON with full case details, including ``parent`` (set on
+    sub-cases) and ``num_sub_cases``.
     """
 
     try:
@@ -6809,11 +7031,14 @@ async def get_case(
                 dropdown_values = await dropdown_service.list_values_for_case(case_id)
                 dropdown_reads = dropdown_values
 
+            hierarchy = (await svc.hierarchy.get_hierarchy([case])).get(case.id)
             return _case_full_payload(
                 case,
                 fields=final_fields,
                 tags=tag_reads,
                 dropdown_values=dropdown_reads,
+                parent=hierarchy.parent if hierarchy else None,
+                num_sub_cases=hierarchy.num_sub_cases if hierarchy else 0,
             )
     except ToolError:
         raise
@@ -6838,6 +7063,7 @@ async def create_case(
     tags: list[str] | None = None,
     create_missing_tags: bool = False,
     dropdown_values: list[CaseDropdownValueInput] | None = None,
+    parent_id: uuid.UUID | None = None,
 ) -> CaseCreatedResponse:
     """Create a new case.
 
@@ -6862,6 +7088,8 @@ async def create_case(
             exactly one of `definition_id`/`definition_ref` and at most one
             of `option_id`/`option_ref` (omit both to clear). Requires the
             case add-ons entitlement.
+        parent_id: Optional UUID of a top-level case to create this case
+            under as a sub-case. Requires the case add-ons entitlement.
 
     Returns JSON with a confirmation message and the created case ID.
     """
@@ -6869,6 +7097,8 @@ async def create_case(
     try:
         if assignee_id is not None:
             assignee_id = _coerce_uuid_arg(assignee_id, "assignee_id")
+        if parent_id is not None:
+            parent_id = _coerce_uuid_arg(parent_id, "parent_id")
         _, role = await _resolve_workspace_role(workspace_id)
 
         params = CaseCreate(
@@ -6881,6 +7111,7 @@ async def create_case(
             fields=fields,
             payload=payload,
             dropdown_values=dropdown_values,
+            parent_id=parent_id,
         )
 
         async with CasesService.with_session(role=role) as svc:
@@ -7019,6 +7250,96 @@ async def update_case(
     except Exception as e:
         logger.error("Failed to update case", error=str(e))
         raise ToolError(f"Failed to update case: {e}") from None
+
+
+@mcp.tool()
+async def set_case_parent(
+    workspace_id: uuid.UUID,
+    case_ids: list[uuid.UUID],
+    parent_id: uuid.UUID,
+) -> CaseBatchResponse:
+    """Group cases as sub-cases of a top-level parent case.
+
+    Sub-cases are one level deep: the parent must be a top-level case, and a
+    case that has its own sub-cases cannot be grouped. Cases already under
+    another parent are moved. Requires the case add-ons entitlement.
+
+    Args:
+        workspace_id: The workspace ID.
+        case_ids: UUIDs of the cases to group (1-1000).
+        parent_id: UUID of the top-level parent case.
+
+    Returns per-case results with ``success`` and ``error``, plus aggregate
+    counts.
+    """
+
+    try:
+        parsed_ids = [_coerce_uuid_arg(case_id, "case_ids") for case_id in case_ids]
+        parent_id = _coerce_uuid_arg(parent_id, "parent_id")
+        _validate_case_batch_ids(parsed_ids)
+        _, role = await _resolve_workspace_role(workspace_id)
+        async with CasesService.with_session(role=role) as svc:
+            return await svc.batch_set_parent(parsed_ids, parent_id)
+    except ToolError:
+        raise
+    except ScopeDeniedError as e:
+        required = ", ".join(e.required_scopes)
+        raise ToolError(f"Missing required scope: {required}") from e
+    except (
+        EntitlementRequired,
+        TracecatNotFoundError,
+        TracecatValidationError,
+        ValueError,
+    ) as e:
+        raise ToolError(str(e)) from e
+    except Exception as e:
+        logger.error("Failed to set case parent", error=str(e))
+        raise ToolError(f"Failed to set case parent: {e}") from None
+
+
+@mcp.tool()
+async def clear_case_parent(
+    workspace_id: uuid.UUID,
+    case_ids: list[uuid.UUID],
+) -> CaseBatchResponse:
+    """Remove sub-cases from their parent case, returning them to the top
+    level. Cases without a parent are left unchanged. Requires the case
+    add-ons entitlement.
+
+    Args:
+        workspace_id: The workspace ID.
+        case_ids: UUIDs of the sub-cases to ungroup (1-1000).
+
+    Returns per-case results with ``success`` and ``error``, plus aggregate
+    counts.
+    """
+
+    try:
+        parsed_ids = [_coerce_uuid_arg(case_id, "case_ids") for case_id in case_ids]
+        _validate_case_batch_ids(parsed_ids)
+        _, role = await _resolve_workspace_role(workspace_id)
+        async with CasesService.with_session(role=role) as svc:
+            return await svc.batch_clear_parent(parsed_ids)
+    except ToolError:
+        raise
+    except ScopeDeniedError as e:
+        required = ", ".join(e.required_scopes)
+        raise ToolError(f"Missing required scope: {required}") from e
+    except (
+        EntitlementRequired,
+        TracecatNotFoundError,
+        TracecatValidationError,
+        ValueError,
+    ) as e:
+        raise ToolError(str(e)) from e
+    except Exception as e:
+        logger.error("Failed to clear case parent", error=str(e))
+        raise ToolError(f"Failed to clear case parent: {e}") from None
+
+
+def _validate_case_batch_ids(case_ids: list[uuid.UUID]) -> None:
+    if not 1 <= len(case_ids) <= 1000:
+        raise ToolError("case_ids must contain between 1 and 1000 case IDs")
 
 
 # ---------------------------------------------------------------------------
@@ -7523,6 +7844,7 @@ async def run_case_task(
             wf_id=wf_id,
             payload=payload,
             registry_lock=registry_lock,
+            correlation_id=build_case_task_correlation_id(task_id),
         )
         response_workflow_id = WorkflowUUID.new(response["wf_id"])
         return CaseTaskRunStartedResponse(
@@ -9289,6 +9611,9 @@ async def create_agent_preset(
     actions: list[str] | None = None,
     namespaces: list[str] | None = None,
     tool_approvals: dict[str, bool] | None = None,
+    tool_tunnels: Annotated[
+        dict[str, str] | None, Field(description=_PRESET_TOOL_TUNNELS_DESCRIPTION)
+    ] = None,
     mcp_integration_ids: list[str] | None = None,
     retries: int | None = None,
     enable_thinking: bool | None = None,
@@ -9344,6 +9669,7 @@ async def create_agent_preset(
             "actions": actions,
             "namespaces": namespaces,
             "tool_approvals": tool_approvals,
+            "tool_tunnels": tool_tunnels,
             "mcp_integrations": mcp_integration_ids,
             "retries": retries,
             "enable_thinking": enable_thinking,
@@ -9397,6 +9723,9 @@ async def update_agent_preset(
     actions: list[str] | None = None,
     namespaces: list[str] | None = None,
     tool_approvals: dict[str, bool] | None = None,
+    tool_tunnels: Annotated[
+        dict[str, str] | None, Field(description=_PRESET_TOOL_TUNNELS_DESCRIPTION)
+    ] = None,
     mcp_integration_ids: list[str] | None = None,
     retries: int | None = None,
     enable_thinking: bool | None = None,
@@ -9448,6 +9777,7 @@ async def update_agent_preset(
             "actions": actions,
             "namespaces": namespaces,
             "tool_approvals": tool_approvals,
+            "tool_tunnels": tool_tunnels,
             "mcp_integrations": mcp_integration_ids,
             "retries": retries,
             "enable_thinking": enable_thinking,

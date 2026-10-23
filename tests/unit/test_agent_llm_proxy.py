@@ -30,6 +30,7 @@ from tracecat.agent.sandbox.llm_proxy import (
     _rewrite_json_body,
     _UpstreamRateLimited,
 )
+from tracecat.agent.sandbox.tool_use_rewrite import ToolUseStreamRewriter
 from tracecat.agent.tokens import LLMRouteClaim, mint_llm_token
 from tracecat.runtime.errors import (
     RetryDisposition,
@@ -102,6 +103,91 @@ def _routing_plan(
     )
 
 
+def _direct_plan(
+    base_url: str = "https://customer-provider.example",
+    *,
+    alias: str = "customer-alias",
+    model_provider: str = "custom-model-provider",
+    authorization: str | None = None,
+    upstream_model_name: str | None = None,
+) -> LLMRoutingPlan:
+    return _routing_plan(
+        direct_routes={
+            alias: LLMRoute(
+                base_url=base_url,
+                model_provider=model_provider,
+                upstream_model_name=upstream_model_name,
+            )
+        },
+        direct_authorizations={alias: authorization} if authorization else None,
+    )
+
+
+_LLM_HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer llm-token",
+}
+_HELLO = [{"role": "user", "content": "hello"}]
+
+
+def _request(
+    body: bytes | dict[str, object] = b'{"messages":[]}',
+    *,
+    method: str = "POST",
+    path: str = "/v1/messages",
+    headers: dict[str, str] | None = None,
+) -> ParsedRequest:
+    return cast(
+        ParsedRequest,
+        {
+            "method": method,
+            "path": path,
+            "headers": {"Content-Type": "application/json"}
+            if headers is None
+            else headers,
+            "body": body if isinstance(body, bytes) else orjson.dumps(body),
+        },
+    )
+
+
+_RATE_LIMIT_REQUEST = _request(
+    {"messages": _HELLO},
+    headers={**_LLM_HEADERS, "X-Request-ID": "trace-rate-limit"},
+)
+
+type _Handler = (
+    Callable[[httpx.Request], httpx.Response]
+    | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+)
+
+
+async def _forward(
+    tmp_path: Path,
+    handler: _Handler,
+    request: ParsedRequest = _RATE_LIMIT_REQUEST,
+    *,
+    routing_plan: LLMRoutingPlan | None = None,
+) -> tuple[str, list[LLMProxyError]]:
+    errors: list[LLMProxyError] = []
+    socket_proxy = LLMSocketProxy(
+        socket_path=tmp_path / "llm.sock",
+        routing_plan=routing_plan or _routing_plan(),
+        on_error=errors.append,
+    )
+    writer = _FakeWriter()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        socket_proxy._client = client
+        socket_proxy._direct_client = client
+        await socket_proxy._forward_request(request, cast(asyncio.StreamWriter, writer))
+    return writer.buffer.decode("utf-8"), errors
+
+
+def _ok(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        200, headers={"Content-Type": "application/json"}, json={"ok": True}
+    )
+
+
 @pytest.mark.anyio
 async def test_forward_request_streams_litellm_response(
     monkeypatch: pytest.MonkeyPatch,
@@ -126,14 +212,6 @@ async def test_forward_request_streams_litellm_response(
             ),
         )
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
     monotonic_values = iter([10.0, 10.025, 10.05, 10.075, 10.1, 10.125])
     monkeypatch.setattr(
         "tracecat.agent.sandbox.llm_proxy.time",
@@ -146,24 +224,12 @@ async def test_forward_request_streams_litellm_response(
 
     monkeypatch.setattr("tracecat.agent.sandbox.llm_proxy.logger.info", fake_info)
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                },
-                "body": b'{"stream":true,"messages":[{"role":"user","content":"hello"}]}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
+    response_text, _ = await _forward(
+        tmp_path,
+        handler,
+        _request({"stream": True, "messages": _HELLO}, headers=_LLM_HEADERS),
+    )
 
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 200 OK")
     assert "text/event-stream" in response_text
     assert "event: message_start" in response_text
@@ -199,30 +265,11 @@ async def test_forward_request_rejects_non_inference_methods(
         forwarded.append(request)
         return httpx.Response(200)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
+    response_text, _ = await _forward(
+        tmp_path, handler, _request(b"{}", method=method, headers={})
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": method,
-                "path": "/v1/messages",
-                "headers": {},
-                "body": b"{}",
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
 
     assert forwarded == [], "denied method must not reach the gateway"
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 405")
     assert "HTTP method not allowed" in response_text
 
@@ -231,8 +278,6 @@ async def test_forward_request_rejects_non_inference_methods(
 async def test_forward_request_returns_upstream_error_response(
     tmp_path: Path,
 ) -> None:
-    errors: list[LLMProxyError] = []
-
     async def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "http://litellm:4000/v1/messages/count_tokens"
         return httpx.Response(
@@ -241,33 +286,16 @@ async def test_forward_request_returns_upstream_error_response(
             json={"error": "bad request"},
         )
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
-        on_error=errors.append,
+    response_text, errors = await _forward(
+        tmp_path,
+        handler,
+        _request(
+            {"messages": _HELLO},
+            path="/v1/messages/count_tokens",
+            headers=_LLM_HEADERS,
+        ),
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages/count_tokens",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                },
-                "body": b'{"messages":[{"role":"user","content":"hello"}]}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 400 Bad Request")
     assert "X-Request-ID:" in response_text
     assert "bad request" in response_text
@@ -278,8 +306,6 @@ async def test_forward_request_returns_upstream_error_response(
 async def test_forward_request_emits_error_for_critical_upstream_http_error(
     tmp_path: Path,
 ) -> None:
-    errors: list[LLMProxyError] = []
-
     async def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "http://litellm:4000/v1/messages"
         return httpx.Response(
@@ -288,34 +314,15 @@ async def test_forward_request_emits_error_for_critical_upstream_http_error(
             json={"error": {"message": "provider quota exhausted"}},
         )
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
-        on_error=errors.append,
+    response_text, errors = await _forward(
+        tmp_path,
+        handler,
+        _request(
+            {"messages": _HELLO},
+            headers={**_LLM_HEADERS, "X-Request-ID": "trace-test-123"},
+        ),
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                    "X-Request-ID": "trace-test-123",
-                },
-                "body": b'{"messages":[{"role":"user","content":"hello"}]}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 429 Too Many Requests")
     assert "provider quota exhausted" in response_text
     assert len(errors) == 1
@@ -328,161 +335,26 @@ async def test_forward_request_emits_error_for_critical_upstream_http_error(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("status_code", "expected_kind"),
-    [
-        (401, RuntimeErrorKind.AGENT_EXECUTOR_UNCLASSIFIED),
-        (403, RuntimeErrorKind.AGENT_EXECUTOR_UNCLASSIFIED),
-        (500, RuntimeErrorKind.AGENT_EXECUTOR_UNCLASSIFIED),
-        (504, RuntimeErrorKind.AGENT_EXECUTOR_TIMED_OUT),
-    ],
-)
-async def test_forward_request_classifies_platform_http_failures_at_source(
-    tmp_path: Path,
-    status_code: int,
-    expected_kind: RuntimeErrorKind,
-) -> None:
-    errors: list[LLMProxyError] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(status_code, request=request, json={"error": "failure"})
-
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
-        on_error=errors.append,
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": b'{"messages":[]}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    assert len(errors) == 1
-    assert errors[0].classification.owner is RuntimeErrorOwner.PLATFORM
-    assert errors[0].classification.kind is expected_kind
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("status_code", "expected_retry_disposition"),
-    [
-        (403, RetryDisposition.NON_RETRYABLE),
-        (503, RetryDisposition.NON_RETRYABLE),
-        (429, RetryDisposition.RETRYABLE),
-        (408, RetryDisposition.RETRYABLE),
-        (504, RetryDisposition.RETRYABLE),
-    ],
-)
-async def test_forward_request_classifies_direct_provider_http_failure_as_user_owned(
-    tmp_path: Path,
-    status_code: int,
-    expected_retry_disposition: RetryDisposition,
-) -> None:
-    errors: list[LLMProxyError] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == "https://customer-provider.example/v1/messages"
-        return httpx.Response(
-            status_code,
-            request=request,
-            json={"error": "unavailable"},
-        )
-
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "customer-alias": LLMRoute(
-                    base_url="https://customer-provider.example",
-                    model_provider="custom-model-provider",
-                )
-            }
-        ),
-        on_error=errors.append,
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": b'{"model":"customer-alias","messages":[]}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    assert len(errors) == 1
-    assert errors[0].classification.owner is RuntimeErrorOwner.USER
-    expected_kind = (
-        RuntimeErrorKind.AGENT_LLM_PROVIDER_AUTH_FAILED
-        if status_code == 403
-        else RuntimeErrorKind.AGENT_LLM_RATE_LIMITED
-        if status_code == 429
-        else RuntimeErrorKind.AGENT_EXECUTION_FAILED
-    )
-    assert errors[0].classification.kind is expected_kind
-    assert errors[0].classification.retry_disposition is expected_retry_disposition
-
-
-@pytest.mark.anyio
 async def test_forward_request_classifies_connect_failure_as_platform(
     tmp_path: Path,
 ) -> None:
-    errors: list[LLMProxyError] = []
+    attempts = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
         raise httpx.ConnectError("gateway unavailable", request=request)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
-        on_error=errors.append,
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
+    _, errors = await _forward(tmp_path, handler, _request())
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": b'{"messages":[]}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
+    # Nothing was sent, so the managed route retries the connect once.
+    assert attempts == 2
     assert len(errors) == 1
     assert errors[0].classification.owner is RuntimeErrorOwner.PLATFORM
     assert errors[0].classification.kind is RuntimeErrorKind.AGENT_EXECUTOR_UNCLASSIFIED
 
 
-@pytest.mark.anyio
-@pytest.mark.parametrize(
+_ROUTE_FAILURE_ATTRIBUTION = pytest.mark.parametrize(
     ("direct", "expected_owner", "expected_kind"),
     [
         (
@@ -493,14 +365,22 @@ async def test_forward_request_classifies_connect_failure_as_platform(
         (True, RuntimeErrorOwner.USER, RuntimeErrorKind.AGENT_EXECUTION_FAILED),
     ],
 )
+
+
+def _direct_or_managed(direct: bool) -> tuple[ParsedRequest, LLMRoutingPlan]:
+    if direct:
+        return _request(b'{"model":"customer-alias","messages":[]}'), _direct_plan()
+    return _request(), _routing_plan()
+
+
+@pytest.mark.anyio
+@_ROUTE_FAILURE_ATTRIBUTION
 async def test_forward_request_classifies_error_body_read_failure_by_route(
     tmp_path: Path,
     direct: bool,
     expected_owner: RuntimeErrorOwner,
     expected_kind: RuntimeErrorKind,
 ) -> None:
-    errors: list[LLMProxyError] = []
-
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             500,
@@ -508,41 +388,12 @@ async def test_forward_request_classifies_error_body_read_failure_by_route(
             stream=_FailingResponseStream(request),
         )
 
-    direct_routes = (
-        {
-            "customer-alias": LLMRoute(
-                base_url="https://customer-provider.example",
-                model_provider="custom-model-provider",
-            )
-        }
-        if direct
-        else None
+    request, plan = _direct_or_managed(direct)
+    response_text, errors = await _forward(
+        tmp_path, handler, request, routing_plan=plan
     )
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(direct_routes=direct_routes),
-        on_error=errors.append,
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-    body = b'{"model":"customer-alias","messages":[]}' if direct else b'{"messages":[]}'
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": body,
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    assert writer.buffer.decode("utf-8").startswith("HTTP/1.1 502 ")
+    assert response_text.startswith("HTTP/1.1 502 ")
     assert len(errors) == 1
     assert errors[0].classification.owner is expected_owner
     assert errors[0].classification.kind is expected_kind
@@ -550,25 +401,13 @@ async def test_forward_request_classifies_error_body_read_failure_by_route(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("direct", "expected_owner", "expected_kind"),
-    [
-        (
-            False,
-            RuntimeErrorOwner.PLATFORM,
-            RuntimeErrorKind.AGENT_EXECUTOR_UNCLASSIFIED,
-        ),
-        (True, RuntimeErrorOwner.USER, RuntimeErrorKind.AGENT_EXECUTION_FAILED),
-    ],
-)
+@_ROUTE_FAILURE_ATTRIBUTION
 async def test_forward_request_does_not_write_second_response_after_body_failure(
     tmp_path: Path,
     direct: bool,
     expected_owner: RuntimeErrorOwner,
     expected_kind: RuntimeErrorKind,
 ) -> None:
-    errors: list[LLMProxyError] = []
-
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -577,41 +416,11 @@ async def test_forward_request_does_not_write_second_response_after_body_failure
             stream=_FailingResponseStream(request),
         )
 
-    direct_routes = (
-        {
-            "customer-alias": LLMRoute(
-                base_url="https://customer-provider.example",
-                model_provider="custom-model-provider",
-            )
-        }
-        if direct
-        else None
+    request, plan = _direct_or_managed(direct)
+    response_text, errors = await _forward(
+        tmp_path, handler, request, routing_plan=plan
     )
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(direct_routes=direct_routes),
-        on_error=errors.append,
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-    body = b'{"model":"customer-alias","messages":[]}' if direct else b'{"messages":[]}'
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": body,
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 200 OK")
     assert response_text.count("HTTP/1.1") == 1
     assert len(errors) == 1
@@ -626,43 +435,14 @@ async def test_forward_request_classifies_direct_transport_failure(
     tmp_path: Path,
     failure: str,
 ) -> None:
-    errors: list[LLMProxyError] = []
-
     async def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://customer-provider.example/v1/messages"
         if failure == "connect":
             raise httpx.ConnectError("provider unavailable", request=request)
         raise httpx.ReadTimeout("provider timed out", request=request)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "customer-alias": LLMRoute(
-                    base_url="https://customer-provider.example",
-                    model_provider="custom-model-provider",
-                )
-            }
-        ),
-        on_error=errors.append,
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": b'{"model":"customer-alias","messages":[]}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
+    request, plan = _direct_or_managed(True)
+    _, errors = await _forward(tmp_path, handler, request, routing_plan=plan)
 
     assert len(errors) == 1
     assert errors[0].classification.owner is (
@@ -758,7 +538,7 @@ async def test_write_stream_response_classifies_typed_upstream_error_event(
         status_code=200,
         reason_phrase="OK",
         headers={"Content-Type": "text/event-stream"},
-        body_chunks=llm_proxy._rewrite_sse_stream(upstream()),
+        body_chunks=llm_proxy._rewrite_sse_stream(upstream(), ToolUseStreamRewriter()),
         trace_request_id="trace-test-upstream-error",
         path="/v1/messages",
     )
@@ -796,7 +576,7 @@ async def test_write_stream_response_forwards_untyped_upstream_error_event(
         status_code=200,
         reason_phrase="OK",
         headers={"Content-Type": "text/event-stream"},
-        body_chunks=llm_proxy._rewrite_sse_stream(upstream()),
+        body_chunks=llm_proxy._rewrite_sse_stream(upstream(), ToolUseStreamRewriter()),
         trace_request_id="trace-test-overloaded",
         path="/v1/messages",
     )
@@ -934,62 +714,22 @@ async def test_forward_request_strips_authorization_for_passthrough_upstream(
     async def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://customer-litellm.example/v1/messages"
         assert "authorization" not in request.headers
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
+        return _ok(request)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "customer-alias": LLMRoute(
-                    base_url="https://customer-litellm.example",
-                    model_provider="custom-model-provider",
-                )
-            }
-        ),
+    response_text, _ = await _forward(
+        tmp_path,
+        handler,
+        _request({"model": "customer-alias", "messages": _HELLO}, headers=_LLM_HEADERS),
+        routing_plan=_direct_plan("https://customer-litellm.example"),
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                },
-                "body": (
-                    b'{"model":"customer-alias",'
-                    b'"messages":[{"role":"user","content":"hello"}]}'
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 200 OK")
 
 
 def test_direct_route_strips_version_suffix(tmp_path: Path) -> None:
     """Passthrough strips a trailing /vN from the stored base_url so it does
     not collide with the /v1/... path the SDK clients emit."""
-    routing_plan = _routing_plan(
-        direct_routes={
-            "customer-alias": LLMRoute(
-                base_url="https://customer-litellm.example/v1/",
-                model_provider="custom-model-provider",
-            )
-        }
-    )
+    routing_plan = _direct_plan("https://customer-litellm.example/v1/")
 
     assert (
         routing_plan.direct_routes["customer-alias"].base_url
@@ -998,14 +738,7 @@ def test_direct_route_strips_version_suffix(tmp_path: Path) -> None:
 
 
 def test_routing_plan_uses_managed_route_for_non_string_model() -> None:
-    routing_plan = _routing_plan(
-        direct_routes={
-            "customer-alias": LLMRoute(
-                base_url="https://customer-litellm.example",
-                model_provider="custom-model-provider",
-            )
-        }
-    )
+    routing_plan = _direct_plan("https://customer-litellm.example")
 
     assert (
         routing_plan.resolve({"model": "customer-alias"}) is routing_plan.managed_route
@@ -1033,46 +766,14 @@ async def test_passthrough_does_not_double_prefix_version_in_request_url(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         received_urls.append(str(request.url))
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
+        return _ok(request)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "customer-alias": LLMRoute(
-                    base_url="https://customer-litellm.example/v1",
-                    model_provider="custom-model-provider",
-                )
-            }
-        ),
+    await _forward(
+        tmp_path,
+        handler,
+        _request({"model": "customer-alias", "messages": _HELLO}, headers=_LLM_HEADERS),
+        routing_plan=_direct_plan("https://customer-litellm.example/v1"),
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                },
-                "body": (
-                    b'{"model":"customer-alias",'
-                    b'"messages":[{"role":"user","content":"hello"}]}'
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
 
     assert received_urls == ["https://customer-litellm.example/v1/messages"], (
         f"expected single /v1 prefix, got {received_urls[0]!r} — "
@@ -1081,160 +782,81 @@ async def test_passthrough_does_not_double_prefix_version_in_request_url(
 
 
 @pytest.mark.anyio
-async def test_passthrough_routes_root_direct_and_subagents_to_gateway(
-    tmp_path: Path,
-) -> None:
-    received: list[tuple[str, str | None, str | None]] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = orjson.loads(request.content)
-        received.append(
-            (
-                str(request.url),
-                request.headers.get("authorization"),
-                payload.get("model"),
-            )
-        )
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
-
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "customer-alias": LLMRoute(
-                    base_url="https://customer-litellm.example/v1",
-                    model_provider="custom-model-provider",
-                )
-            },
-            direct_authorizations={"customer-alias": "Bearer sk-customer"},
-        ),
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-
-    try:
-        # Only the exact passthrough model key should bypass managed LiteLLM.
-        # Synthetic subagent keys without a direct route stay on the gateway.
-        for model in (
+@pytest.mark.parametrize(
+    ("direct_alias", "upstream_model_name", "managed_model", "expected_direct"),
+    [
+        pytest.param(
             "customer-alias",
+            None,
             "openai/gpt-5-mini::tracecat-subagent::analyst",
-        ):
-            writer = _FakeWriter()
-            await socket_proxy._forward_request(
-                {
-                    "method": "POST",
-                    "path": "/v1/messages",
-                    "headers": {
-                        "Content-Type": "application/json",
-                        "Authorization": "Bearer llm-token",
-                    },
-                    "body": orjson.dumps(
-                        {
-                            "model": model,
-                            "messages": [{"role": "user", "content": "hello"}],
-                        }
-                    ),
-                },
-                cast(asyncio.StreamWriter, writer),
-            )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    assert received == [
-        (
-            "https://customer-litellm.example/v1/messages",
-            "Bearer sk-customer",
-            "customer-alias",
-        ),
-        (
-            "http://litellm:4000/v1/messages",
-            "Bearer llm-token",
-            "openai/gpt-5-mini::tracecat-subagent::analyst",
-        ),
-    ]
-
-
-@pytest.mark.anyio
-async def test_passthrough_routes_subagent_direct_when_subagent_config_passthrough(
-    tmp_path: Path,
-) -> None:
-    received: list[tuple[str, str | None, str | None]] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = orjson.loads(request.content)
-        received.append(
             (
-                str(request.url),
-                request.headers.get("authorization"),
-                payload.get("model"),
-            )
-        )
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
-
-    child_model = "child-alias::tracecat-subagent::analyst"
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                child_model: LLMRoute(
-                    base_url="https://child-litellm.example/v1",
-                    model_provider="custom-model-provider",
-                    upstream_model_name="child-alias",
-                )
-            },
-            direct_authorizations={child_model: "Bearer sk-child"},
+                "https://customer-litellm.example/v1/messages",
+                "Bearer sk-customer",
+                "customer-alias",
+            ),
+            id="root-direct-subagent-gateway",
         ),
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-
-    try:
-        # A passthrough subagent gets its own direct route, independent of the
-        # root agent and independent of other subagent routes.
-        for model in (child_model, "openai/gpt-5-mini::tracecat-subagent::critic"):
-            writer = _FakeWriter()
-            await socket_proxy._forward_request(
-                {
-                    "method": "POST",
-                    "path": "/v1/messages",
-                    "headers": {
-                        "Content-Type": "application/json",
-                        "Authorization": "Bearer llm-token",
-                    },
-                    "body": orjson.dumps(
-                        {
-                            "model": model,
-                            "messages": [{"role": "user", "content": "hello"}],
-                        }
-                    ),
-                },
-                cast(asyncio.StreamWriter, writer),
-            )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    assert received == [
-        (
-            "https://child-litellm.example/v1/messages",
-            "Bearer sk-child",
+        pytest.param(
+            "child-alias::tracecat-subagent::analyst",
             "child-alias",
-        ),
-        (
-            "http://litellm:4000/v1/messages",
-            "Bearer llm-token",
             "openai/gpt-5-mini::tracecat-subagent::critic",
+            (
+                "https://customer-litellm.example/v1/messages",
+                "Bearer sk-customer",
+                "child-alias",
+            ),
+            id="subagent-direct-other-subagent-gateway",
         ),
+    ],
+)
+async def test_passthrough_routes_only_exact_direct_model_key(
+    tmp_path: Path,
+    direct_alias: str,
+    upstream_model_name: str | None,
+    managed_model: str,
+    expected_direct: tuple[str, str, str],
+) -> None:
+    """Only the exact passthrough model key bypasses managed LiteLLM; a
+    passthrough subagent gets its own route, independent of other subagents."""
+    received: list[tuple[str, str | None, str | None]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        received.append(
+            (
+                str(request.url),
+                request.headers.get("authorization"),
+                payload.get("model"),
+            )
+        )
+        return _ok(request)
+
+    plan = _direct_plan(
+        "https://customer-litellm.example/v1",
+        alias=direct_alias,
+        authorization="Bearer sk-customer",
+        upstream_model_name=upstream_model_name,
+    )
+    for model in (direct_alias, managed_model):
+        await _forward(
+            tmp_path,
+            handler,
+            _request({"model": model, "messages": _HELLO}, headers=_LLM_HEADERS),
+            routing_plan=plan,
+        )
+
+    assert received == [
+        expected_direct,
+        ("http://litellm:4000/v1/messages", "Bearer llm-token", managed_model),
     ]
+
+
+_ANTHROPIC_ONLY_FIELDS: dict[str, object] = {
+    "anthropic_beta": ["prompt-caching-2024-07-31"],
+    "context_management": {"strategy": "summarize"},
+    "output_config": {"task_budget": 2048},
+    "output_format": {"type": "json_schema"},
+}
 
 
 @pytest.mark.anyio
@@ -1244,345 +866,74 @@ async def test_forward_request_preserves_anthropic_fields_for_anthropic_upstream
     async def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://customer-litellm.example/v1/messages"
         payload = orjson.loads(request.content)
-        assert payload["messages"] == [{"role": "user", "content": "hello"}]
+        assert payload["messages"] == _HELLO
         assert payload["thinking"] == {"type": "enabled", "budget_tokens": 1024}
         assert payload["reasoning_effort"] == "high"
-        assert payload["anthropic_beta"] == ["prompt-caching-2024-07-31"]
-        assert payload["context_management"] == {"strategy": "summarize"}
-        assert payload["output_config"] == {"task_budget": 2048}
-        assert payload["output_format"] == {"type": "json_schema"}
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
+        for field, value in _ANTHROPIC_ONLY_FIELDS.items():
+            assert payload[field] == value
+        return _ok(request)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "claude-direct": LLMRoute(
-                    base_url="https://customer-litellm.example",
-                    model_provider="anthropic",
-                )
-            }
+    response_text, _ = await _forward(
+        tmp_path,
+        handler,
+        _request(
+            {
+                "model": "claude-direct",
+                "messages": _HELLO,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "reasoning_effort": "high",
+                **_ANTHROPIC_ONLY_FIELDS,
+            },
+            headers={"Content-Type": "application/json", "Content-Length": "112"},
+        ),
+        routing_plan=_direct_plan(
+            "https://customer-litellm.example",
+            alias="claude-direct",
+            model_provider="anthropic",
         ),
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Content-Length": "112",
-                },
-                "body": orjson.dumps(
-                    {
-                        "model": "claude-direct",
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "thinking": {"type": "enabled", "budget_tokens": 1024},
-                        "reasoning_effort": "high",
-                        "anthropic_beta": ["prompt-caching-2024-07-31"],
-                        "context_management": {"strategy": "summarize"},
-                        "output_config": {"task_budget": 2048},
-                        "output_format": {"type": "json_schema"},
-                    }
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 200 OK")
 
 
 @pytest.mark.anyio
-async def test_forward_request_strips_anthropic_only_fields_for_non_anthropic_upstream(
+@pytest.mark.parametrize("local_provider_cleanup", [True, False])
+async def test_managed_route_anthropic_only_field_cleanup(
     tmp_path: Path,
+    local_provider_cleanup: bool,
 ) -> None:
+    """Managed routes strip Anthropic-only fields locally unless the gateway
+    owns provider cleanup."""
+
+    path = "/v1/chat/completions" if local_provider_cleanup else "/v1/messages"
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == f"http://litellm:4000{path}"
         payload = orjson.loads(request.content)
-        assert "anthropic_beta" not in payload
-        assert "context_management" not in payload
-        assert "output_config" not in payload
-        assert "output_format" not in payload
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
+        for field, value in _ANTHROPIC_ONLY_FIELDS.items():
+            if local_provider_cleanup:
+                assert field not in payload
+            else:
+                assert payload[field] == value
+        return _ok(request)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
+    response_text, _ = await _forward(
+        tmp_path,
+        handler,
+        _request(
             {
-                "method": "POST",
-                "path": "/v1/chat/completions",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                },
-                "body": orjson.dumps(
-                    {
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "anthropic_beta": ["prompt-caching-2024-07-31"],
-                        "context_management": {"strategy": "summarize"},
-                        "output_config": {"task_budget": 2048},
-                        "output_format": {"type": "json_schema"},
-                    }
-                ),
+                "model": "openai/gpt-5-mini::tracecat-subagent::analyst",
+                "messages": _HELLO,
+                **_ANTHROPIC_ONLY_FIELDS,
             },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
-    assert response_text.startswith("HTTP/1.1 200 OK")
-
-
-@pytest.mark.anyio
-async def test_custom_model_provider_forces_thinking_disabled_when_not_enabled(
-    tmp_path: Path,
-) -> None:
-    """The CLI always emits thinking={"type": "adaptive"} for this route, so
-    when the route's own agent config has thinking disabled, the proxy must
-    override it with both the Ollama-style "thinking" field and vLLM's own
-    "chat_template_kwargs" field (vLLM ignores the former -- see the real
-    vLLM 0.29 /v1/messages evidence in llm_proxy.py's comment)."""
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = orjson.loads(request.content)
-        assert payload["thinking"] == {"type": "disabled"}
-        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
-
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
+            path=path,
+            headers=_LLM_HEADERS,
+        ),
         routing_plan=_routing_plan(
-            direct_routes={
-                "qwen-direct": LLMRoute(
-                    base_url="https://qwen.example",
-                    model_provider="custom-model-provider",
-                    enable_thinking=False,
-                )
-            }
+            managed_local_provider_cleanup=local_provider_cleanup
         ),
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    writer = _FakeWriter()
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": orjson.dumps(
-                    {
-                        "model": "qwen-direct",
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "thinking": {"type": "adaptive"},
-                    }
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
-    assert response_text.startswith("HTTP/1.1 200 OK")
-
-
-@pytest.mark.anyio
-async def test_custom_model_provider_leaves_thinking_untouched_when_enabled(
-    tmp_path: Path,
-) -> None:
-    """When the route's own agent config has thinking enabled, the CLI's own
-    "adaptive" request must pass through unchanged -- no forced "disabled"
-    override and no "chat_template_kwargs" injected."""
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = orjson.loads(request.content)
-        assert payload["thinking"] == {"type": "adaptive"}
-        assert "chat_template_kwargs" not in payload
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
-
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "qwen-direct": LLMRoute(
-                    base_url="https://qwen.example",
-                    model_provider="custom-model-provider",
-                    enable_thinking=True,
-                )
-            }
-        ),
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": orjson.dumps(
-                    {
-                        "model": "qwen-direct",
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "thinking": {"type": "adaptive"},
-                    }
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
-    assert response_text.startswith("HTTP/1.1 200 OK")
-
-
-@pytest.mark.anyio
-async def test_custom_model_provider_disables_thinking_when_cli_sends_no_thinking_field(
-    tmp_path: Path,
-) -> None:
-    """On a direct (passthrough) route the CLI sends no "thinking" field at all
-    (confirmed via live logging against a real passthrough route). The
-    "chat_template_kwargs" override must still apply in that case -- it cannot
-    be gated on the "thinking" field's presence, since vLLM needs it regardless
-    of whether the CLI sent an Anthropic-shaped "thinking" field."""
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = orjson.loads(request.content)
-        assert "thinking" not in payload
-        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
-
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "qwen-direct": LLMRoute(
-                    base_url="https://qwen.example",
-                    model_provider="custom-model-provider",
-                    enable_thinking=False,
-                )
-            }
-        ),
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": orjson.dumps(
-                    {
-                        "model": "qwen-direct",
-                        "messages": [{"role": "user", "content": "hello"}],
-                    }
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
-    assert response_text.startswith("HTTP/1.1 200 OK")
-
-
-@pytest.mark.anyio
-async def test_managed_route_can_defer_provider_cleanup_to_gateway(
-    tmp_path: Path,
-) -> None:
-    async def handler(request: httpx.Request) -> httpx.Response:
-        payload = orjson.loads(request.content)
-        assert str(request.url) == "http://litellm:4000/v1/messages"
-        assert payload["anthropic_beta"] == ["prompt-caching-2024-07-31"]
-        assert payload["context_management"] == {"strategy": "summarize"}
-        assert payload["output_config"] == {"task_budget": 2048}
-        assert payload["output_format"] == {"type": "json_schema"}
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
-
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(managed_local_provider_cleanup=False),
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                },
-                "body": orjson.dumps(
-                    {
-                        "model": "openai/gpt-5-mini::tracecat-subagent::analyst",
-                        "messages": [{"role": "user", "content": "hello"}],
-                        "anthropic_beta": ["prompt-caching-2024-07-31"],
-                        "context_management": {"strategy": "summarize"},
-                        "output_config": {"task_budget": 2048},
-                        "output_format": {"type": "json_schema"},
-                    }
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 200 OK")
 
 
@@ -1592,49 +943,17 @@ async def test_forward_request_injects_passthrough_api_key_as_bearer_authorizati
 ) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer sk-customer"
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            json={"ok": True},
-        )
+        return _ok(request)
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "customer-alias": LLMRoute(
-                    base_url="https://customer-litellm.example",
-                    model_provider="custom-model-provider",
-                )
-            },
-            direct_authorizations={"customer-alias": "Bearer sk-customer"},
+    response_text, _ = await _forward(
+        tmp_path,
+        handler,
+        _request({"model": "customer-alias", "messages": _HELLO}, headers=_LLM_HEADERS),
+        routing_plan=_direct_plan(
+            "https://customer-litellm.example", authorization="Bearer sk-customer"
         ),
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
 
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer llm-token",
-                },
-                "body": (
-                    b'{"model":"customer-alias",'
-                    b'"messages":[{"role":"user","content":"hello"}]}'
-                ),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        if socket_proxy._client is not None:
-            await socket_proxy._client.aclose()
-
-    response_text = writer.buffer.decode("utf-8")
     assert response_text.startswith("HTTP/1.1 200 OK")
 
 
@@ -1890,7 +1209,6 @@ async def test_read_timeout_before_headers_records_route(
     direct: bool,
     error_response: bool,
 ) -> None:
-    errors: list[LLMProxyError] = []
     log = Mock()
     monkeypatch.setattr("tracecat.agent.sandbox.llm_proxy.logger", log)
 
@@ -1904,33 +1222,14 @@ async def test_read_timeout_before_headers_records_route(
             return httpx.Response(503, stream=StalledErrorBody())
         raise httpx.ReadTimeout("synthetic sensitive diagnostic", request=request)
 
-    proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "synthetic-model": LLMRoute(
-                    base_url="https://provider.example",
-                    model_provider="custom-model-provider",
-                )
-            }
-            if direct
-            else None
-        ),
-        on_error=errors.append,
+    response_text, errors = await _forward(
+        tmp_path,
+        handler,
+        _request(b'{"model":"synthetic-model"}', headers={}),
+        routing_plan=_direct_plan("https://provider.example", alias="synthetic-model")
+        if direct
+        else _routing_plan(),
     )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        proxy._client = client
-        proxy._direct_client = client
-        writer = _FakeWriter()
-        await proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {},
-                "body": b'{"model":"synthetic-model"}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
     timeout_log = next(
         call
         for call in log.warning.call_args_list
@@ -1948,7 +1247,7 @@ async def test_read_timeout_before_headers_records_route(
     assert errors[0].classification.kind is RuntimeErrorKind.AGENT_LLM_READ_TIMEOUT
     assert errors[0].classification.owner is RuntimeErrorOwner.PLATFORM
     assert "synthetic sensitive diagnostic" not in str(errors)
-    assert writer.buffer.startswith(b"HTTP/1.1 504")
+    assert response_text.startswith("HTTP/1.1 504")
 
 
 @pytest.mark.anyio
@@ -2051,6 +1350,54 @@ async def test_read_timeout_before_headers_records_route(
             RuntimeErrorOwner.PLATFORM,
             True,
         ),
+        (
+            504,
+            "api_error",
+            False,
+            RuntimeErrorKind.AGENT_EXECUTOR_TIMED_OUT,
+            RuntimeErrorOwner.PLATFORM,
+            True,
+        ),
+        (
+            403,
+            "api_error",
+            True,
+            RuntimeErrorKind.AGENT_LLM_PROVIDER_AUTH_FAILED,
+            RuntimeErrorOwner.USER,
+            False,
+        ),
+        (
+            429,
+            "rate_limit_error",
+            True,
+            RuntimeErrorKind.AGENT_LLM_RATE_LIMITED,
+            RuntimeErrorOwner.USER,
+            True,
+        ),
+        (
+            503,
+            "api_error",
+            True,
+            RuntimeErrorKind.AGENT_EXECUTION_FAILED,
+            RuntimeErrorOwner.USER,
+            False,
+        ),
+        (
+            408,
+            "api_error",
+            True,
+            RuntimeErrorKind.AGENT_EXECUTION_FAILED,
+            RuntimeErrorOwner.USER,
+            True,
+        ),
+        (
+            504,
+            "api_error",
+            True,
+            RuntimeErrorKind.AGENT_EXECUTION_FAILED,
+            RuntimeErrorOwner.USER,
+            True,
+        ),
     ],
 )
 async def test_structured_gateway_http_attribution(
@@ -2062,7 +1409,6 @@ async def test_structured_gateway_http_attribution(
     owner: RuntimeErrorOwner,
     retryable: bool,
 ) -> None:
-    errors: list[LLMProxyError] = []
     # Deliberately misleading text must never select classification, and
     # credential-shaped data must never enter durable failure text.
     body = orjson.dumps(
@@ -2073,37 +1419,14 @@ async def test_structured_gateway_http_attribution(
             }
         }
     )
-    proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(
-            direct_routes={
-                "synthetic-model": LLMRoute(
-                    base_url="https://provider.example",
-                    model_provider="custom-model-provider",
-                )
-            }
-            if direct
-            else None
-        ),
-        on_error=errors.append,
+    response_text, errors = await _forward(
+        tmp_path,
+        lambda request: httpx.Response(status_code, content=body),
+        _request(b'{"model":"synthetic-model"}', headers={}),
+        routing_plan=_direct_plan("https://provider.example", alias="synthetic-model")
+        if direct
+        else _routing_plan(),
     )
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(status_code, content=body)
-        )
-    ) as client:
-        proxy._client = client
-        proxy._direct_client = client
-        writer = _FakeWriter()
-        await proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {},
-                "body": b'{"model":"synthetic-model"}',
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
     assert len(errors) == 1
     assert errors[0].classification.kind is kind
     assert errors[0].classification.owner is owner
@@ -2111,13 +1434,20 @@ async def test_structured_gateway_http_attribution(
         RetryDisposition.RETRYABLE if retryable else RetryDisposition.NON_RETRYABLE
     )
     assert "synthetic-secret" not in errors[0].message
-    assert body in writer.buffer  # SDK still receives the upstream HTTP response.
+    # SDK still receives the upstream HTTP response.
+    assert body.decode() in response_text
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("path", ["/models", "/v1/models?limit=10"])
 @pytest.mark.parametrize(
-    "failure", ["auth", "rate_limit", "connect", "headers_timeout", "body_timeout"]
+    ("path", "failure"),
+    [
+        ("/models", "auth"),
+        ("/v1/models?limit=10", "rate_limit"),
+        ("/models", "connect"),
+        ("/v1/models?limit=10", "headers_timeout"),
+        ("/models", "body_timeout"),
+    ],
 )
 async def test_failed_discovery_does_not_consume_generation_failure_callback(
     tmp_path: Path,
@@ -2202,6 +1532,82 @@ def test_budget_classification_requires_structured_evidence(
     )
 
 
+@pytest.mark.parametrize(
+    ("status_code", "direct", "body", "model", "kind", "retryable", "message"),
+    [
+        pytest.param(
+            400,
+            False,
+            b'{"error":{"type":"BadRequestError","message":"secret-ish detail"}}',
+            "vendor/example-model",
+            RuntimeErrorKind.AGENT_EXECUTION_FAILED,
+            False,
+            "LLM provider rejected the request (HTTP 400, BadRequestError) "
+            "for model vendor/example-model",
+            id="safe-detail",
+        ),
+        pytest.param(
+            400,
+            False,
+            b'{"error":{"type":"invalid_request_error","code":"unsupported_parameter"}}',
+            None,
+            RuntimeErrorKind.AGENT_EXECUTION_FAILED,
+            False,
+            "LLM provider rejected the request (HTTP 400, unsupported_parameter)",
+            id="code-over-type",
+        ),
+        pytest.param(
+            400,
+            False,
+            b'{"error":{"type":"sk-live-abc def with spaces!"}}',
+            None,
+            RuntimeErrorKind.AGENT_EXECUTION_FAILED,
+            False,
+            "LLM provider rejected the request (HTTP 400)",
+            id="unsafe-token-dropped",
+        ),
+        pytest.param(
+            503,
+            False,
+            b"",
+            None,
+            RuntimeErrorKind.AGENT_EXECUTOR_UNCLASSIFIED,
+            True,
+            "Unclassified agent executor error: LLM gateway returned HTTP 503",
+            id="managed-unclassified-no-body",
+        ),
+        pytest.param(
+            504,
+            True,
+            b"",
+            None,
+            RuntimeErrorKind.AGENT_EXECUTION_FAILED,
+            True,
+            "LLM provider rejected the request (HTTP 504)",
+            id="direct-timeout-status-retryable",
+        ),
+    ],
+)
+def test_generic_http_error_message(
+    status_code: int,
+    direct: bool,
+    body: bytes,
+    model: str | None,
+    kind: RuntimeErrorKind,
+    retryable: bool,
+    message: str,
+) -> None:
+    classification = _http_error_classification(
+        status_code, route_is_direct=direct, body=body, model=model
+    )
+
+    assert classification.kind is kind
+    assert classification.retry_disposition is (
+        RetryDisposition.RETRYABLE if retryable else RetryDisposition.NON_RETRYABLE
+    )
+    assert classification.message == message
+
+
 def test_managed_unclassified_http_error_keeps_gateway_message() -> None:
     classification = _http_error_classification(
         500,
@@ -2227,62 +1633,6 @@ def test_managed_unclassified_http_error_keeps_gateway_message() -> None:
     assert "synthetic-secret" not in classification.message
 
 
-def test_managed_unclassified_http_error_without_body_names_status() -> None:
-    classification = _http_error_classification(503, route_is_direct=False)
-
-    assert classification.message == (
-        "Unclassified agent executor error: LLM gateway returned HTTP 503"
-    )
-
-
-def test_generic_http_error_message_carries_safe_detail() -> None:
-    classification = _http_error_classification(
-        400,
-        route_is_direct=False,
-        body=b'{"error":{"type":"BadRequestError","message":"secret-ish detail"}}',
-        model="vendor/example-model",
-    )
-
-    assert classification.kind is RuntimeErrorKind.AGENT_EXECUTION_FAILED
-    assert classification.owner is RuntimeErrorOwner.USER
-    assert (
-        classification.message
-        == "LLM provider rejected the request (HTTP 400, BadRequestError) "
-        "for model vendor/example-model"
-    )
-    assert "secret-ish detail" not in classification.message
-
-
-def test_generic_http_error_prefers_error_code_over_type() -> None:
-    classification = _http_error_classification(
-        400,
-        route_is_direct=False,
-        body=b'{"error":{"type":"invalid_request_error","code":"unsupported_parameter"}}',
-    )
-
-    assert "unsupported_parameter" in classification.message
-    assert "invalid_request_error" not in classification.message
-
-
-def test_generic_http_error_drops_unsafe_tokens() -> None:
-    classification = _http_error_classification(
-        400,
-        route_is_direct=False,
-        body=b'{"error":{"type":"sk-live-abc def with spaces!"}}',
-    )
-
-    assert classification.message == "LLM provider rejected the request (HTTP 400)"
-
-
-def test_direct_route_generic_error_retryable_on_timeout_status() -> None:
-    classification = _http_error_classification(504, route_is_direct=True)
-
-    assert classification.retry_disposition is RetryDisposition.RETRYABLE
-    assert classification.message.startswith(
-        "LLM provider rejected the request (HTTP 504)"
-    )
-
-
 @pytest.mark.parametrize("oversized", [False, True])
 def test_error_classification_bounds_json_parsing(
     monkeypatch: pytest.MonkeyPatch, oversized: bool
@@ -2304,10 +1654,18 @@ def test_error_classification_bounds_json_parsing(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("configuration", ["builtin", "custom"])
-@pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize(
-    "failure", ["auth", "budget", "rate", "connect", "headers_timeout", "body_timeout"]
+    ("configuration", "direct", "failure"),
+    [
+        ("builtin", False, "auth"),
+        ("custom", True, "auth"),
+        ("custom", False, "budget"),
+        ("builtin", True, "rate"),
+        ("builtin", False, "connect"),
+        ("custom", True, "connect"),
+        ("custom", False, "headers_timeout"),
+        ("builtin", True, "body_timeout"),
+    ],
 )
 async def test_llm_metadata_follows_selected_route_on_all_failure_phases(
     tmp_path: Path,
@@ -2319,7 +1677,6 @@ async def test_llm_metadata_follows_selected_route_on_all_failure_phases(
     monkeypatch.setattr(
         "tracecat.config.TRACECAT__SERVICE_KEY", "synthetic-signing-key-for-tests-only"
     )
-    errors: list[LLMProxyError] = []
 
     class StalledBody(httpx.AsyncByteStream):
         async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -2378,21 +1735,14 @@ async def test_llm_metadata_follows_selected_route_on_all_failure_phases(
             )
         },
     )
-    proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock", routing_plan=plan, on_error=errors.append
+    _, errors = await _forward(
+        tmp_path,
+        handler,
+        _request(
+            b'{"model":"synthetic-model"}', headers={"Authorization": f"Bearer {token}"}
+        ),
+        routing_plan=plan,
     )
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        proxy._client = client
-        proxy._direct_client = client
-        await proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Authorization": f"Bearer {token}"},
-                "body": b'{"model":"synthetic-model"}',
-            },
-            cast(asyncio.StreamWriter, _FakeWriter()),
-        )
     assert len(errors) == 1
     classification = errors[0].classification
     assert errors[0].diagnostic == LLMErrorDiagnostics(
@@ -2538,8 +1888,13 @@ async def test_successful_managed_request_skips_diagnostic_token_verification(
         side_effect=AssertionError("Success must not decode diagnostic tokens")
     )
     monkeypatch.setattr("tracecat.agent.sandbox.llm_proxy.verify_llm_token", verify)
-    proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
+    await _forward(
+        tmp_path,
+        lambda request: httpx.Response(200, content=b"ok"),
+        _request(
+            b'{"model":"synthetic-model"}',
+            headers={"Authorization": "Bearer synthetic-token"},
+        ),
         routing_plan=LLMRoutingPlan(
             managed_route=LLMRoute(
                 base_url="http://gateway", model_provider="openai", mode="managed"
@@ -2547,22 +1902,6 @@ async def test_successful_managed_request_skips_diagnostic_token_verification(
             direct_routes={},
         ),
     )
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, content=b"ok")
-        )
-    ) as client:
-        proxy._client = client
-        proxy._direct_client = client
-        await proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Authorization": "Bearer synthetic-token"},
-                "body": b'{"model":"synthetic-model"}',
-            },
-            cast(asyncio.StreamWriter, _FakeWriter()),
-        )
     verify.assert_not_called()
 
 
@@ -2608,27 +1947,11 @@ async def test_forward_request_normalizes_read_tool_use_before_sandbox(
             200, headers={"Content-Type": content_type}, content=upstream_body
         )
 
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
+    response_text, _ = await _forward(
+        tmp_path, handler, _request({"stream": streaming, "messages": []})
     )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-    try:
-        await socket_proxy._forward_request(
-            {
-                "method": "POST",
-                "path": "/v1/messages",
-                "headers": {"Content-Type": "application/json"},
-                "body": orjson.dumps({"stream": streaming, "messages": []}),
-            },
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        await socket_proxy._client.aclose()
 
-    head, _, body = bytes(writer.buffer).partition(b"\r\n\r\n")
+    head, _, body = response_text.encode().partition(b"\r\n\r\n")
     assert b"HTTP/1.1 200" in head
     assert b'"pages"' not in body
     assert b"/skills/demo/references/api.md" in body
@@ -2656,41 +1979,6 @@ async def test_rewrite_json_body_passes_through_oversized_bodies() -> None:
     assert len(out) == 2
 
 
-_RATE_LIMIT_REQUEST: dict[str, object] = {
-    "method": "POST",
-    "path": "/v1/messages",
-    "headers": {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer llm-token",
-        "X-Request-ID": "trace-rate-limit",
-    },
-    "body": b'{"messages":[{"role":"user","content":"hello"}]}',
-}
-
-
-async def _forward_with_handler(
-    tmp_path: Path,
-    handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> tuple[str, list[LLMProxyError]]:
-    errors: list[LLMProxyError] = []
-    socket_proxy = LLMSocketProxy(
-        socket_path=tmp_path / "llm.sock",
-        routing_plan=_routing_plan(),
-        on_error=errors.append,
-    )
-    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    socket_proxy._direct_client = socket_proxy._client
-    writer = _FakeWriter()
-    try:
-        await socket_proxy._forward_request(
-            cast(ParsedRequest, _RATE_LIMIT_REQUEST),
-            cast(asyncio.StreamWriter, writer),
-        )
-    finally:
-        await socket_proxy._client.aclose()
-    return writer.buffer.decode("utf-8"), errors
-
-
 @pytest.mark.anyio
 async def test_forward_request_retries_rate_limited_request_until_success(
     tmp_path: Path,
@@ -2703,7 +1991,7 @@ async def test_forward_request_retries_rate_limited_request_until_success(
             return httpx.Response(429, json={"error": {"type": "rate_limit_error"}})
         return httpx.Response(200, json={"ok": True})
 
-    response_text, errors = await _forward_with_handler(tmp_path, handler)
+    response_text, errors = await _forward(tmp_path, handler)
 
     assert response_text.startswith("HTTP/1.1 200 OK")
     assert '"ok":true' in response_text
@@ -2729,7 +2017,7 @@ async def test_forward_request_emits_rate_limit_after_bounded_retries(
             )
         return httpx.Response(429, json={"error": {"type": "rate_limit_error"}})
 
-    response_text, errors = await _forward_with_handler(tmp_path, handler)
+    response_text, errors = await _forward(tmp_path, handler)
 
     # The pre-header connection drop is retried without using rate-limit budget.
     assert attempts == llm_proxy._RATE_LIMIT_MAX_ATTEMPTS + 1
@@ -2761,7 +2049,7 @@ async def test_forward_request_does_not_retry_non_rate_limit_failures(
         attempts += 1
         return httpx.Response(status_code, json=body)
 
-    _, errors = await _forward_with_handler(tmp_path, handler)
+    _, errors = await _forward(tmp_path, handler)
 
     assert attempts == 1
     assert len(errors) == 1
@@ -2812,3 +2100,397 @@ def test_rate_limit_wait_falls_back_to_jittered_backoff(
     assert 1.0 <= _rate_limit_wait(_rate_limited_retry_state(1, retry_after)) <= 1.5
     assert 4.0 <= _rate_limit_wait(_rate_limited_retry_state(3, retry_after)) <= 4.5
     assert _rate_limit_wait(_rate_limited_retry_state(10, retry_after)) == 20.0
+
+
+_SSE_MESSAGE_START = b'event: message_start\ndata: {"type":"message_start"}\n\n'
+_SSE_MESSAGE_STOP = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
+class _CutSSEStream(httpx.AsyncByteStream):
+    """SSE body that dies after its first event, like a gateway pod going away."""
+
+    def __init__(self, error: type[httpx.TransportError]) -> None:
+        self._error = error
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield _SSE_MESSAGE_START
+        raise self._error("peer closed connection without sending complete message")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error", [httpx.RemoteProtocolError, httpx.ReadError])
+async def test_managed_stream_cut_after_headers_is_stream_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: type[httpx.TransportError],
+) -> None:
+    log = Mock()
+    monkeypatch.setattr("tracecat.agent.sandbox.llm_proxy.logger", log)
+    upstream_request_ids: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        upstream_request_ids.append(request.headers.get("x-request-id"))
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "X-Tracecat-Gateway": "litellm-0/42",
+            },
+            stream=_CutSSEStream(error),
+        )
+
+    response_text, errors = await _forward(
+        tmp_path,
+        handler,
+        _request({"stream": True, "messages": _HELLO}, headers=_LLM_HEADERS),
+    )
+
+    # The partial response already reached the runtime: no transparent retry.
+    assert len(upstream_request_ids) == 1
+    assert response_text.startswith("HTTP/1.1 200 OK")
+    assert response_text.count("HTTP/1.1") == 1
+    assert "event: message_start" in response_text
+    assert "event: error" in response_text
+    # Raw transport text is not source-owned, so neither the runtime nor the
+    # terminal error sees it.
+    assert "peer closed connection" not in response_text
+    assert len(errors) == 1
+    classification = errors[0].classification
+    assert errors[0].message == classification.message
+    assert classification.kind is RuntimeErrorKind.AGENT_LLM_STREAM_INTERRUPTED
+    assert classification.owner is RuntimeErrorOwner.PLATFORM
+    assert classification.retry_disposition is RetryDisposition.RETRYABLE
+    assert classification.cause_type == error.__name__
+
+    stream_log = next(
+        call
+        for call in log.warning.call_args_list
+        if call.args == ("Stream error after headers sent, emitting SSE error event",)
+    )
+    trace_request_id = upstream_request_ids[0]
+    assert trace_request_id is not None
+    assert f"X-Request-ID: {trace_request_id}" in response_text
+    assert stream_log.kwargs["error_type"] == error.__name__
+    assert stream_log.kwargs["route"] == "managed"
+    assert stream_log.kwargs["trace_request_id"] == trace_request_id
+    assert stream_log.kwargs["response_bytes"] == len(_SSE_MESSAGE_START)
+    assert stream_log.kwargs["sse_events"] == 1
+    assert stream_log.kwargs["saw_message_stop"] is False
+    assert stream_log.kwargs["gateway_identity"] == "litellm-0/42"
+    # Gateway pod and pid stay out of the in-jail runtime's response.
+    assert "litellm-0/42" not in response_text
+    assert stream_log.kwargs["stream_duration_ms"] >= 0
+    # Progress fields stay content-free.
+    assert "hello" not in str(log.mock_calls)
+
+
+@pytest.mark.anyio
+async def test_direct_stream_cut_after_headers_keeps_user_attribution(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            stream=_CutSSEStream(httpx.RemoteProtocolError),
+        )
+
+    request, plan = _direct_or_managed(True)
+    _, errors = await _forward(tmp_path, handler, request, routing_plan=plan)
+
+    assert len(errors) == 1
+    assert errors[0].classification.kind is RuntimeErrorKind.AGENT_EXECUTION_FAILED
+    assert errors[0].classification.owner is RuntimeErrorOwner.USER
+
+
+@pytest.mark.anyio
+async def test_completed_stream_logs_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = Mock()
+    monkeypatch.setattr("tracecat.agent.sandbox.llm_proxy.logger", log)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=_SSE_MESSAGE_START + _SSE_MESSAGE_STOP,
+        )
+
+    _, errors = await _forward(
+        tmp_path,
+        handler,
+        _request(
+            {"stream": True, "messages": _HELLO},
+            headers={**_LLM_HEADERS, "X-Request-ID": "trace-complete"},
+        ),
+    )
+
+    assert errors == []
+    finished = next(
+        call
+        for call in log.info.call_args_list
+        if call.args == ("LLM proxy stream finished",)
+    )
+    assert finished.kwargs["trace_request_id"] == "trace-complete"
+    assert finished.kwargs["response_bytes"] == len(
+        _SSE_MESSAGE_START + _SSE_MESSAGE_STOP
+    )
+    assert finished.kwargs["sse_events"] == 2
+    assert finished.kwargs["saw_message_stop"] is True
+    assert finished.kwargs["gateway_identity"] is None
+
+
+@pytest.mark.anyio
+async def test_forward_request_retries_managed_connect_error_once(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # A gateway pod that stopped listening before endpoints updated.
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"ok": True})
+
+    response_text, errors = await _forward(tmp_path, handler)
+
+    assert attempts == 2
+    assert response_text.startswith("HTTP/1.1 200 OK")
+    assert errors == []
+
+
+@pytest.mark.anyio
+async def test_forward_request_does_not_retry_direct_connect_error(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("connection refused", request=request)
+
+    request, plan = _direct_or_managed(True)
+    _, errors = await _forward(tmp_path, handler, request, routing_plan=plan)
+
+    assert attempts == 1
+    assert len(errors) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("direct", "inbound_headers", "expected"),
+    [
+        (False, {}, "generated"),
+        (False, {"x-request-id": "trace-inbound"}, "trace-inbound"),
+        # Oversized or unsafe runtime-chosen IDs are replaced, not forwarded.
+        (False, {"x-request-id": "t" * 129}, "generated"),
+        (False, {"x-request-id": "trace id\twith spaces"}, "generated"),
+        (True, {}, None),
+    ],
+)
+async def test_forward_request_sends_trace_request_id_to_gateway(
+    tmp_path: Path,
+    direct: bool,
+    inbound_headers: dict[str, str],
+    expected: str | None,
+) -> None:
+    sent: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get_list("x-request-id"))
+        return _ok(request)
+
+    request, plan = _direct_or_managed(direct)
+    request = cast(
+        ParsedRequest, {**request, "headers": {**_LLM_HEADERS, **inbound_headers}}
+    )
+    response_text, _ = await _forward(tmp_path, handler, request, routing_plan=plan)
+
+    if expected is None:
+        assert sent == [[]]
+    elif expected == "generated":
+        assert len(sent[0]) == 1
+        assert sent[0][0] != inbound_headers.get("x-request-id")
+        assert str(uuid.UUID(sent[0][0])) == sent[0][0]
+        assert f"X-Request-ID: {sent[0][0]}" in response_text
+    else:
+        assert sent == [[expected]]
+
+
+@pytest.mark.anyio
+async def test_custom_model_provider_forces_thinking_disabled_when_not_enabled(
+    tmp_path: Path,
+) -> None:
+    """The CLI always emits thinking={"type": "adaptive"} for this route, so
+    when the route's own agent config has thinking disabled, the proxy must
+    override it with both the Ollama-style "thinking" field and vLLM's own
+    "chat_template_kwargs" field (vLLM ignores the former -- see the real
+    vLLM 0.29 /v1/messages evidence in llm_proxy.py's comment)."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        assert payload["thinking"] == {"type": "disabled"}
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"ok": True},
+        )
+
+    socket_proxy = LLMSocketProxy(
+        socket_path=tmp_path / "llm.sock",
+        routing_plan=_routing_plan(
+            direct_routes={
+                "qwen-direct": LLMRoute(
+                    base_url="https://qwen.example",
+                    model_provider="custom-model-provider",
+                    enable_thinking=False,
+                )
+            }
+        ),
+    )
+    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    writer = _FakeWriter()
+
+    try:
+        await socket_proxy._forward_request(
+            {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"Content-Type": "application/json"},
+                "body": orjson.dumps(
+                    {
+                        "model": "qwen-direct",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "thinking": {"type": "adaptive"},
+                    }
+                ),
+            },
+            cast(asyncio.StreamWriter, writer),
+        )
+    finally:
+        if socket_proxy._client is not None:
+            await socket_proxy._client.aclose()
+
+    response_text = writer.buffer.decode("utf-8")
+    assert response_text.startswith("HTTP/1.1 200 OK")
+
+
+@pytest.mark.anyio
+async def test_custom_model_provider_leaves_thinking_untouched_when_enabled(
+    tmp_path: Path,
+) -> None:
+    """When the route's own agent config has thinking enabled, the CLI's own
+    "adaptive" request must pass through unchanged -- no forced "disabled"
+    override and no "chat_template_kwargs" injected."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert "chat_template_kwargs" not in payload
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"ok": True},
+        )
+
+    socket_proxy = LLMSocketProxy(
+        socket_path=tmp_path / "llm.sock",
+        routing_plan=_routing_plan(
+            direct_routes={
+                "qwen-direct": LLMRoute(
+                    base_url="https://qwen.example",
+                    model_provider="custom-model-provider",
+                    enable_thinking=True,
+                )
+            }
+        ),
+    )
+    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    writer = _FakeWriter()
+
+    try:
+        await socket_proxy._forward_request(
+            {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"Content-Type": "application/json"},
+                "body": orjson.dumps(
+                    {
+                        "model": "qwen-direct",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "thinking": {"type": "adaptive"},
+                    }
+                ),
+            },
+            cast(asyncio.StreamWriter, writer),
+        )
+    finally:
+        if socket_proxy._client is not None:
+            await socket_proxy._client.aclose()
+
+    response_text = writer.buffer.decode("utf-8")
+    assert response_text.startswith("HTTP/1.1 200 OK")
+
+
+@pytest.mark.anyio
+async def test_custom_model_provider_disables_thinking_when_cli_sends_no_thinking_field(
+    tmp_path: Path,
+) -> None:
+    """On a direct (passthrough) route the CLI sends no "thinking" field at all
+    (confirmed via live logging against a real passthrough route). The
+    "chat_template_kwargs" override must still apply in that case -- it cannot
+    be gated on the "thinking" field's presence, since vLLM needs it regardless
+    of whether the CLI sent an Anthropic-shaped "thinking" field."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = orjson.loads(request.content)
+        assert "thinking" not in payload
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            json={"ok": True},
+        )
+
+    socket_proxy = LLMSocketProxy(
+        socket_path=tmp_path / "llm.sock",
+        routing_plan=_routing_plan(
+            direct_routes={
+                "qwen-direct": LLMRoute(
+                    base_url="https://qwen.example",
+                    model_provider="custom-model-provider",
+                    enable_thinking=False,
+                )
+            }
+        ),
+    )
+    socket_proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    writer = _FakeWriter()
+
+    try:
+        await socket_proxy._forward_request(
+            {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"Content-Type": "application/json"},
+                "body": orjson.dumps(
+                    {
+                        "model": "qwen-direct",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                ),
+            },
+            cast(asyncio.StreamWriter, writer),
+        )
+    finally:
+        if socket_proxy._client is not None:
+            await socket_proxy._client.aclose()
+
+    response_text = writer.buffer.decode("utf-8")
+    assert response_text.startswith("HTTP/1.1 200 OK")

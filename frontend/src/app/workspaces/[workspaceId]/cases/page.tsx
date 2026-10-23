@@ -110,6 +110,7 @@ export default function CasesPage() {
     appliedSearchQuery,
     effectiveHierarchy,
     isSearchPending,
+    setSearchMode,
     setSearchQuery,
     setSortBy,
     setStatusFilter,
@@ -126,6 +127,7 @@ export default function CasesPage() {
     setTagFilter,
     setTagMode,
     setTagSortDirection,
+    setStructuredFilters,
     setDropdownFilter,
     setDropdownMode,
     setDropdownSortDirection,
@@ -136,6 +138,7 @@ export default function CasesPage() {
     stageCounts,
     isCountsLoading,
     isCountsFetching,
+    isCountsError,
     hasNextPage,
     isFetchingNextPage,
     fetchNextPage,
@@ -159,6 +162,7 @@ export default function CasesPage() {
         isSearchPending={isSearchPending}
         members={members}
         tags={caseTags}
+        onSearchModeChange={setSearchMode}
         onSearchChange={setSearchQuery}
         onSortByChange={setSortBy}
         onStatusChange={setStatusFilter}
@@ -189,6 +193,7 @@ export default function CasesPage() {
         }
         visibleColumnIds={visibleColumnIds}
         onToggleColumn={toggleColumn}
+        onStructuredFiltersChange={setStructuredFilters}
         onDropdownFilterChange={setDropdownFilter}
         onDropdownModeChange={setDropdownMode}
         onDropdownSortDirectionChange={setDropdownSortDirection}
@@ -196,6 +201,7 @@ export default function CasesPage() {
         stageCounts={stageCounts}
         isCountsLoading={isCountsLoading}
         isCountsFetching={isCountsFetching}
+        isCountsError={isCountsError}
         hasNextPage={hasNextPage}
         isFetchingNextPage={isFetchingNextPage}
         onLoadMore={fetchNextPage}

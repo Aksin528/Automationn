@@ -9,14 +9,20 @@ jest.mock("@/components/chat/chat-session-pane", () => ({
   ChatSessionPane: ({
     resume,
     modelInfo,
+    inputDisabled,
+    inputDisabledPlaceholder,
   }: {
     resume?: boolean
     modelInfo?: { name: string; provider: string }
+    inputDisabled?: boolean
+    inputDisabledPlaceholder?: string
   }) => (
     <div
       data-testid="chat-session-pane"
       data-resume={String(resume)}
       data-model={modelInfo ? `${modelInfo.name} ${modelInfo.provider}` : ""}
+      data-input-disabled={String(Boolean(inputDisabled))}
+      data-placeholder={inputDisabledPlaceholder ?? ""}
     />
   ),
 }))
@@ -96,6 +102,7 @@ describe("InboxDetail", () => {
       chatLoading: false,
       chatFetching: false,
       chatError: null,
+      refetchChat: jest.fn(),
     })
     mockUseChatReadiness.mockReturnValue({
       ready: true,
@@ -106,6 +113,33 @@ describe("InboxDetail", () => {
 
   afterEach(() => {
     jest.clearAllMocks()
+  })
+
+  it("keeps the session and its approvals visible when no model is usable", () => {
+    // The workspace subset excludes the default; history stays readable.
+    mockUseChatReadiness.mockReturnValue({
+      ready: false,
+      loading: false,
+      reason: "default_not_enabled",
+    })
+    // No pending approvals, so only the missing model disables the composer.
+    render(
+      <InboxDetail
+        sessionId="session-1"
+        parentSessionId="session-1"
+        session={inboxSession({
+          derivedStatus: "COMPLETED",
+          statusLabel: "Completed",
+          pendingApprovalCount: 0,
+        })}
+      />
+    )
+
+    const pane = screen.getByTestId("chat-session-pane")
+    expect(pane).toHaveAttribute("data-input-disabled", "true")
+    expect(pane.getAttribute("data-placeholder")).toMatch(
+      /default model is not enabled for this workspace/
+    )
   })
 
   it("re-arms stream resume when an approval leaves pending", () => {
@@ -153,9 +187,10 @@ describe("InboxDetail model badge", () => {
       chatLoading: false,
       chatFetching: false,
       chatError: null,
+      refetchChat: jest.fn(),
     }))
     // The workspace default, unless the caller passes the session's model.
-    mockUseChatReadiness.mockImplementation((options) => ({
+    mockUseChatReadiness.mockImplementation((_workspaceId, options) => ({
       ready: true,
       loading: false,
       modelInfo: options?.modelOverride ?? {

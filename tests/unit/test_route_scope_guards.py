@@ -247,10 +247,19 @@ async def test_skill_scope_guards(endpoint: AsyncEndpoint, required_scope: str) 
         agent_catalog_router.list_catalog,
         agent_catalog_router.get_catalog_entry,
         agent_catalog_router.get_workspace_models,
+        agent_catalog_router.get_workspace_model_access,
     ],
 )
 async def test_agent_catalog_read_scope_guards(endpoint: AsyncEndpoint) -> None:
     await _assert_endpoint_requires_scope(endpoint, "agent:read")
+
+
+@pytest.mark.anyio
+async def test_workspace_model_access_update_requires_agent_update() -> None:
+    """Saving a workspace's model subset needs agent:update."""
+    await _assert_endpoint_requires_scope(
+        agent_catalog_router.update_workspace_model_access, "agent:update"
+    )
 
 
 @pytest.mark.anyio
@@ -278,6 +287,72 @@ async def test_agent_catalog_list_accepts_service_account_with_scope() -> None:
         organization_id=organization_id,
         service_account_id=uuid.uuid4(),
         scopes=frozenset({"agent:read"}),
+    )
+    token = ctx_role.set(allowed_role)
+    try:
+        with pytest.raises(TypeError):
+            await endpoint()
+    finally:
+        ctx_role.reset(token)
+
+
+@pytest.mark.anyio
+async def test_registry_repository_sync_accepts_service_account_with_scope() -> None:
+    endpoint = cast(AsyncEndpoint, registry_repos_router.sync_registry_repository)
+    organization_id = uuid.uuid4()
+    denied_role = Role(
+        type="service_account",
+        service_id="tracecat-api",
+        organization_id=organization_id,
+        service_account_id=uuid.uuid4(),
+        scopes=frozenset({"org:registry:read"}),
+    )
+    token = ctx_role.set(denied_role)
+    try:
+        with pytest.raises(ScopeDeniedError):
+            await endpoint()
+    finally:
+        ctx_role.reset(token)
+
+    allowed_role = Role(
+        type="service_account",
+        service_id="tracecat-api",
+        organization_id=organization_id,
+        service_account_id=uuid.uuid4(),
+        scopes=frozenset({"org:registry:update"}),
+    )
+    token = ctx_role.set(allowed_role)
+    try:
+        with pytest.raises(TypeError):
+            await endpoint()
+    finally:
+        ctx_role.reset(token)
+
+
+@pytest.mark.anyio
+async def test_list_org_members_accepts_service_account_with_scope() -> None:
+    endpoint = cast(AsyncEndpoint, organization_router.list_org_members)
+    organization_id = uuid.uuid4()
+    denied_role = Role(
+        type="service_account",
+        service_id="tracecat-api",
+        organization_id=organization_id,
+        service_account_id=uuid.uuid4(),
+        scopes=frozenset({"org:rbac:read"}),
+    )
+    token = ctx_role.set(denied_role)
+    try:
+        with pytest.raises(ScopeDeniedError):
+            await endpoint()
+    finally:
+        ctx_role.reset(token)
+
+    allowed_role = Role(
+        type="service_account",
+        service_id="tracecat-api",
+        organization_id=organization_id,
+        service_account_id=uuid.uuid4(),
+        scopes=frozenset({"org:member:read"}),
     )
     token = ctx_role.set(allowed_role)
     try:

@@ -23,6 +23,7 @@ import {
   Trash2Icon,
 } from "lucide-react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import React, {
   Fragment,
   useCallback,
@@ -32,7 +33,6 @@ import React, {
   useState,
 } from "react"
 import { FormProvider, useForm, useFormContext } from "react-hook-form"
-import YAML from "yaml"
 import {
   type ActionRead,
   actionsCreateAction,
@@ -82,11 +82,14 @@ import {
   useAction,
   useActionLockStatuses,
   useGetRegistryAction,
+  useListTables,
   useWorkflowManager,
 } from "@/lib/hooks"
 import { useQueryClient } from "@/lib/query"
+import { getTableActionRef, type TableActionRef } from "@/lib/table-actions"
 import { cn, slugifyActionRef } from "@/lib/utils"
 import { CHILD_WORKFLOW_ACTION_TYPE } from "@/lib/workflow"
+import { parseYaml } from "@/lib/yaml"
 import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
 
@@ -109,6 +112,13 @@ type ChildWorkflowInfo = {
   childWorkflowAlias?: string
   childIdFromAlias?: string
   isDynamicChildWorkflowAlias: boolean
+}
+
+type TableLinkInfo = TableActionRef & {
+  tableId?: string
+  tableName?: string
+  isDynamic: boolean
+  isLoading: boolean
 }
 
 export default React.memo(function ActionNode({
@@ -342,11 +352,10 @@ export default React.memo(function ActionNode({
 
   const actionInputsObj = useMemo(() => {
     try {
-      // Use YAML.parse with strict schema to catch duplicate keys
+      // Parse strictly to catch duplicate keys
       setError(null)
       return action?.inputs
-        ? YAML.parse(action.inputs, {
-            schema: "core",
+        ? parseYaml(action.inputs, {
             strict: true,
             uniqueKeys: true,
           })
@@ -423,6 +432,36 @@ export default React.memo(function ActionNode({
     isDynamicChildWorkflowAlias,
   }
 
+  const tableRef = useMemo(
+    () => getTableActionRef(action?.type, actionInputsObj),
+    [action?.type, actionInputsObj]
+  )
+  const isDynamicTableRef = !!tableRef?.value && isExpression(tableRef.value)
+  const { tables, tablesIsLoading } = useListTables(
+    { workspaceId },
+    { enabled: !!tableRef?.value && !isDynamicTableRef }
+  )
+  const tableLinkInfo = useMemo<TableLinkInfo | null>(() => {
+    if (!tableRef) {
+      return null
+    }
+    const table =
+      tableRef.value && !isDynamicTableRef
+        ? tables?.find((t) =>
+            tableRef.by === "id"
+              ? t.id === tableRef.value
+              : t.name === tableRef.value
+          )
+        : undefined
+    return {
+      ...tableRef,
+      tableId: table?.id,
+      tableName: table?.name,
+      isDynamic: isDynamicTableRef,
+      isLoading: tablesIsLoading,
+    }
+  }, [tableRef, isDynamicTableRef, tables, tablesIsLoading])
+
   return (
     <TooltipProvider>
       <FormProvider {...form}>
@@ -451,6 +490,7 @@ export default React.memo(function ActionNode({
                   breakpoint={breakpoint}
                   Icon={Icon}
                   childWorkflowInfo={childWorkflowInfo}
+                  tableLinkInfo={tableLinkInfo}
                   error={error}
                   validationErrors={actionValidationErrors}
                 />
@@ -499,6 +539,7 @@ export default React.memo(function ActionNode({
                   <ActionNodeToolbar
                     action={action}
                     childWorkflowInfo={childWorkflowInfo}
+                    tableLinkInfo={tableLinkInfo}
                     showToolbar={showToolbar && !contextMenuOpen}
                     selected={selected && !contextMenuOpen}
                     sidebarRef={sidebarRef}
@@ -558,6 +599,7 @@ function ActionNodeContent({
   Icon,
   workspaceId,
   childWorkflowInfo,
+  tableLinkInfo,
   error,
   validationErrors,
 }: {
@@ -570,6 +612,7 @@ function ActionNodeContent({
   Icon: React.ReactNode
   workspaceId: string
   childWorkflowInfo: ChildWorkflowInfo
+  tableLinkInfo: TableLinkInfo | null
   error: ActionConfigError | null
   validationErrors: ValidationResult[]
 }) {
@@ -658,13 +701,18 @@ function ActionNodeContent({
               </CardDescription>
             )}
           </div>
-          {/* Child workflow */}
-
-          <div className="flex items-start gap-1">
+          {/* Child workflow / table links, kept clear of the lock button */}
+          <div className="flex items-center gap-1 self-end">
             {childWorkflowInfo.isChildWorkflow && (
               <ChildWorkflowLink
                 workspaceId={workspaceId}
                 childWorkflowInfo={childWorkflowInfo}
+              />
+            )}
+            {tableLinkInfo && (
+              <TableLink
+                workspaceId={workspaceId}
+                tableLinkInfo={tableLinkInfo}
               />
             )}
           </div>
@@ -709,9 +757,10 @@ function ActionNodeContent({
 
 const COMMAND_VALUE_UNSET = "__UNSET__"
 
-function ActionNodeToolbar({
+export function ActionNodeToolbar({
   action,
   childWorkflowInfo,
+  tableLinkInfo,
   showToolbar,
   selected,
   sidebarRef,
@@ -724,6 +773,7 @@ function ActionNodeToolbar({
 }: {
   action: ActionRead
   childWorkflowInfo: ChildWorkflowInfo
+  tableLinkInfo: TableLinkInfo | null
   showToolbar: boolean
   selected: boolean
   sidebarRef: React.RefObject<EventsSidebarRef>
@@ -752,6 +802,17 @@ function ActionNodeToolbar({
     setCommandValue(COMMAND_VALUE_UNSET)
   }, [])
 
+  // null: no static reference, so no item. undefined: unresolved, so disabled.
+  const subflowHref =
+    isChildWorkflow && (childWorkflowAlias || childWorkflowId)
+      ? childIdFromAlias || childWorkflowId
+        ? `/workspaces/${workspaceId}/workflows/${childIdFromAlias ?? childWorkflowId}`
+        : undefined
+      : null
+  const tableHref = tableLinkInfo?.tableId
+    ? `/workspaces/${workspaceId}/tables/${tableLinkInfo.tableId}`
+    : undefined
+
   return (
     <NodeToolbar
       isVisible={showToolbar || selected}
@@ -767,7 +828,21 @@ function ActionNodeToolbar({
         className="min-w-[100px] rounded-lg border text-sm shadow-md [&_[cmdk-item]]:text-foreground/90 [&_[cmdk-item]]:hover:cursor-pointer"
         defaultValue={COMMAND_VALUE_UNSET}
       >
-        <CommandList>
+        {/* Uncapped: a capped list hides trailing items behind the hidden scrollbar. */}
+        <CommandList className="max-h-[none]">
+          {(subflowHref !== null || tableHref) && (
+            <Fragment>
+              <CommandGroup>
+                {subflowHref !== null && (
+                  <ToolbarLinkItem href={subflowHref} label="Open subflow" />
+                )}
+                {tableHref && (
+                  <ToolbarLinkItem href={tableHref} label="Open table" />
+                )}
+              </CommandGroup>
+              <CommandSeparator />
+            </Fragment>
+          )}
           {/* Actions */}
           <CommandGroup>
             <CommandItem
@@ -843,34 +918,42 @@ function ActionNodeToolbar({
               <span className="group-hover:text-red-600">Delete</span>
             </CommandItem>
           </CommandGroup>
-          {/* Child workflow */}
-          {isChildWorkflow && (
-            <Fragment>
-              <CommandSeparator />
-              {(childWorkflowAlias || childWorkflowId) && (
-                <CommandGroup heading="Subflow">
-                  <CommandItem disabled={!childIdFromAlias && !childWorkflowId}>
-                    <Link
-                      href={`/workspaces/${workspaceId}/workflows/${childIdFromAlias ?? childWorkflowId}`}
-                      className={
-                        !childIdFromAlias && !childWorkflowId
-                          ? "pointer-events-none"
-                          : ""
-                      }
-                    >
-                      <div className="flex items-center">
-                        <SquareArrowOutUpRightIcon className="mr-2 size-3" />
-                        <span>Open subflow</span>
-                      </div>
-                    </Link>
-                  </CommandItem>
-                </CommandGroup>
-              )}
-            </Fragment>
-          )}
         </CommandList>
       </Command>
     </NodeToolbar>
+  )
+}
+
+function ToolbarLinkItem({ href, label }: { href?: string; label: string }) {
+  const router = useRouter()
+  const content = (
+    <>
+      <SquareArrowOutUpRightIcon className="mr-2 size-3" />
+      <span>{label}</span>
+    </>
+  )
+  // The whole row (and Enter) navigates via onSelect. The inner Link keeps
+  // modifier-click/middle-click and stops propagation so a click doesn't
+  // navigate twice.
+  return (
+    <CommandItem
+      disabled={!href}
+      onSelect={() => {
+        if (href) router.push(href)
+      }}
+    >
+      {href ? (
+        <Link
+          href={href}
+          className="flex w-full items-center gap-2"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {content}
+        </Link>
+      ) : (
+        <div className="flex items-center gap-2">{content}</div>
+      )}
+    </CommandItem>
   )
 }
 
@@ -989,6 +1072,96 @@ function ChildWorkflowLink({
         </span>
       </TooltipContent>
     </Tooltip>
+  )
+}
+
+function TableLink({
+  workspaceId,
+  tableLinkInfo,
+}: {
+  workspaceId: string
+  tableLinkInfo: TableLinkInfo
+}) {
+  const { inputKey, by, value, tableId, tableName, isDynamic, isLoading } =
+    tableLinkInfo
+  const { setSelectedNodeId } = useWorkflowBuilder()
+
+  if (!value) {
+    return (
+      <Tooltip>
+        <TooltipTrigger>
+          <CircleHelp
+            className="size-4 text-muted-foreground"
+            strokeWidth={2}
+          />
+        </TooltipTrigger>
+        <TooltipContent sideOffset={20}>
+          <span>
+            Missing <TooltipCode value={inputKey} />
+          </span>
+        </TooltipContent>
+      </Tooltip>
+    )
+  }
+  if (isDynamic) {
+    return (
+      <Tooltip>
+        <TooltipTrigger>
+          <div className="rounded-sm border bg-blue-200/30 p-0.5">
+            <BracesIcon className="size-3 text-blue-600/80" />
+          </div>
+        </TooltipTrigger>
+        <TooltipContent
+          sideOffset={20}
+          className="max-w-[300px] whitespace-normal break-words"
+        >
+          <span>
+            This table is resolved dynamically at runtime using the{" "}
+            <TooltipCode value={inputKey} /> expression
+          </span>
+        </TooltipContent>
+      </Tooltip>
+    )
+  }
+  if (!tableId) {
+    if (isLoading) {
+      return null
+    }
+    return (
+      <Tooltip>
+        <TooltipTrigger>
+          <AlertTriangleIcon className="size-4 fill-red-500 stroke-white outline-red-500" />
+        </TooltipTrigger>
+        <TooltipContent sideOffset={20}>
+          <span>
+            No matching table found for {by === "id" ? "ID" : "name"}{" "}
+            <TooltipCode value={value} />
+          </span>
+        </TooltipContent>
+      </Tooltip>
+    )
+  }
+  return (
+    <Link
+      href={`/workspaces/${workspaceId}/tables/${tableId}`}
+      onClick={() => setSelectedNodeId(null)}
+    >
+      <div className="flex flex-col items-center gap-1">
+        <Tooltip delayDuration={100}>
+          <TooltipTrigger>
+            <div className="rounded-sm border bg-muted-foreground/10 p-0.5">
+              <SquareArrowOutUpRightIcon className="size-3 text-foreground/70" />
+            </div>
+          </TooltipTrigger>
+          <TooltipContent sideOffset={20}>
+            <span>
+              Open the <TooltipCode value={tableName ?? value} />
+              table
+            </span>
+          </TooltipContent>
+        </Tooltip>
+      </div>
+    </Link>
   )
 }
 

@@ -20,6 +20,8 @@ import type {
   ActionsUpdateActionResponse,
   AdminAgentListPlatformCatalogData,
   AdminAgentListPlatformCatalogResponse,
+  AdminCheckIpAllowlistData,
+  AdminCheckIpAllowlistResponse,
   AdminCreateOrganizationData,
   AdminCreateOrganizationDomainData,
   AdminCreateOrganizationDomainResponse,
@@ -48,6 +50,7 @@ import type {
   AdminGetOrgTierData,
   AdminGetOrgTierResponse,
   AdminGetRegistrySettingsResponse,
+  AdminGetSecuritySettingsResponse,
   AdminGetTierData,
   AdminGetTierResponse,
   AdminGetUserData,
@@ -107,6 +110,8 @@ import type {
   AdminUpdateOrgTierResponse,
   AdminUpdateRegistrySettingsData,
   AdminUpdateRegistrySettingsResponse,
+  AdminUpdateSecuritySettingsData,
+  AdminUpdateSecuritySettingsResponse,
   AdminUpdateTierData,
   AdminUpdateTierResponse,
   AgentChannelsCreateChannelTokenData,
@@ -377,6 +382,8 @@ import type {
   CasesLinkCaseRowResponse,
   CasesListCaseDropdownValuesData,
   CasesListCaseDropdownValuesResponse,
+  CasesListCaseFilterFieldsData,
+  CasesListCaseFilterFieldsResponse,
   CasesListCaseLinkedTablesData,
   CasesListCaseLinkedTablesResponse,
   CasesListCaseRowsData,
@@ -399,6 +406,10 @@ import type {
   CasesListTagsResponse,
   CasesListTasksData,
   CasesListTasksResponse,
+  CasesQueryCaseAggregatesData,
+  CasesQueryCaseAggregatesResponse,
+  CasesQueryCasesData,
+  CasesQueryCasesResponse,
   CasesRemoveTagData,
   CasesRemoveTagResponse,
   CasesRestoreCaseVersionData,
@@ -504,6 +515,8 @@ import type {
   GetCatalogEntryResponse,
   GetCustomProviderData,
   GetCustomProviderResponse,
+  GetWorkspaceModelAccessData,
+  GetWorkspaceModelAccessResponse,
   GetWorkspaceModelsData,
   GetWorkspaceModelsResponse,
   GraphApplyGraphOperationsData,
@@ -985,6 +998,8 @@ import type {
   TunnelsCreateTunnelResponse,
   TunnelsDeleteTunnelData,
   TunnelsDeleteTunnelResponse,
+  TunnelsGetTunnelAvailabilityData,
+  TunnelsGetTunnelAvailabilityResponse,
   TunnelsGetTunnelData,
   TunnelsGetTunnelResponse,
   TunnelsGetTunnelStatusData,
@@ -999,6 +1014,8 @@ import type {
   UpdateCatalogEntryResponse,
   UpdateCustomProviderData,
   UpdateCustomProviderResponse,
+  UpdateWorkspaceModelAccessData,
+  UpdateWorkspaceModelAccessResponse,
   UsersGetMyScopesData,
   UsersGetMyScopesResponse,
   UsersSearchUserData,
@@ -2808,6 +2825,7 @@ export const workflowExecutionsCreateWorkflowExecution = (
  * @param data.durationLteSeconds
  * @param data.searchTerm Filter by workflow title or alias.
  * @param data.relation
+ * @param data.caseTaskId Filter by the case task that started the run.
  * @param data.workflowId
  * @param data.limit
  * @param data.cursor
@@ -2837,6 +2855,7 @@ export const workflowExecutionsSearchWorkflowExecutions = (
       duration_lte_seconds: data.durationLteSeconds,
       search_term: data.searchTerm,
       relation: data.relation,
+      case_task_id: data.caseTaskId,
       workflow_id: data.workflowId,
       limit: data.limit,
       cursor: data.cursor,
@@ -4208,6 +4227,29 @@ export const tunnelsCreateTunnel = (
 }
 
 /**
+ * Get Tunnel Availability
+ * Report whether this deployment can run tunnel gateways.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @returns TunnelAvailabilityRead Successful Response
+ * @throws ApiError
+ */
+export const tunnelsGetTunnelAvailability = (
+  data: TunnelsGetTunnelAvailabilityData
+): CancelablePromise<TunnelsGetTunnelAvailabilityResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/tunnels/availability",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Create Managed Tunnel
  * Create a tunnel whose Pangolin site, machine client, and resources Tracecat provisions.
  *
@@ -4262,11 +4304,11 @@ export const tunnelsGetTunnelStatus = (
 
 /**
  * Get Tunnel
- * Get a tunnel in the workspace.
+ * Get a tunnel in the workspace and the resources that reference it.
  * @param data The data for the request.
  * @param data.tunnelId
  * @param data.workspaceId
- * @returns TunnelRead Successful Response
+ * @returns TunnelDetailRead Successful Response
  * @throws ApiError
  */
 export const tunnelsGetTunnel = (
@@ -4650,11 +4692,15 @@ export const tagsDeleteTag = (
 
 /**
  * Search User
- * Search for a user by email.
+ * Find a member of the caller's organization by email.
+ *
+ * Users outside the caller's organization return 404, the same as an unknown
+ * email, so the route cannot be used to enumerate accounts. Platform admins
+ * are scoped the same way; platform-wide lookups go through ``/admin/users``.
  * @param data The data for the request.
  * @param data.email
  * @param data.workspaceId
- * @returns UserRead Successful Response
+ * @returns UserSearchRead Successful Response
  * @throws ApiError
  */
 export const usersSearchUser = (
@@ -5682,13 +5728,14 @@ export const deleteCatalogEntry = (
 
 /**
  * Get Workspace Models
- * Get models accessible to a workspace.
+ * Get models accessible to a workspace, and its default model.
  *
  * Returns the full effective set; the list is bounded by org enablement
- * and is expected to be small, so pagination is not used here.
+ * and is expected to be small, so pagination is not used here. The default
+ * is the organization's default model, if it is enabled for this workspace.
  * @param data The data for the request.
  * @param data.workspaceId
- * @returns AgentCatalogListResponse Successful Response
+ * @returns WorkspaceAgentModelListResponse Successful Response
  * @throws ApiError
  */
 export const getWorkspaceModels = (
@@ -5700,6 +5747,57 @@ export const getWorkspaceModels = (
     path: {
       workspace_id: data.workspaceId,
     },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Get Workspace Model Access
+ * Get a workspace's model subset and the organization models it can use.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @returns WorkspaceAgentModelAccessRead Successful Response
+ * @throws ApiError
+ */
+export const getWorkspaceModelAccess = (
+  data: GetWorkspaceModelAccessData
+): CancelablePromise<GetWorkspaceModelAccessResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/agent-model-access",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Update Workspace Model Access
+ * Replace a workspace's model subset, or clear it to inherit the org's models.
+ *
+ * Every catalog ID must be enabled for the organization.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns WorkspaceAgentModelAccessRead Successful Response
+ * @throws ApiError
+ */
+export const updateWorkspaceModelAccess = (
+  data: UpdateWorkspaceModelAccessData
+): CancelablePromise<UpdateWorkspaceModelAccessResponse> => {
+  return __request(OpenAPI, {
+    method: "PUT",
+    url: "/workspaces/{workspace_id}/agent-model-access",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
     errors: {
       422: "Validation Error",
     },
@@ -9124,6 +9222,67 @@ export const adminUpdateRegistrySettings = (
 }
 
 /**
+ * Get Security Settings
+ * Get the platform admin IP allowlist.
+ * @returns PlatformSecuritySettingsRead Successful Response
+ * @throws ApiError
+ */
+export const adminGetSecuritySettings =
+  (): CancelablePromise<AdminGetSecuritySettingsResponse> => {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/admin/settings/security",
+    })
+  }
+
+/**
+ * Update Security Settings
+ * Update the platform admin IP allowlist.
+ *
+ * Enabling a non-empty allowlist that excludes the caller's own IP is
+ * rejected so a platform admin cannot lock themselves out.
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns PlatformSecuritySettingsRead Successful Response
+ * @throws ApiError
+ */
+export const adminUpdateSecuritySettings = (
+  data: AdminUpdateSecuritySettingsData
+): CancelablePromise<AdminUpdateSecuritySettingsResponse> => {
+  return __request(OpenAPI, {
+    method: "PATCH",
+    url: "/admin/settings/security",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Check Ip Allowlist
+ * Report whether an IP address is admitted by the saved platform admin allowlist.
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns IPAllowlistCheckResult Successful Response
+ * @throws ApiError
+ */
+export const adminCheckIpAllowlist = (
+  data: AdminCheckIpAllowlistData
+): CancelablePromise<AdminCheckIpAllowlistResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/admin/settings/security/ip-allowlist/check",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * List Tiers
  * List all tiers.
  * @param data The data for the request.
@@ -11976,13 +12135,16 @@ export const formsListIntakeSubmissions = (
  * @param data.limit Maximum items per page
  * @param data.cursor Cursor for pagination
  * @param data.reverse Reverse pagination direction
- * @param data.orderBy Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks). Default: created_at
+ * @param data.orderBy Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks, assignee, tags). Default: created_at
  * @param data.sort Direction to sort (asc or desc)
  * @param data.includeRows Include linked table rows
  * @param data.fieldIds Include only the requested custom field IDs
  * @param data.includeDurations Include case duration values
  * @param data.includePayload Include case payload
+ * @param data.payloadFields Return only these literal top-level payload keys, automatically including the subset regardless of include_payload. Dots are literal; nested values are returned whole. Missing keys are omitted and null values preserved. An empty list acts as omitted; an empty string selects the literal empty key.
+ * @param data.includeCount Include the exact filtered total_estimate for compatibility. Set false when fetching aggregate counts separately; total_estimate will be null.
  * @param data.hierarchy Return every case, or only top-level cases without a parent.
+ * @param data.payloadPaths JSON-encoded array of up to 100 object paths, e.g. [["alert","source","ip"]]. Each path contains 1 to 32 literal keys. Preserves nesting, combines with payload_fields, and includes the subset automatically. Selected parents include their whole value. Missing paths are omitted; nulls are preserved. Arrays can be selected whole, without index traversal. An empty list acts as omitted.
  * @returns CursorPaginatedResponse_CaseReadMinimal_ Successful Response
  * @throws ApiError
  */
@@ -12005,7 +12167,10 @@ export const casesListCases = (
       field_ids: data.fieldIds,
       include_durations: data.includeDurations,
       include_payload: data.includePayload,
+      payload_fields: data.payloadFields,
+      include_count: data.includeCount,
       hierarchy: data.hierarchy,
+      payload_paths: data.payloadPaths,
     },
     errors: {
       422: "Validation Error",
@@ -12040,6 +12205,55 @@ export const casesCreateCase = (
 }
 
 /**
+ * List Case Filter Fields
+ * List filterable workspace fields with authoritative operators and limits.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @returns CaseFilterMetadata Successful Response
+ * @throws ApiError
+ */
+export const casesListCaseFilterFields = (
+  data: CasesListCaseFilterFieldsData
+): CancelablePromise<CasesListCaseFilterFieldsResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/cases/search/fields",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Query Cases
+ * Search with typed AND/OR/NOT filters and independent result details.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns CursorPaginatedResponse_CaseReadMinimal_ Successful Response
+ * @throws ApiError
+ */
+export const casesQueryCases = (
+  data: CasesQueryCasesData
+): CancelablePromise<CasesQueryCasesResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/search",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Search Cases
  * Search cases with cursor-based pagination, filtering, and sorting.
  * @param data The data for the request.
@@ -12048,6 +12262,8 @@ export const casesCreateCase = (
  * @param data.cursor Cursor for pagination
  * @param data.reverse Reverse pagination direction
  * @param data.searchTerm Text to search for in case summary, description, short ID, or case UUID
+ * @param data.searchMode Explicit full_text or literal; omitted mode preserves legacy search.
+ * @param data.searchColumns Selected text fields; omitted searches both.
  * @param data.shortId Search by exact case short ID (e.g. 42 or CASE-0042)
  * @param data.caseId Filter by exact case UUID
  * @param data.promoteExactMatch Place a complete case reference first, even outside view filters. Workspace authorization and explicit identity/relationship constraints remain strict. Filtered counts exclude cases outside the view.
@@ -12062,14 +12278,17 @@ export const casesCreateCase = (
  * @param data.updatedAfter Return cases updated at or after this timestamp
  * @param data.updatedBefore Return cases updated at or before this timestamp
  * @param data.assigneeId Filter by assignee ID or 'unassigned'
- * @param data.orderBy Column name to order by (e.g. created_at, updated_at, priority, severity, status, tasks). Default: created_at
+ * @param data.orderBy Full-text defaults to relevance; legacy/literal defaults to created_at. Explicit columns preserve their ordering.
  * @param data.sort Direction to sort (asc or desc)
  * @param data.includeRows Include linked table rows
  * @param data.fieldIds Include only the requested custom field IDs
  * @param data.includeDurations Include case duration values
  * @param data.includePayload Include case payload
+ * @param data.payloadFields Return only these literal top-level payload keys, automatically including the subset regardless of include_payload. Dots are literal; nested values are returned whole. Missing keys are omitted and null values preserved. An empty list acts as omitted; an empty string selects the literal empty key.
+ * @param data.includeCount Include the exact filtered total_estimate for compatibility. Set false on all pages when fetching aggregate counts separately; total_estimate will be null.
  * @param data.hierarchy Return every case, or only top-level cases without a parent.
  * @param data.parentId Return only the sub-cases of this parent case
+ * @param data.payloadPaths JSON-encoded array of up to 100 object paths, e.g. [["alert","source","ip"]]. Each path contains 1 to 32 literal keys. Preserves nesting, combines with payload_fields, and includes the subset automatically. Selected parents include their whole value. Missing paths are omitted; nulls are preserved. Arrays can be selected whole, without index traversal. An empty list acts as omitted.
  * @returns CursorPaginatedResponse_CaseReadMinimal_ Successful Response
  * @throws ApiError
  */
@@ -12087,6 +12306,8 @@ export const casesSearchCases = (
       cursor: data.cursor,
       reverse: data.reverse,
       search_term: data.searchTerm,
+      search_mode: data.searchMode,
+      search_columns: data.searchColumns,
       short_id: data.shortId,
       case_id: data.caseId,
       promote_exact_match: data.promoteExactMatch,
@@ -12107,9 +12328,38 @@ export const casesSearchCases = (
       field_ids: data.fieldIds,
       include_durations: data.includeDurations,
       include_payload: data.includePayload,
+      payload_fields: data.payloadFields,
+      include_count: data.includeCount,
       hierarchy: data.hierarchy,
       parent_id: data.parentId,
+      payload_paths: data.payloadPaths,
     },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Query Case Aggregates
+ * Count the same typed matching conditions as search.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns CaseSearchAggregateRead Successful Response
+ * @throws ApiError
+ */
+export const casesQueryCaseAggregates = (
+  data: CasesQueryCaseAggregatesData
+): CancelablePromise<CasesQueryCaseAggregatesResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/search/aggregate",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
     errors: {
       422: "Validation Error",
     },
@@ -12122,6 +12372,10 @@ export const casesSearchCases = (
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.searchTerm Text to search for in case summary, description, short ID, or case UUID
+ * @param data.searchMode Explicit full_text or literal; omitted mode preserves legacy search.
+ * @param data.searchColumns Selected text fields; omitted searches both.
+ * @param data.shortId
+ * @param data.caseId
  * @param data.status Filter by case status
  * @param data.priority Filter by case priority
  * @param data.severity Filter by case severity
@@ -12148,6 +12402,10 @@ export const casesSearchCaseAggregates = (
     },
     query: {
       search_term: data.searchTerm,
+      search_mode: data.searchMode,
+      search_columns: data.searchColumns,
+      short_id: data.shortId,
+      case_id: data.caseId,
       status: data.status,
       priority: data.priority,
       severity: data.severity,

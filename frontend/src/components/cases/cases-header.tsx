@@ -27,6 +27,7 @@ import type {
   CaseDurationDefinitionRead,
   CaseFieldReadMinimal,
   CasePriority,
+  CaseQuery,
   CaseSeverity,
   CaseStatus,
   CasesSearchCasesData,
@@ -39,6 +40,7 @@ import {
   STATUSES,
 } from "@/components/cases/case-categories"
 import { CaseColumnPicker } from "@/components/cases/case-column-picker"
+import { CaseFilterEditor } from "@/components/cases/case-filter-editor"
 import { UNASSIGNED } from "@/components/cases/case-panel-selectors"
 import {
   type CaseSortField,
@@ -53,6 +55,7 @@ import {
   type SortDirection,
 } from "@/components/filters/filter-multi-select"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { Button } from "@/components/ui/button"
 import { Calendar } from "@/components/ui/calendar"
 import { Input } from "@/components/ui/input"
 import {
@@ -111,21 +114,6 @@ function isDateFilterActive(filter: CaseDateFilterValue): boolean {
     return filter.value !== null
   }
   return filter.value.from !== undefined
-}
-
-function getDateScopeLabel(filter: CaseDateFilterValue, label: string): string {
-  if (filter.type === "preset") {
-    if (!filter.value) return `${label}: any time`
-    const days = { "1d": 1, "3d": 3, "1w": 7, "1m": 30 }[filter.value]
-    return `${label} in last ${days} ${days === 1 ? "day" : "days"}`
-  }
-  const { from, to } = filter.value
-  if (from && to) {
-    return `${label} from ${format(from, "MMM d, yyyy")} to ${format(to, "MMM d, yyyy")}`
-  }
-  if (from) return `${label} from ${format(from, "MMM d, yyyy")}`
-  if (to) return `${label} through ${format(to, "MMM d, yyyy")}`
-  return `${label}: any time`
 }
 
 interface DateFilterSelectProps {
@@ -288,6 +276,7 @@ const CASE_SORT_OPTIONS: Array<{
   value: CaseSortField
   label: string
   icon: ComponentType<{ className?: string }>
+  description?: string
 }> = [
   { value: "updated_at", label: "Updated", icon: ClockIcon },
   { value: "created_at", label: "Created", icon: CalendarIcon },
@@ -295,6 +284,18 @@ const CASE_SORT_OPTIONS: Array<{
   { value: "severity", label: "Severity", icon: ShieldAlertIcon },
   { value: "status", label: "Status", icon: SignalIcon },
   { value: "tasks", label: "Tasks", icon: ListIcon },
+  {
+    value: "assignee",
+    label: "Assignee",
+    icon: UserIcon,
+    description: "By email; unassigned cases last.",
+  },
+  {
+    value: "tags",
+    label: "Tags",
+    icon: TagIcon,
+    description: "First alphabetical tag; untagged cases last.",
+  },
 ]
 
 function isDefaultCaseSort(value: CaseSortValue): boolean {
@@ -306,13 +307,23 @@ function isDefaultCaseSort(value: CaseSortValue): boolean {
 
 interface CaseSortSelectProps {
   value: CaseSortValue
+  allowRelevance?: boolean
   onChange: (value: CaseSortValue) => void
 }
 
-function CaseSortSelect({ value, onChange }: CaseSortSelectProps) {
+function CaseSortSelect({
+  value,
+  onChange,
+  allowRelevance,
+}: CaseSortSelectProps) {
+  const options: typeof CASE_SORT_OPTIONS = allowRelevance
+    ? [
+        { value: "relevance" as const, label: "Relevance", icon: SearchIcon },
+        ...CASE_SORT_OPTIONS,
+      ]
+    : CASE_SORT_OPTIONS
   const selectedLabel =
-    CASE_SORT_OPTIONS.find((option) => option.value === value.field)?.label ??
-    "Updated"
+    options.find((option) => option.value === value.field)?.label ?? "Updated"
 
   return (
     <div className="inline-flex items-center rounded-md border border-input bg-transparent">
@@ -321,22 +332,36 @@ function CaseSortSelect({ value, onChange }: CaseSortSelectProps) {
         onValueChange={(nextField) =>
           onChange({
             field: nextField as CaseSortField,
-            direction: value.direction,
+            direction: nextField === "relevance" ? "desc" : value.direction,
           })
         }
       >
-        <SelectTrigger className="h-6 w-[140px] rounded-r-none border-0 bg-transparent px-2 text-xs font-medium shadow-none focus:ring-0">
+        <SelectTrigger
+          aria-label="Case sort field"
+          className="h-6 w-[140px] rounded-r-none border-0 bg-transparent px-2 text-xs font-medium shadow-none focus:ring-1 focus:ring-inset focus:ring-ring"
+        >
           <span className="text-muted-foreground">Sort by</span>
           <span className="text-foreground">{selectedLabel}</span>
         </SelectTrigger>
         <SelectContent align="start">
-          {CASE_SORT_OPTIONS.map((option) => {
+          {options.map((option) => {
             const Icon = option.icon
             return (
-              <SelectItem key={option.value} value={option.value}>
-                <span className="flex items-center gap-2">
-                  <Icon className="size-3.5 text-muted-foreground" />
-                  <span>{option.label}</span>
+              <SelectItem
+                key={option.value}
+                value={option.value}
+                textValue={option.label}
+              >
+                <span className="flex flex-col gap-1">
+                  <span className="flex items-center gap-2">
+                    <Icon className="size-3.5 text-muted-foreground" />
+                    <span>{option.label}</span>
+                  </span>
+                  {option.description && (
+                    <span className="max-w-[220px] text-[11px] text-muted-foreground">
+                      {option.description}
+                    </span>
+                  )}
                 </span>
               </SelectItem>
             )
@@ -345,6 +370,7 @@ function CaseSortSelect({ value, onChange }: CaseSortSelectProps) {
       </Select>
       <button
         type="button"
+        disabled={value.field === "relevance"}
         className="flex h-6 w-7 items-center justify-center border-l border-input text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
         onClick={() =>
           onChange({
@@ -367,7 +393,10 @@ function CaseSortSelect({ value, onChange }: CaseSortSelectProps) {
 }
 
 interface CasesHeaderProps {
+  structuredFilters?: CaseQuery["filters"]
   searchQuery: string
+  searchMode?: "full_text" | "literal"
+  onSearchModeChange?: (mode: "full_text" | "literal") => void
   appliedSearchQuery: string
   effectiveHierarchy: NonNullable<CasesSearchCasesData["hierarchy"]>
   isSearchPending: boolean
@@ -416,12 +445,14 @@ interface CasesHeaderProps {
   visibleColumnIds?: string[]
   onToggleColumn?: (columnId: string) => void
   dropdownFilters: Record<string, DropdownFilterState>
+  onStructuredFiltersChange?: (filters: CaseQuery["filters"]) => void
   onDropdownFilterChange: (ref: string, values: string[]) => void
   onDropdownModeChange: (ref: string, mode: FilterMode) => void
   onDropdownSortDirectionChange: (ref: string, direction: SortDirection) => void
   // Selection props
   totalCaseCount?: number
   displayCaseCount?: number | null
+  isCountsError?: boolean
   selectedCount?: number
   onSelectAll?: () => void
   onDeselectAll?: () => void
@@ -429,7 +460,10 @@ interface CasesHeaderProps {
 
 /** Case search, visible scope, and the current view's filter controls. */
 export function CasesHeader({
+  structuredFilters,
   searchQuery,
+  searchMode = "full_text",
+  onSearchModeChange,
   appliedSearchQuery,
   effectiveHierarchy,
   isSearchPending,
@@ -478,11 +512,13 @@ export function CasesHeader({
   visibleColumnIds,
   onToggleColumn,
   dropdownFilters,
+  onStructuredFiltersChange,
   onDropdownFilterChange,
   onDropdownModeChange,
   onDropdownSortDirectionChange,
   totalCaseCount = 0,
   displayCaseCount = null,
+  isCountsError = false,
   selectedCount = 0,
   onSelectAll,
   onDeselectAll,
@@ -567,19 +603,11 @@ export function CasesHeader({
     createdAfter.type === "preset" &&
     createdAfter.value === DEFAULT_CREATED_PRESET
 
+  const countNoun = displayCaseCount === 1 ? "case" : "cases"
   const includesSubCases = effectiveHierarchy === "all"
-  const hierarchyLabel = includesSubCases
-    ? "Includes sub-cases"
-    : "Top-level cases only"
-  const createdLabel = getDateScopeLabel(createdAfter, "Created")
-  const updatedLabel = getDateScopeLabel(updatedAfter, "Updated")
-  const scopeDescription = [
-    createdLabel,
-    updatedLabel,
-    ...(onIncludeSubCasesChange ? [hierarchyLabel] : []),
-  ].join(" · ")
 
   const hasFilters =
+    Boolean(structuredFilters) ||
     searchQuery.trim().length > 0 ||
     !isDefaultCaseSort(sortBy) ||
     statusFilter.length > 0 ||
@@ -593,8 +621,9 @@ export function CasesHeader({
     (includeSubCases && onIncludeSubCasesChange !== undefined)
 
   const handleReset = () => {
+    onStructuredFiltersChange?.(null)
     onSearchChange("")
-    onSortByChange(DEFAULT_CASE_SORT)
+    onSearchModeChange?.("full_text")
     onStatusChange([])
     onStatusModeChange("include")
     onPriorityChange([])
@@ -610,9 +639,10 @@ export function CasesHeader({
     onTagModeChange("include")
     onTagSortDirectionChange?.(null)
     // Reset dropdown filters
-    const refs = dropdownDefinitions
-      ? dropdownDefinitions.map((d) => d.ref)
-      : Object.keys(dropdownFilters)
+    const refs = new Set([
+      ...(dropdownDefinitions?.map((d) => d.ref) ?? []),
+      ...Object.keys(dropdownFilters),
+    ])
     for (const ref of refs) {
       onDropdownFilterChange(ref, [])
       onDropdownModeChange(ref, "include")
@@ -624,6 +654,11 @@ export function CasesHeader({
       value: DEFAULT_CREATED_PRESET,
     })
     onIncludeSubCasesChange?.(false)
+    onSortByChange(
+      onSearchModeChange
+        ? { field: "relevance", direction: "desc" }
+        : DEFAULT_CASE_SORT
+    )
   }
 
   return (
@@ -638,7 +673,11 @@ export function CasesHeader({
             type="text"
             aria-label="Search cases"
             aria-describedby="case-search-scope"
-            placeholder="Search by summary or ID..."
+            placeholder={
+              searchMode === "literal"
+                ? "Search exact characters..."
+                : 'Search words, "phrases", or ID...'
+            }
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
             className={cn(
@@ -649,6 +688,20 @@ export function CasesHeader({
               "focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
             )}
           />
+          {onSearchModeChange && (
+            <Select value={searchMode} onValueChange={onSearchModeChange}>
+              <SelectTrigger
+                aria-label="Case search mode"
+                className="h-7 w-[100px] shrink-0 px-2 text-xs shadow-none"
+              >
+                <span>{searchMode === "full_text" ? "Words" : "Literal"}</span>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="full_text">Words and phrases</SelectItem>
+                <SelectItem value="literal">Literal characters</SelectItem>
+              </SelectContent>
+            </Select>
+          )}
         </div>
 
         <div className="ml-auto flex items-center gap-2">
@@ -661,22 +714,22 @@ export function CasesHeader({
               onToggle={onToggleColumn}
             />
           )}
-          {(displayCaseCount ?? totalCaseCount) > 0 && (
+          {(displayCaseCount === null || displayCaseCount > 0) && (
             <span className="text-xs text-muted-foreground">
               {displayCaseCount ?? totalCaseCount}{" "}
-              {(displayCaseCount ?? totalCaseCount) === 1 ? "case" : "cases"}
+              {displayCaseCount === null ? "loaded" : countNoun}
             </span>
           )}
         </div>
       </header>
 
-      <p
-        id="case-search-scope"
-        role="status"
-        className="px-4 pt-2 text-xs text-muted-foreground"
-      >
-        {scopeDescription}
-        {isSearchPending && <span> · Updating search…</span>}
+      <p id="case-search-scope" role="status" className="sr-only">
+        {[
+          isSearchPending && "Updating search…",
+          isCountsError && "Case count unavailable",
+        ]
+          .filter(Boolean)
+          .join(" · ")}
       </p>
 
       {/* Row 2: Filter dropdowns */}
@@ -760,6 +813,7 @@ export function CasesHeader({
             allowExclude={false}
             showSort
             sortDirection={assigneeSortDirection}
+            sortDescription="By assignee email, ignoring case. Unassigned cases appear last."
             onSortDirectionChange={onAssigneeSortDirectionChange}
             emptyMessage={
               members && members.length > 0
@@ -779,6 +833,7 @@ export function CasesHeader({
             allowExclude={false}
             showSort
             sortDirection={tagSortDirection}
+            sortDescription="By the first tag alphabetically, ignoring case. Untagged cases appear last."
             onSortDirectionChange={onTagSortDirectionChange}
             emptyMessage={
               tags && tags.length > 0 ? "No matching tags." : "No tags found."
@@ -855,6 +910,37 @@ export function CasesHeader({
             )
           })}
 
+          {dropdownDefinitions &&
+            Object.entries(dropdownFilters)
+              .filter(
+                ([ref, state]) =>
+                  state.values.length > 0 &&
+                  !dropdownDefinitions.some(
+                    (definition) => definition.ref === ref
+                  )
+              )
+              .map(([ref, state]) => (
+                <Button
+                  key={ref}
+                  variant="outline"
+                  size="sm"
+                  className="h-6 text-xs"
+                  onClick={() => onDropdownFilterChange(ref, [])}
+                >
+                  Unavailable dropdown {ref}: {state.values.join(", ")} ×
+                </Button>
+              ))}
+
+          {onStructuredFiltersChange && (
+            <CaseFilterEditor
+              value={structuredFilters ?? null}
+              onChange={onStructuredFiltersChange}
+              members={members}
+              tags={tags}
+              dropdowns={dropdownDefinitions}
+            />
+          )}
+
           <DateFilterSelect
             placeholder="Updated"
             icon={ClockIcon}
@@ -877,21 +963,24 @@ export function CasesHeader({
               disabled={Boolean(appliedSearchQuery)}
               onClick={() => onIncludeSubCasesChange(!includeSubCases)}
               className={cn(
-                "flex h-6 items-center gap-1.5 rounded-md border border-dashed px-2 text-xs transition-colors",
-                includesSubCases
-                  ? "border-solid bg-muted text-foreground"
-                  : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                "flex h-6 items-center gap-1.5 rounded-md border border-input bg-transparent px-2 text-xs font-medium transition-colors",
+                "hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50",
+                includesSubCases && "border-primary/50 bg-primary/5"
               )}
             >
-              <ListTreeIcon className="size-3.5" />
-              {includesSubCases
-                ? "Including sub-cases"
-                : "Top-level cases only"}
+              <ListTreeIcon className="size-3.5 text-muted-foreground" />
+              {includesSubCases ? "All cases" : "Parents only"}
             </button>
           )}
         </fieldset>
 
-        <CaseSortSelect value={sortBy} onChange={onSortByChange} />
+        <CaseSortSelect
+          value={sortBy}
+          onChange={onSortByChange}
+          allowRelevance={
+            searchMode === "full_text" && Boolean(appliedSearchQuery)
+          }
+        />
 
         {hasFilters && (
           <button

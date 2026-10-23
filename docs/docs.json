@@ -121,6 +121,7 @@
             "icon": "circle-check-big",
             "pages": [
               "automations/cases/linked-rows",
+              "automations/cases/sub-cases",
               "automations/cases/tasks",
               "automations/cases/agent-mentions",
               "automations/cases/correlations",
@@ -301,6 +302,8 @@
               "tools/phishlabs",
               "tools/pipe0",
               "tools/project_discovery",
+              "tools/proofpoint_tap",
+              "tools/proofpoint_threat_protection",
               "tools/pymongo",
               "tools/rapid7",
               "tools/recorded_future",

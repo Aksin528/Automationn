@@ -87,6 +87,14 @@ own embedded collection truncation behavior below.
   `get_workflow_execution` to confirm the run closed as `CANCELED`. Cancelling
   a run that already finished does nothing.
 
+## Workspace settings tools
+
+- `update_workspace_attachment_types(workspace_id, allowed_extensions=None, allowed_mime_types=None)`
+
+Each list replaces the workspace allowlist for case attachments, and an empty
+list restores the system defaults. Call it with no lists to read the current
+and effective values. Writes need the `workspace:update` scope.
+
 ## Action discovery and authoring context
 
 - `list_actions(workspace_id, query=None, namespace=None, limit=50, cursor=None)`
@@ -129,6 +137,19 @@ stored config whole. Submissions are not exposed over MCP.
 - `list_tags_for_workflow(workspace_id, workflow_id, limit=20, cursor=None)`
 - `add_workflow_tag(workspace_id, workflow_id, tag_id)`
 - `remove_workflow_tag(workspace_id, workflow_id, tag_id)`
+
+## Sub-case tools
+
+- `search_cases(..., parent_id=None, hierarchy="all")` lists a parent's sub-cases with `parent_id`, or only top-level cases with `hierarchy="top_level"`
+- `create_case(..., parent_id=None)` creates the case as a sub-case of a top-level case
+- `set_case_parent(workspace_id, case_ids, parent_id)` groups cases under a top-level parent case
+- `clear_case_parent(workspace_id, case_ids)` returns sub-cases to the top level
+
+Notes:
+
+- Sub-case tools and the `parent_id` arguments require the case add-ons entitlement.
+- `get_case`, `list_cases`, and `search_cases` return `parent` and `num_sub_cases` on every case.
+- Sub-cases are one level deep. Closing a parent case does not change its sub-cases.
 
 ## Case tag tools
 
@@ -228,8 +249,8 @@ Notes:
 - `prepare_skill_upload(workspace_id, files, skill_id=None, name=None, description=None)`
 - `complete_skill_upload(workspace_id, skill_id, base_revision, files)`
 - `publish_skill(workspace_id, skill_id)`
-- `create_agent_preset(workspace_id, name, slug=None, description=None, instructions=None, model_name=None, model_provider=None, base_url=None, output_type=None, actions=None, namespaces=None, tool_approvals=None, mcp_integration_ids=None, retries=None, enable_thinking=None, enable_internet_access=None, skills=None, subagents=None)`
-- `update_agent_preset(workspace_id, preset_slug, name=None, slug=None, description=None, instructions=None, model_name=None, model_provider=None, base_url=None, output_type=None, clear_output_type=False, actions=None, namespaces=None, tool_approvals=None, mcp_integration_ids=None, retries=None, enable_thinking=None, enable_internet_access=None, skills=None, subagents=None)`
+- `create_agent_preset(workspace_id, name, slug=None, description=None, instructions=None, model_name=None, model_provider=None, base_url=None, output_type=None, actions=None, namespaces=None, tool_approvals=None, tool_tunnels=None, mcp_integration_ids=None, retries=None, enable_thinking=None, enable_internet_access=None, skills=None, subagents=None)`
+- `update_agent_preset(workspace_id, preset_slug, name=None, slug=None, description=None, instructions=None, model_name=None, model_provider=None, base_url=None, output_type=None, clear_output_type=False, actions=None, namespaces=None, tool_approvals=None, tool_tunnels=None, mcp_integration_ids=None, retries=None, enable_thinking=None, enable_internet_access=None, skills=None, subagents=None)`
 - `list_agent_presets(workspace_id, limit=20, cursor=None)`
 - `get_agent_preset(workspace_id, preset_slug)`
 - `run_agent_preset(workspace_id, preset_slug, prompt, preset_version=None, timeout_seconds=120)`

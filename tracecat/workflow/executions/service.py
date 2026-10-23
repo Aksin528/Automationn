@@ -491,8 +491,10 @@ class WorkflowExecutionsService:
         duration_gte_seconds: int | None = None,
         duration_lte_seconds: int | None = None,
         relation: WorkflowExecutionRelationFilter = WorkflowExecutionRelationFilter.ALL,
+        correlation_id: str | None = None,
     ) -> WorkflowExecutionsPage:
         query = build_query(
+            correlation_id=correlation_id,
             workflow_id=workflow_id,
             trigger_types=trigger_types,
             triggered_by_user_id=triggered_by_user_id,
@@ -729,16 +731,25 @@ class WorkflowExecutionsService:
                     action_ref=WF_TRIGGER_REF,
                     action_input=action_input,
                 )
-            # ── synthetic compact event for top-level workflow failure ──
-            elif event.event_type is EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED:
+            # ── synthetic compact event for top-level workflow failure or termination ──
+            elif event.event_type in (
+                EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED,
+                EventType.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED,
+            ):
                 failure = await EventFailure.from_history_event(event)
+                status = (
+                    WorkflowExecutionEventStatus.TERMINATED
+                    if event.event_type
+                    == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED
+                    else WorkflowExecutionEventStatus.FAILED
+                )
                 id2event[event.event_id] = WorkflowExecutionEventCompact(
                     source_event_id=event.event_id,
                     schedule_time=event.event_time.ToDatetime(datetime.UTC),
                     start_time=event.event_time.ToDatetime(datetime.UTC),
                     close_time=event.event_time.ToDatetime(datetime.UTC),
                     curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
-                    status=WorkflowExecutionEventStatus.FAILED,
+                    status=status,
                     action_name=WF_FAILURE_REF,
                     action_ref=WF_FAILURE_REF,
                     action_error=failure,
@@ -1337,23 +1348,17 @@ class WorkflowExecutionsService:
                             result=result,
                         )
                     )
-                case EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED:
+                case (
+                    EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED
+                    | EventType.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED
+                ):
                     events.append(
                         WorkflowExecutionEvent(
                             event_id=event.event_id,
                             event_time=event.event_time.ToDatetime(datetime.UTC),
-                            event_type=WorkflowEventType.WORKFLOW_EXECUTION_FAILED,
+                            event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
                             task_id=event.task_id,
                             failure=await EventFailure.from_history_event(event),
-                        )
-                    )
-                case EventType.EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED:
-                    events.append(
-                        WorkflowExecutionEvent(
-                            event_id=event.event_id,
-                            event_time=event.event_time.ToDatetime(datetime.UTC),
-                            event_type=WorkflowEventType.WORKFLOW_EXECUTION_TERMINATED,
-                            task_id=event.task_id,
                         )
                     )
                 case EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED:
@@ -1510,6 +1515,7 @@ class WorkflowExecutionsService:
         time_anchor: datetime.datetime | None = None,
         registry_lock: RegistryLock | None = None,
         memo: dict[str, Any] | None = None,
+        correlation_id: str | None = None,
     ) -> WorkflowExecutionCreateResponse:
         """Create a new workflow execution.
 
@@ -1518,6 +1524,7 @@ class WorkflowExecutionsService:
         Args:
             memo: Optional memo dict to store with the workflow execution.
                   Useful for correlation (e.g., parent_wf_exec_id).
+            correlation_id: Optional `TracecatCorrelationId` search attribute value.
         """
         wf_exec_id = generate_exec_id(wf_id)
         coro = self._start_workflow(
@@ -1530,6 +1537,7 @@ class WorkflowExecutionsService:
             memo=memo,
             trigger_inputs=payload,
             execution_type=ExecutionType.PUBLISHED,
+            correlation_id=correlation_id,
         )
         task = asyncio.ensure_future(coro)
         task.add_done_callback(self._handle_background_task_exception)
@@ -1552,6 +1560,7 @@ class WorkflowExecutionsService:
         registry_lock: RegistryLock | None = None,
         memo: dict[str, Any] | None = None,
         fixed_action_results: dict[str, FixedActionResult] | None = None,
+        correlation_id: str | None = None,
     ) -> WorkflowExecutionCreateResponse:
         """Create a workflow execution and wait until Temporal acknowledges start."""
         if wf_exec_id is None:
@@ -1568,6 +1577,7 @@ class WorkflowExecutionsService:
             registry_lock=registry_lock,
             memo=memo,
             fixed_action_results=fixed_action_results,
+            correlation_id=correlation_id,
         )
 
         return WorkflowExecutionCreateResponse(
@@ -1910,6 +1920,7 @@ class WorkflowExecutionsService:
         time_anchor: datetime.datetime | None = None,
         registry_lock: RegistryLock | None = None,
         fixed_action_results: dict[str, FixedActionResult] | None = None,
+        correlation_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         if self.role is None:
@@ -1989,6 +2000,8 @@ class WorkflowExecutionsService:
                     )
                 )
         pairs.append(execution_type.to_temporal_search_attr_pair())
+        if correlation_id is not None:
+            pairs.append(TemporalSearchAttr.CORRELATION_ID.create_pair(correlation_id))
         search_attrs = TypedSearchAttributes(search_attributes=pairs)
 
         try:

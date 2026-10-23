@@ -73,11 +73,15 @@ import {
 } from "@/components/agents/agent-preset-rail-tools"
 import { AgentPresetVersionSelect } from "@/components/agents/agent-preset-version-select"
 import { SlackChannelPanel } from "@/components/agents/external-channels/slack-channel-panel"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import {
   ChatHistoryDropdown,
   type ChatHistoryScope,
 } from "@/components/chat/chat-history-dropdown"
-import { ChatSessionPane } from "@/components/chat/chat-session-pane"
+import {
+  AGENT_EXECUTE_REQUIRED_MESSAGE,
+  ChatSessionPane,
+} from "@/components/chat/chat-session-pane"
 import { CodeEditor } from "@/components/editor/codemirror/code-editor"
 import { getModelProviderIconId, ProviderIcon } from "@/components/icons"
 import { CenteredSpinner } from "@/components/loading/spinner"
@@ -261,6 +265,7 @@ export const agentPresetSchema = z
         })
       )
       .default([]),
+    toolTunnels: z.record(z.string(), z.string()).default({}),
     retries: z.coerce
       .number({ invalid_type_error: "Retries must be a number" })
       .int()
@@ -411,6 +416,7 @@ const DEFAULT_FORM_VALUES: AgentPresetFormValues = {
   skills: [],
   librarySkills: [],
   toolApprovals: [],
+  toolTunnels: {},
   retries: DEFAULT_RETRIES,
   enableThinking: true,
   enableInternetAccess: false,
@@ -430,7 +436,7 @@ export function AgentPresetsBuilder({ presetId }: { presetId?: string }) {
   const { registryActions, registryActionsError } = useRegistryActions({
     staleTime: 5 * 60 * 1000,
   })
-  const { models, providers } = useWorkspaceAgentModels(workspaceId)
+  const { models } = useWorkspaceAgentModels(workspaceId)
   const enabledModelsLoaded = models !== undefined
 
   const { mcpIntegrations, mcpIntegrationsError } =
@@ -481,8 +487,8 @@ export function AgentPresetsBuilder({ presetId }: { presetId?: string }) {
   } = useAgentPreset(workspaceId, activePresetId)
 
   const enabledModelOptions = useMemo(
-    () => buildEnabledModelOptions(models, providers),
-    [models, providers]
+    () => buildEnabledModelOptions(models),
+    [models]
   )
 
   if (presetsIsLoading) {
@@ -574,7 +580,7 @@ export function AgentPresetArtifactView({
   const { registryActions, registryActionsError } = useRegistryActions({
     staleTime: 5 * 60 * 1000,
   })
-  const { models, providers } = useWorkspaceAgentModels(workspaceId)
+  const { models } = useWorkspaceAgentModels(workspaceId)
   const enabledModelsLoaded = models !== undefined
   const { mcpIntegrations, mcpIntegrationsError } =
     useListMcpIntegrations(workspaceId)
@@ -582,8 +588,8 @@ export function AgentPresetArtifactView({
     useUpdateAgentPreset(workspaceId)
 
   const enabledModelOptions = useMemo(
-    () => buildEnabledModelOptions(models, providers),
-    [models, providers]
+    () => buildEnabledModelOptions(models),
+    [models]
   )
 
   return (
@@ -617,6 +623,16 @@ export function AgentPresetArtifactView({
   )
 }
 
+/** Shown in place of a chat when the user's role lacks `agent:execute`. */
+function AgentExecuteRequiredNotice() {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 px-4 text-center text-xs text-muted-foreground">
+      <AlertCircle className="size-5 text-amber-500" />
+      <p className="max-w-xs text-pretty">{AGENT_EXECUTE_REQUIRED_MESSAGE}</p>
+    </div>
+  )
+}
+
 function AgentPresetChatPane({
   preset,
   workspaceId,
@@ -635,6 +651,8 @@ function AgentPresetChatPane({
   trailing: ReactNode
 }) {
   const { user } = useAuth()
+  // `undefined` while scopes load: creation waits, nothing is disabled.
+  const canExecuteAgents = useScopeCheck("agent:execute")
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
   const [historyScope, setHistoryScope] = useState<ChatHistoryScope>("team")
 
@@ -715,7 +733,8 @@ function AgentPresetChatPane({
   }, [effectiveModelConfig, selectedModel])
 
   const canStartChat = Boolean(
-    preset &&
+    canExecuteAgents === true &&
+      preset &&
       effectiveModelConfig &&
       (!enabledModelsLoaded || selectedModel !== null || hasLegacyModelConfig)
   )
@@ -723,7 +742,7 @@ function AgentPresetChatPane({
     canStartChat && !activeChatId && !chatsLoading && !createChatPending
 
   const handleCreateChat = async () => {
-    if (!preset || createChatPending) {
+    if (!preset || createChatPending || canExecuteAgents !== true) {
       return
     }
 
@@ -744,7 +763,8 @@ function AgentPresetChatPane({
   }
 
   const handlePresetVersionChange = async (nextVersionId: string | null) => {
-    if (!activeChatId || chat?.is_readonly) return
+    // Changing the pinned version updates the session, which needs agent:execute.
+    if (!activeChatId || chat?.is_readonly || canExecuteAgents !== true) return
     try {
       await updateChat({
         chatId: activeChatId,
@@ -780,6 +800,15 @@ function AgentPresetChatPane({
           </Empty>
         </div>
       )
+    }
+
+    if (
+      canExecuteAgents === false &&
+      !activeChatId &&
+      !chatsLoading &&
+      !chatsError
+    ) {
+      return <AgentExecuteRequiredNotice />
     }
 
     if (selectedVersionConfigIsLoading) {
@@ -871,53 +900,60 @@ function AgentPresetChatPane({
 
   return (
     <div className="flex h-full flex-col bg-background">
-      <div className="flex h-12 shrink-0 items-center gap-1 border-b border-border/60 px-5">
+      <div className="@container/agent-preset-bar flex min-h-12 shrink-0 flex-wrap items-center gap-1 border-b border-border/60 px-5 py-1.5">
         {leading}
-        <span className="flex-1" />
-        {preset ? (
-          <AgentPresetVersionSelect
-            versions={versions}
-            versionsIsLoading={versionsIsLoading}
-            versionsError={versionsError}
-            selectedVersionId={selectedVersionId}
-            currentVersionId={preset.current_version_id ?? null}
-            onSelect={handlePresetVersionChange}
-            disabled={!activeChatId || !chat || chat.is_readonly || isUpdating}
-            triggerClassName="h-7 w-[10.5rem] text-xs shadow-none"
-          />
-        ) : null}
-        {preset ? (
-          <>
-            <ChatHistoryDropdown
-              chats={chats}
-              isLoading={chatsLoading}
-              error={chatsError}
-              selectedChatId={activeChatId ?? undefined}
-              onSelectChat={(chatId) => setSelectedChatId(chatId)}
-              workspaceId={workspaceId}
-              scope={historyScope}
-              onScopeChange={handleHistoryScopeChange}
-              align="end"
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+          {preset ? (
+            <AgentPresetVersionSelect
+              versions={versions}
+              versionsIsLoading={versionsIsLoading}
+              versionsError={versionsError}
+              selectedVersionId={selectedVersionId}
+              currentVersionId={preset.current_version_id ?? null}
+              onSelect={handlePresetVersionChange}
+              disabled={
+                !activeChatId ||
+                !chat ||
+                chat.is_readonly ||
+                isUpdating ||
+                canExecuteAgents !== true
+              }
+              triggerClassName="h-7 w-[10.5rem] text-xs shadow-none"
             />
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              className="text-xs"
-              disabled={createChatPending || !canStartChat}
-              onClick={() => void handleCreateChat()}
-            >
-              {createChatPending ? (
-                <Loader2 className="mr-2 size-4 animate-spin" />
-              ) : (
-                <Plus className="mr-2 size-4" />
-              )}
-              New chat
-            </Button>
-            <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
-          </>
-        ) : null}
-        {trailing}
+          ) : null}
+          {preset ? (
+            <>
+              <ChatHistoryDropdown
+                chats={chats}
+                isLoading={chatsLoading}
+                error={chatsError}
+                selectedChatId={activeChatId ?? undefined}
+                onSelectChat={(chatId) => setSelectedChatId(chatId)}
+                workspaceId={workspaceId}
+                scope={historyScope}
+                onScopeChange={handleHistoryScopeChange}
+                align="end"
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="text-xs"
+                disabled={createChatPending || !canStartChat}
+                onClick={() => void handleCreateChat()}
+              >
+                {createChatPending ? (
+                  <Loader2 className="mr-2 size-4 animate-spin" />
+                ) : (
+                  <Plus className="mr-2 size-4" />
+                )}
+                New chat
+              </Button>
+              <span aria-hidden="true" className="mx-1 h-4 w-px bg-border" />
+            </>
+          ) : null}
+          {trailing}
+        </div>
       </div>
       <div className="flex-1 min-h-0">{renderBody()}</div>
     </div>
@@ -1086,6 +1122,7 @@ const AGENT_PRESET_FORM_FIELD_TO_BACKEND_FIELD: Record<
   skills: "skills",
   librarySkills: "library_skills",
   toolApprovals: "tool_approvals",
+  toolTunnels: "tool_tunnels",
   retries: "retries",
   enableThinking: "enable_thinking",
   enableInternetAccess: "enable_internet_access",
@@ -1537,17 +1574,8 @@ function AgentPresetForm({
   const documentPanel = (
     <AgentPresetDocumentPanel
       form={form}
-      workspaceId={workspaceId}
-      presetId={preset?.id ?? null}
-      currentVersionId={preset?.current_version_id ?? null}
-      getDraftPayload={getDraftPayload}
       isSaving={isSaving}
-      canSubmit={canSubmit}
-      submitLabel={submitLabel}
-      onPublish={submit}
-      isDirty={form.formState.isDirty}
-      cutsVersion={cutsVersion}
-      onDiscard={discard}
+      fullWidth={layout === "stacked"}
     />
   )
 
@@ -1631,11 +1659,12 @@ function AgentPresetForm({
   } else {
     leftPanel = (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="flex h-12 shrink-0 items-center gap-1 border-b border-border/60 px-5">
+        <div className="@container/agent-preset-bar flex min-h-12 shrink-0 flex-wrap items-center gap-1 border-b border-border/60 px-5 py-1.5">
           {modeSwitch}
-          <span className="flex-1" />
-          {leftMode === "channels" ? inlineActions : null}
-          {railToggle}
+          <div className="ml-auto flex items-center gap-1">
+            {inlineActions}
+            {railToggle}
+          </div>
         </div>
         <div className="min-h-0 flex-1">
           {/* Mount once entitlements resolve; the panel's early return
@@ -1736,107 +1765,72 @@ function AgentPresetForm({
 
 function AgentPresetDocumentPanel({
   form,
-  workspaceId,
-  presetId,
-  currentVersionId,
-  getDraftPayload,
   isSaving,
-  canSubmit,
-  submitLabel,
-  onPublish,
-  isDirty,
-  cutsVersion,
-  onDiscard,
+  fullWidth,
 }: {
   form: UseFormReturn<AgentPresetFormValues>
-  workspaceId: string
-  presetId: string | null
-  currentVersionId: string | null
-  getDraftPayload: () => AgentPresetCreate | null
   isSaving: boolean
-  canSubmit: boolean
-  submitLabel: string
-  onPublish: () => void
-  isDirty: boolean
-  cutsVersion: boolean
-  onDiscard: () => void
+  /** Match the setup rail's insets instead of a centered reading column. */
+  fullWidth: boolean
 }) {
-  // Context present -> the standalone route's global controls header renders
-  // the detail actions; context absent (case artifact view) -> render them
-  // inline next to the title.
-  const detail = useAgentPresetDetailContext()
   return (
     <ScrollArea className="h-full [&_[data-radix-scroll-area-viewport]>div]:!flex [&_[data-radix-scroll-area-viewport]>div]:min-h-full [&_[data-radix-scroll-area-viewport]>div]:flex-col">
-      <div className="mx-auto flex w-full max-w-[700px] flex-1 flex-col gap-0 px-[clamp(16px,5vw,48px)] pt-12 pb-10">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0 flex-1 space-y-3">
-            <FormField
-              control={form.control}
-              name="slug"
-              render={({ field }) => (
-                <FormItem className="space-y-0">
-                  <FormLabel className="sr-only">Slug</FormLabel>
-                  <FormControl>
-                    <input type="hidden" {...field} value={field.value ?? ""} />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem className="space-y-0">
-                  <FormLabel className="sr-only">Agent name</FormLabel>
-                  <FormControl>
-                    <Input
-                      className="h-auto w-full border-none bg-transparent px-0 text-[30px] font-semibold leading-tight tracking-[-0.02em] text-foreground shadow-none outline-none transition-none placeholder:text-muted-foreground/40 focus-visible:bg-transparent focus-visible:outline-none focus-visible:ring-0"
-                      placeholder="New agent preset"
-                      disabled={isSaving}
-                      {...field}
-                      value={field.value ?? ""}
-                    />
-                  </FormControl>
-                  <FormMessage className="text-xs" />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="description"
-              render={({ field }) => (
-                <FormItem>
-                  <FormControl>
-                    <AutoResizeTextarea
-                      value={field.value ?? ""}
-                      onChange={field.onChange}
-                      onBlur={field.onBlur}
-                      disabled={isSaving}
-                      placeholder="Describe this agent."
-                      className="w-full resize-none overflow-hidden border-none bg-transparent px-0 text-[15px] leading-[1.55] text-muted-foreground shadow-none outline-none transition-none placeholder:text-muted-foreground/50 focus-visible:bg-transparent focus-visible:outline-none focus-visible:ring-0"
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-          </div>
-          {detail ? null : (
-            <div className="flex flex-wrap items-center gap-2">
-              <AgentPresetDetailActions
-                workspaceId={workspaceId}
-                presetId={presetId}
-                currentVersionId={currentVersionId}
-                getDraftPayload={getDraftPayload}
-                isSaving={isSaving}
-                canSubmit={canSubmit}
-                submitLabel={submitLabel}
-                onPublish={onPublish}
-                isDirty={isDirty}
-                cutsVersion={cutsVersion}
-                onDiscard={onDiscard}
-              />
-            </div>
-          )}
+      <div
+        className={cn(
+          "flex w-full flex-1 flex-col gap-0 pt-12 pb-10",
+          fullWidth ? "px-6" : "mx-auto max-w-[700px] px-[clamp(16px,5vw,48px)]"
+        )}
+      >
+        <div className="space-y-3">
+          <FormField
+            control={form.control}
+            name="slug"
+            render={({ field }) => (
+              <FormItem className="space-y-0">
+                <FormLabel className="sr-only">Slug</FormLabel>
+                <FormControl>
+                  <input type="hidden" {...field} value={field.value ?? ""} />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem className="space-y-0">
+                <FormLabel className="sr-only">Agent name</FormLabel>
+                <FormControl>
+                  <Input
+                    className="h-auto w-full border-none bg-transparent px-0 text-[30px] font-semibold leading-tight tracking-[-0.02em] text-foreground shadow-none outline-none transition-none placeholder:text-muted-foreground/40 focus-visible:bg-transparent focus-visible:outline-none focus-visible:ring-0"
+                    placeholder="New agent preset"
+                    disabled={isSaving}
+                    {...field}
+                    value={field.value ?? ""}
+                  />
+                </FormControl>
+                <FormMessage className="text-xs" />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="description"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <AutoResizeTextarea
+                    value={field.value ?? ""}
+                    onChange={field.onChange}
+                    onBlur={field.onBlur}
+                    disabled={isSaving}
+                    placeholder="Describe this agent."
+                    className="w-full resize-none overflow-hidden border-none bg-transparent px-0 text-[15px] leading-[1.55] text-muted-foreground shadow-none outline-none transition-none placeholder:text-muted-foreground/50 focus-visible:bg-transparent focus-visible:outline-none focus-visible:ring-0"
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
         </div>
         <Separator className="my-8" />
         <section className="flex flex-1 flex-col">
@@ -3719,6 +3713,7 @@ function presetToFormValues(preset: AgentPresetRead): AgentPresetFormValues {
           })
         )
       : [],
+    toolTunnels: preset.tool_tunnels ?? {},
     mcpIntegrations: preset.mcp_integrations ?? [],
     subagents,
     skills:
@@ -3772,6 +3767,8 @@ export function formValuesToPayload(
     library_skills:
       values.librarySkills.length > 0 ? values.librarySkills : null,
     tool_approvals: toToolApprovalMap(values.toolApprovals),
+    tool_tunnels:
+      Object.keys(values.toolTunnels).length > 0 ? values.toolTunnels : null,
     retries: values.retries,
     enable_thinking: values.enableThinking,
     enable_internet_access:
