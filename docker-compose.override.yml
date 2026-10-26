@@ -120,7 +120,7 @@ services:
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "8100"
     ports:
-      - "8100:8100"
+      - "127.0.0.1:8100:8100"
     networks:
       - core
     restart: unless-stopped
@@ -144,7 +144,7 @@ services:
       MCP_HOST: "0.0.0.0"
       MCP_ACTIONS_PORT: "8101"
     ports:
-      - "8101:8101"
+      - "127.0.0.1:8101:8101"
     networks:
       - core
     restart: unless-stopped
