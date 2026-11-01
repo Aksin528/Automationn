@@ -1,12 +1,12 @@
 "use client"
 
-import { useQuery } from "@tanstack/react-query"
 import { ArrowUpRight, PlayIcon } from "lucide-react"
 import Link from "next/link"
 import { useCallback, useMemo } from "react"
 import type { ApiError, CaseRead, WorkflowRead } from "@/client"
 import { workflowsGetWorkflow } from "@/client"
 import {
+  TRIGGER_SCROLL_AREA_CLASS,
   type TriggerFormValues,
   WorkflowTriggerForm,
 } from "@/components/cases/workflow-trigger-form"
@@ -21,12 +21,15 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { Switch } from "@/components/ui/switch"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
 import { useWorkflowTriggerInputs } from "@/hooks/use-workflow-trigger-inputs"
 import { useCreateManualWorkflowExecution } from "@/lib/hooks"
+import { useQuery } from "@/lib/query"
 import type { TracecatJsonSchema } from "@/lib/schema"
+import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 type WorkflowWithSchema = WorkflowRead & {
@@ -58,6 +61,7 @@ export function WorkflowTriggerDialog({
     useCreateManualWorkflowExecution(workflowId || "")
 
   const {
+    caseFieldDisplayNameById,
     caseFieldsRecord,
     fallbackInputs,
     groupCaseFields,
@@ -143,6 +147,7 @@ export function WorkflowTriggerDialog({
       await createExecution({
         workflow_id: workflowId,
         inputs: withTaskContextInputs(values),
+        case_task_id: taskId ?? null,
       })
       showExecutionStartedToast()
       onOpenChange(false)
@@ -161,6 +166,7 @@ export function WorkflowTriggerDialog({
     await createExecution({
       workflow_id: workflowId,
       inputs: withTaskContextInputs(fallbackInputs),
+      case_task_id: taskId ?? null,
     })
     showExecutionStartedToast()
     onOpenChange(false)
@@ -179,7 +185,7 @@ export function WorkflowTriggerDialog({
 
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent className="max-w-md">
+      <AlertDialogContent className="flex max-h-[85vh] max-w-md flex-col overflow-hidden [overflow-wrap:anywhere]">
         <AlertDialogHeader>
           <AlertDialogTitle className="text-sm">
             {triggerSchema
@@ -197,6 +203,7 @@ export function WorkflowTriggerDialog({
             schema={triggerSchema}
             caseId={caseData.id}
             caseFields={caseFieldsRecord}
+            caseFieldDisplayNameById={caseFieldDisplayNameById}
             groupCaseFields={effectiveGroupCaseFields}
             defaultTriggerValues={defaultTriggerValues}
             taskId={taskId}
@@ -205,30 +212,31 @@ export function WorkflowTriggerDialog({
           />
         ) : (
           <>
-            <div className="mt-4 space-y-3">
-              <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/40 px-3 py-2">
-                <div className="space-y-1 text-xs">
-                  <div className="font-medium">Group case fields</div>
-                  <p className="text-[11px] text-muted-foreground">
-                    Send case data under a single <code>case_fields</code>{" "}
-                    object.
-                  </p>
+            <ScrollArea className={cn(TRIGGER_SCROLL_AREA_CLASS, "mt-4")}>
+              <div className="space-y-3 pr-3">
+                <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/40 px-3 py-2">
+                  <div className="space-y-1 text-xs">
+                    <div className="font-medium">Group case fields</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      Send case data under a single <code>case_fields</code>{" "}
+                      object.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={groupCaseFields}
+                    onCheckedChange={(value) => setGroupCaseFields(value)}
+                    className="h-4 w-8"
+                  />
                 </div>
-                <Switch
-                  checked={groupCaseFields}
-                  onCheckedChange={(value) => setGroupCaseFields(value)}
-                  className="h-4 w-8"
-                />
+                <TooltipProvider>
+                  <JsonViewWithControls
+                    src={fallbackInputs}
+                    showControls={false}
+                    defaultExpanded
+                  />
+                </TooltipProvider>
               </div>
-              <TooltipProvider>
-                <JsonViewWithControls
-                  src={fallbackInputs}
-                  showControls={false}
-                  defaultTab="nested"
-                  defaultExpanded
-                />
-              </TooltipProvider>
-            </div>
+            </ScrollArea>
             <AlertDialogFooter>
               <AlertDialogCancel className="text-xs">Cancel</AlertDialogCancel>
               <Button

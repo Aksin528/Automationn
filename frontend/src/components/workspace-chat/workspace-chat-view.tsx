@@ -1,7 +1,6 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
-import type { ChatOnDataCallback, UIMessage } from "ai"
+import type { ChatStatus, UIMessage } from "ai"
 import { PanelLeftIcon } from "lucide-react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
@@ -22,17 +21,14 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { ArtifactPanel } from "@/components/workspace-chat/artifacts/artifact-panel"
-import { invalidateArtifactQueries } from "@/components/workspace-chat/artifacts/artifact-registry"
+import { useArtifactInvalidation } from "@/hooks/use-artifact-invalidation"
 import { useRemoveSessionArtifact } from "@/hooks/use-chat"
 import { useEntitlements } from "@/hooks/use-entitlements"
 import { useWorkspaceChatArtifacts } from "@/hooks/use-workspace-chat-artifacts"
 import { useWorkspaceId } from "@/providers/workspace-id"
-import {
-  ARTIFACT_DATA_PART_TYPE,
-  type ArtifactType,
-  parseWorkspaceChatArtifactStreamPart,
-  type WorkspaceChatArtifact,
-  type WorkspaceChatArtifactStreamPart,
+import type {
+  ArtifactType,
+  WorkspaceChatArtifact,
 } from "@/types/workspace-chat-artifacts"
 
 const EMPTY_MESSAGES: UIMessage[] = []
@@ -45,6 +41,7 @@ const ARTIFACT_TYPES = new Set<ArtifactType>([
   "run",
   "table",
   "agent",
+  "form",
   "alert",
   "integration",
   "secret",
@@ -99,7 +96,6 @@ export function WorkspaceChatView({ chatId }: { chatId?: string }) {
   const initialArtifactTabRef = useRef(
     parseArtifactTabQueryValue(searchParams.get(ARTIFACT_TAB_QUERY_PARAM))
   )
-  const queryClient = useQueryClient()
   const canAccessMissionControl = useScopeCheck(
     undefined,
     ["agent:execute", "agent:read"],
@@ -109,6 +105,7 @@ export function WorkspaceChatView({ chatId }: { chatId?: string }) {
   const workspaceChatEnabled = hasEntitlement("workspace_chat")
 
   const [messages, setMessages] = useState<UIMessage[]>(EMPTY_MESSAGES)
+  const [chatStatus, setChatStatus] = useState<ChatStatus>("ready")
   const [chat, setChat] = useState<
     AgentSessionsGetSessionVercelResponse | undefined
   >()
@@ -131,34 +128,13 @@ export function WorkspaceChatView({ chatId }: { chatId?: string }) {
     },
     [chat, removeArtifact]
   )
-  const handleArtifactStreamPart = useCallback(
-    (part: WorkspaceChatArtifactStreamPart) => {
-      switch (part.type) {
-        case ARTIFACT_DATA_PART_TYPE:
-          invalidateArtifactQueries(
-            queryClient,
-            workspaceId,
-            part.data.artifact
-          )
-          return
-      }
-    },
-    [queryClient, workspaceId]
-  )
-  const handleStreamData = useCallback<ChatOnDataCallback<UIMessage>>(
-    (dataPart) => {
-      const part = parseWorkspaceChatArtifactStreamPart(dataPart)
-      if (!part) {
-        return
-      }
-      handleArtifactStreamPart(part)
-    },
-    [handleArtifactStreamPart]
-  )
+  const { handleArtifactStreamPart, handleStreamData } =
+    useArtifactInvalidation(workspaceId)
   const artifactsState = useWorkspaceChatArtifacts(messages, {
     enabled: true,
     initialActiveArtifactKey: initialArtifactKeyRef.current,
     persistedArtifacts,
+    isStreaming: chatStatus === "submitted" || chatStatus === "streaming",
     onArtifactStreamPart: handleArtifactStreamPart,
     onCloseArtifact: closePersistedArtifact,
   })
@@ -261,6 +237,7 @@ export function WorkspaceChatView({ chatId }: { chatId?: string }) {
             surface="workspace-chat"
             onMessagesChange={setMessages}
             onData={handleStreamData}
+            onStatusChange={setChatStatus}
             onChatChange={setChat}
             headerActions={
               showExpandButton ? (

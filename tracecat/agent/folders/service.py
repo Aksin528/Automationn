@@ -18,7 +18,10 @@ from tracecat.agent.folders.schemas import (
     AgentPresetDirectoryItem,
     DirectoryItem,
 )
+from tracecat.agent.preset.schemas import build_agent_preset_tool_summary
+from tracecat.agent.preset.service import AgentPresetService
 from tracecat.authz.controls import require_scope
+from tracecat.db.errors import is_unique_violation
 from tracecat.db.models import AgentFolder, AgentPreset
 from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
 from tracecat.pagination import (
@@ -91,15 +94,20 @@ class AgentFolderService(BaseWorkspaceService):
         *,
         conflict_path: str,
         commit: bool,
+        old_path: str | None = None,
     ) -> None:
         """Persist a folder write and translate unique conflicts cleanly."""
         try:
+            if old_path is not None and old_path != conflict_path:
+                await self._update_descendant_paths(old_path, conflict_path)
             if commit:
                 await self.session.commit()
             else:
                 await self.session.flush()
         except IntegrityError as exc:
             await self.session.rollback()
+            if not is_unique_violation(exc, "uq_agent_folder_path_workspace"):
+                raise
             raise self._folder_validation_error(
                 f"Folder {conflict_path} already exists",
                 code=AgentFolderErrorCode.CONFLICT,
@@ -303,12 +311,25 @@ class AgentFolderService(BaseWorkspaceService):
         statement = select(AgentPreset).where(
             AgentPreset.workspace_id == self.workspace_id,
             AgentPreset.id == preset_id,
+            AgentPreset.deleted_at.is_(None),
         )
         result = await self.session.execute(statement)
         preset = result.scalar_one_or_none()
         if not preset:
             raise TracecatNotFoundError(f"Agent preset {preset_id} not found")
 
+        if folder is not None:
+            # Key-share lock keeps the folder from being deleted before commit.
+            folder_id = await self.session.scalar(
+                select(AgentFolder.id)
+                .where(
+                    AgentFolder.workspace_id == self.workspace_id,
+                    AgentFolder.id == folder.id,
+                )
+                .with_for_update(read=True, key_share=True)
+            )
+            if folder_id is None:
+                raise TracecatNotFoundError("Agent folder not found")
         preset.folder_id = folder.id if folder else None
         self.session.add(preset)
         await self.session.commit()
@@ -348,10 +369,9 @@ class AgentFolderService(BaseWorkspaceService):
         folder.path = new_path
         self.session.add(folder)
 
-        if new_path != old_path:
-            await self._update_descendant_paths(old_path, new_path)
-
-        await self._write_folder_change(conflict_path=new_path, commit=True)
+        await self._write_folder_change(
+            conflict_path=new_path, commit=True, old_path=old_path
+        )
         await self.session.refresh(folder)
         return folder
 
@@ -408,10 +428,9 @@ class AgentFolderService(BaseWorkspaceService):
         folder.path = new_path
         self.session.add(folder)
 
-        if new_path != old_path:
-            await self._update_descendant_paths(old_path, new_path)
-
-        await self._write_folder_change(conflict_path=new_path, commit=True)
+        await self._write_folder_change(
+            conflict_path=new_path, commit=True, old_path=old_path
+        )
         await self.session.refresh(folder)
         return folder
 
@@ -482,6 +501,7 @@ class AgentFolderService(BaseWorkspaceService):
             .where(
                 AgentPreset.workspace_id == self.workspace_id,
                 AgentPreset.folder_id == folder_id,
+                AgentPreset.deleted_at.is_(None),
             )
             .order_by(
                 AgentPreset.created_at.desc()
@@ -544,6 +564,7 @@ class AgentFolderService(BaseWorkspaceService):
                 .where(
                     AgentPreset.workspace_id == self.workspace_id,
                     AgentPreset.folder_id.in_(folder_ids),
+                    AgentPreset.deleted_at.is_(None),
                 )
                 .group_by(AgentPreset.folder_id)
             )
@@ -587,6 +608,9 @@ class AgentFolderService(BaseWorkspaceService):
                 updated_at=f.updated_at,
             )
 
+        policies = await AgentPresetService(
+            self.session, role=self.role
+        ).resolve_tool_policies(presets)
         for preset in presets:
             items_by_id[preset.id] = AgentPresetDirectoryItem(
                 type="preset",
@@ -594,9 +618,11 @@ class AgentFolderService(BaseWorkspaceService):
                 name=preset.name,
                 slug=preset.slug,
                 description=preset.description,
+                use_in_chat=preset.use_in_chat,
                 model_provider=preset.model_provider,
                 model_name=preset.model_name,
                 folder_id=preset.folder_id,
+                tool_summary=build_agent_preset_tool_summary(policies[preset.id]),
                 tags=[
                     TagRead.model_validate(tag, from_attributes=True)
                     for tag in preset.tags
@@ -675,5 +701,6 @@ class AgentFolderService(BaseWorkspaceService):
         exists_clause = sa.exists().where(
             AgentPreset.workspace_id == self.workspace_id,
             AgentPreset.folder_id == folder_id,
+            AgentPreset.deleted_at.is_(None),
         )
         return bool(await self.session.scalar(select(exists_clause)))

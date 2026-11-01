@@ -16,7 +16,7 @@ from tracecat.admin.registry.schemas import (
     RegistryVersionRead,
 )
 from tracecat.admin.registry.service import AdminRegistryService
-from tracecat.auth.credentials import SuperuserRole
+from tracecat.auth.credentials import SuperuserRole, SuperuserStepUpRole
 from tracecat.db.dependencies import AsyncDBSessionBypass
 from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
 from tracecat.registry.repositories.schemas import (
@@ -53,7 +53,7 @@ async def get_platform_repository(
 
 @router.post("/sync", response_model=RegistrySyncResponse)
 async def sync_all_repositories(
-    role: SuperuserRole,
+    role: SuperuserStepUpRole,
     session: AsyncDBSessionBypass,
     force: bool = Query(False, description="Force sync by deleting existing version"),
 ) -> RegistrySyncResponse:
@@ -64,7 +64,7 @@ async def sync_all_repositories(
 
 @router.post("/sync/{repository_id}", response_model=RegistrySyncResponse)
 async def sync_repository(
-    role: SuperuserRole,
+    role: SuperuserStepUpRole,
     session: AsyncDBSessionBypass,
     repository_id: uuid.UUID,
     force: bool = Query(False, description="Force sync by deleting existing version"),
@@ -108,7 +108,7 @@ async def list_registry_versions(
     response_model=RegistryArtifactsBackfillStartResponse,
 )
 async def start_registry_artifacts_backfill(
-    role: SuperuserRole,
+    role: SuperuserStepUpRole,
     session: AsyncDBSessionBypass,
     params: RegistryArtifactsBackfillStartRequest,
 ) -> RegistryArtifactsBackfillStartResponse:
@@ -129,7 +129,7 @@ async def start_registry_artifacts_backfill(
     response_model=RegistryVersionPromoteResponse,
 )
 async def promote_registry_version(
-    role: SuperuserRole,
+    role: SuperuserStepUpRole,
     session: AsyncDBSessionBypass,
     repository_id: uuid.UUID,
     version_id: uuid.UUID,
@@ -140,6 +140,28 @@ async def promote_registry_version(
         return await service.promote_version(
             repository_id=repository_id, version_id=version_id
         )
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+
+
+@router.delete(
+    "/{repository_id}/versions/{version_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_registry_version(
+    role: SuperuserStepUpRole,
+    session: AsyncDBSessionBypass,
+    repository_id: uuid.UUID,
+    version_id: uuid.UUID,
+) -> None:
+    """Delete an unused, non-current platform registry version."""
+    service = AdminRegistryService(session, role)
+    try:
+        await service.delete_version(repository_id=repository_id, version_id=version_id)
     except TracecatValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)

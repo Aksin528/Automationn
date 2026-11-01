@@ -3,7 +3,11 @@
 import { CheckCheckIcon, CopyIcon, LinkIcon } from "lucide-react"
 import React from "react"
 import JsonView from "react18-json-view"
-import type { NodeMeta } from "react18-json-view/dist/types"
+import type {
+  Collapsed,
+  DisplaySize,
+  NodeMeta,
+} from "react18-json-view/dist/types"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
@@ -100,16 +104,25 @@ interface JsonViewWithControlsProps {
   copyPrefix?: string
   copyMode?: JsonViewCopyMode
   className?: string
+  /** Which nodes stay folded while expanded; everything opens by default. */
+  collapsed?: Collapsed
+  /** When to show a node's item count; always by default. */
+  displaySize?: DisplaySize
+  /** Whether hovering a node offers to copy its JSONPath. */
+  enableClipboard?: boolean
 }
 
 export function JsonViewWithControls({
   src,
   defaultExpanded = false,
-  defaultTab = "flat",
+  defaultTab = "nested",
   showControls = true,
   copyPrefix,
   copyMode = "jsonpath-only",
   className,
+  collapsed,
+  displaySize = true,
+  enableClipboard = true,
 }: JsonViewWithControlsProps): JSX.Element {
   const [isExpanded, setIsExpanded] = React.useState(defaultExpanded)
 
@@ -133,8 +146,8 @@ export function JsonViewWithControls({
   const tabItems = React.useMemo(
     () =>
       [
-        { value: "flat", label: "Flat", src: flattenedSrc },
         { value: "nested", label: "Nested", src: originalSrc },
+        { value: "flat", label: "Flat", src: flattenedSrc },
       ] as { value: JsonViewWithControlsTabs; label: string; src: unknown }[],
     [flattenedSrc, originalSrc]
   )
@@ -195,9 +208,9 @@ export function JsonViewWithControls({
             onClick={(e) => e.stopPropagation()}
           >
             <JsonView
-              collapsed={!isExpanded}
-              displaySize
-              enableClipboard
+              collapsed={isExpanded ? (collapsed ?? false) : true}
+              displaySize={displaySize}
+              enableClipboard={enableClipboard}
               src={source ?? null}
               className="break-all text-xs"
               theme="atom"

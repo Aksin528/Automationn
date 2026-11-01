@@ -10,6 +10,7 @@ from typing import Any, Literal, NotRequired, Self, TypedDict, cast
 import orjson
 from pydantic import (
     AliasChoices,
+    AliasPath,
     BaseModel,
     ConfigDict,
     Field,
@@ -54,6 +55,15 @@ class AgentArtifactPayload(TypedDict):
     type: Literal["agent"]
     id: str
     title: str
+
+
+class FormArtifactPayload(TypedDict):
+    """Raw payload used to validate a form artifact."""
+
+    type: Literal["form"]
+    id: str
+    title: str
+    status: NotRequired[Literal["online", "offline"]]
 
 
 class WorkflowArtifactPayload(TypedDict):
@@ -132,6 +142,23 @@ class _AgentPresetToolResult(_ArtifactProjectionModel):
     )
 
 
+class _FormToolResult(_ArtifactProjectionModel):
+    id: str
+    title: str | None = Field(
+        default=None, validation_alias=AliasPath("config", "title")
+    )
+    workflow_title: str | None = None
+    status: Literal["online", "offline"] | None = None
+
+
+class _WorkflowEditDocumentMetadata(_ArtifactProjectionModel):
+    title: str | None = None
+
+
+class _WorkflowEditDocument(_ArtifactProjectionModel):
+    metadata: _WorkflowEditDocumentMetadata | None = None
+
+
 class _WorkflowToolResult(_ArtifactProjectionModel):
     id: str = Field(
         validation_alias=AliasChoices("id", "workflow_id", "workflowId", "wf_id")
@@ -142,6 +169,17 @@ class _WorkflowToolResult(_ArtifactProjectionModel):
     is_published: bool | None = Field(
         default=None, validation_alias=AliasChoices("is_published", "isPublished")
     )
+    # ``get_workflow``/``edit_workflow`` carry the title nested under the
+    # editable draft document instead of at the top level.
+    draft_document: _WorkflowEditDocument | None = None
+
+    @property
+    def resolved_title(self) -> str | None:
+        if self.title:
+            return self.title
+        if self.draft_document and self.draft_document.metadata:
+            return self.draft_document.metadata.title
+        return None
 
 
 class _WorkflowRunToolResult(_ArtifactProjectionModel):
@@ -213,6 +251,12 @@ class ArtifactBinding:
     op: ArtifactOp
     build: ArtifactBuilder
     identity: ArtifactIdentityBuilder | None = None
+    max_artifacts: int | None = None
+
+
+# List-style tools (list/search) skip artifact emission past this count so a
+# broad listing answers in chat text instead of opening one tab per item.
+MAX_LIST_ARTIFACTS = 3
 
 
 def _build_case_artifact(ctx: ArtifactProjectionContext) -> Artifact | None:
@@ -267,6 +311,24 @@ def _build_agent_artifacts(ctx: ArtifactProjectionContext) -> Iterable[Artifact]
     return _agent_artifacts_from_output(ctx.tool_output, ctx.tool_call_id)
 
 
+def _build_form_artifact(ctx: ArtifactProjectionContext) -> Artifact | None:
+    data = _mapping_from_tool_output(ctx.tool_output)
+    if data is None or (result := _FormToolResult.try_validate(data)) is None:
+        return None
+
+    payload: FormArtifactPayload = {
+        "type": "form",
+        "id": result.id,
+        "title": result.title or result.workflow_title or result.id,
+    }
+    if result.status is not None:
+        payload["status"] = result.status
+
+    return ArtifactAdapter.validate_python(
+        _with_parent_scope(payload, ctx.tool_call_id)
+    )
+
+
 def _build_workflow_run_artifact(ctx: ArtifactProjectionContext) -> Artifact | None:
     return _run_artifact_from_output(ctx.tool_output, ctx.tool_input, ctx.tool_call_id)
 
@@ -289,6 +351,7 @@ ARTIFACT_BINDINGS: tuple[ArtifactBinding, ...] = (
         tool_names=("core.cases.list_cases", "core.cases.search_cases"),
         op="upsert",
         build=_build_case_artifacts,
+        max_artifacts=MAX_LIST_ARTIFACTS,
     ),
     ArtifactBinding(
         tool_names=("core.cases.delete_case",),
@@ -312,6 +375,7 @@ ARTIFACT_BINDINGS: tuple[ArtifactBinding, ...] = (
         tool_names=("core.table.list_tables",),
         op="upsert",
         build=_build_table_artifacts,
+        max_artifacts=MAX_LIST_ARTIFACTS,
     ),
     ArtifactBinding(
         tool_names=(
@@ -319,6 +383,7 @@ ARTIFACT_BINDINGS: tuple[ArtifactBinding, ...] = (
             "core.table.lookup_many",
             "core.table.is_in",
             "core.table.search_rows",
+            "core.table.aggregate_rows",
             "core.table.insert_row",
             "core.table.insert_rows",
             "core.table.update_row",
@@ -342,6 +407,12 @@ ARTIFACT_BINDINGS: tuple[ArtifactBinding, ...] = (
         tool_names=("ai.agent.list_presets",),
         op="upsert",
         build=_build_agent_artifacts,
+        max_artifacts=MAX_LIST_ARTIFACTS,
+    ),
+    ArtifactBinding(
+        tool_names=("core.forms.get_form", "core.forms.update_form"),
+        op="upsert",
+        build=_build_form_artifact,
     ),
     ArtifactBinding(
         tool_names=("core.workflow.execute", "core.workflow.get_status"),
@@ -349,7 +420,11 @@ ARTIFACT_BINDINGS: tuple[ArtifactBinding, ...] = (
         build=_build_workflow_run_artifact,
     ),
     ArtifactBinding(
-        tool_names=("core.workflow.create_workflow",),
+        tool_names=(
+            "core.workflow.create_workflow",
+            "core.workflow.get_workflow",
+            "core.workflow.edit_workflow",
+        ),
         op="upsert",
         build=_build_workflow_artifact,
     ),
@@ -418,6 +493,8 @@ def artifact_side_effects_for_tool_result(
 
     artifacts = _artifact_tuple(binding.build(ctx))
     if not artifacts:
+        return
+    if binding.max_artifacts is not None and len(artifacts) > binding.max_artifacts:
         return
 
     identity_ref = binding.identity(ctx) if binding.identity else None
@@ -677,10 +754,18 @@ def _workflow_artifact_from_output(
     if result is None:
         return None
 
+    # ``edit_workflow`` returns no title (only message/workflow_id/draft_revision),
+    # so skip the upsert when no real title resolves. An empty side effect leaves
+    # the existing artifact untouched, preventing a title-less edit response from
+    # clobbering the title set by create_workflow/get_workflow with the workflow id.
+    title = result.resolved_title
+    if not title:
+        return None
+
     payload: WorkflowArtifactPayload = {
         "type": "workflow",
         "id": result.id,
-        "title": result.title or result.id,
+        "title": title,
         "color": _DEFAULT_WORKFLOW_ARTIFACT_COLOR,
     }
     if result.is_published is not None:

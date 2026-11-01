@@ -4,15 +4,24 @@ from uuid import UUID
 
 from fastapi import APIRouter, Body, HTTPException, Query, status
 
+from tracecat.agent.access.schemas import (
+    WorkspaceAgentModelAccessRead,
+    WorkspaceAgentModelAccessUpdate,
+)
 from tracecat.agent.access.service import AgentModelAccessService
 from tracecat.agent.catalog.schemas import (
     AgentCatalogCreate,
     AgentCatalogListResponse,
     AgentCatalogRead,
     AgentCatalogUpdate,
+    WorkspaceAgentModelListResponse,
 )
 from tracecat.agent.catalog.service import AgentCatalogService
-from tracecat.auth.dependencies import OrgUserRole, WorkspaceUserPathRole
+from tracecat.auth.dependencies import (
+    OrgActorRole,
+    OrgUserRole,
+    WorkspaceActorRouteRole,
+)
 from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
@@ -27,7 +36,7 @@ router = APIRouter()
 )
 @require_scope("agent:read")
 async def list_catalog(
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     provider: str | None = Query(None),
     model_name: str | None = Query(None),
@@ -35,6 +44,9 @@ async def list_catalog(
     limit: int = Query(50, ge=1, le=100),
 ) -> AgentCatalogListResponse:
     """List catalog entries with optional filtering and pagination."""
+    # Workspace-bound keys must use the workspace-effective model view instead.
+    if role.type == "service_account" and role.bound_workspace_id is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     service = AgentCatalogService(session=session)
     try:
         params = CursorPaginationParams(cursor=cursor, limit=limit)
@@ -59,11 +71,14 @@ async def list_catalog(
 @require_scope("agent:read")
 async def get_catalog_entry(
     catalog_id: UUID,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
 ) -> AgentCatalogRead:
     """Get a specific catalog entry."""
-    assert role.organization_id is not None  # OrgUserRole guarantees this
+    assert role.organization_id is not None  # OrgActorRole guarantees this
+    # Workspace-bound keys must use the workspace-effective model view instead.
+    if role.type == "service_account" and role.bound_workspace_id is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     service = AgentCatalogService(session=session)
     try:
         row = await service.get_catalog_entry(
@@ -193,18 +208,19 @@ async def delete_catalog_entry(
 
 @router.get(
     "/workspaces/{workspace_id}/agent-models",
-    response_model=AgentCatalogListResponse,
+    response_model=WorkspaceAgentModelListResponse,
 )
 @require_scope("agent:read")
 async def get_workspace_models(
     workspace_id: UUID,
-    role: WorkspaceUserPathRole,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
-) -> AgentCatalogListResponse:
-    """Get models accessible to a workspace.
+) -> WorkspaceAgentModelListResponse:
+    """Get models accessible to a workspace, and its default model.
 
     Returns the full effective set; the list is bounded by org enablement
-    and is expected to be small, so pagination is not used here.
+    and is expected to be small, so pagination is not used here. The default
+    is the organization's default model, if it is enabled for this workspace.
     """
     if role.workspace_id != workspace_id:
         raise HTTPException(
@@ -214,10 +230,63 @@ async def get_workspace_models(
 
     access_service = AgentModelAccessService(session=session, role=role)
     try:
-        models = await access_service.get_workspace_models(workspace_id=workspace_id)
+        return await access_service.list_workspace_models(workspace_id=workspace_id)
     except TracecatNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         ) from e
-    return AgentCatalogListResponse(items=models, next_cursor=None)
+
+
+@router.get(
+    "/workspaces/{workspace_id}/agent-model-access",
+    response_model=WorkspaceAgentModelAccessRead,
+)
+@require_scope("agent:read")
+async def get_workspace_model_access(
+    workspace_id: UUID,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+) -> WorkspaceAgentModelAccessRead:
+    """Get a workspace's model subset and the organization models it can use."""
+    if role.workspace_id != workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this workspace",
+        )
+
+    access_service = AgentModelAccessService(session=session, role=role)
+    return await access_service.get_workspace_model_access(workspace_id=workspace_id)
+
+
+@router.put(
+    "/workspaces/{workspace_id}/agent-model-access",
+    response_model=WorkspaceAgentModelAccessRead,
+)
+@require_scope("agent:update")
+async def update_workspace_model_access(
+    workspace_id: UUID,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    params: WorkspaceAgentModelAccessUpdate = Body(...),
+) -> WorkspaceAgentModelAccessRead:
+    """Replace a workspace's model subset, or clear it to inherit the org's models.
+
+    Every catalog ID must be enabled for the organization.
+    """
+    if role.workspace_id != workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this workspace",
+        )
+
+    access_service = AgentModelAccessService(session=session, role=role)
+    try:
+        return await access_service.set_workspace_model_access(
+            workspace_id=workspace_id, params=params
+        )
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e

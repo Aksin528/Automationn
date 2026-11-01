@@ -5,31 +5,59 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 
+from tests.shared import capture_application_error as _capture_application_error
 from tracecat.auth.types import Role
 from tracecat.dsl import scheduler as scheduler_module
 from tracecat.dsl.common import DSLEntrypoint, DSLInput
+from tracecat.dsl.error_transport import parse_classified_action_error_payload
 from tracecat.dsl.scheduler import DSLScheduler
-from tracecat.dsl.schemas import ActionStatement, ExecutionContext, RunContext
+from tracecat.dsl.schemas import (
+    ROOT_STREAM,
+    ActionStatement,
+    ExecutionContext,
+    RunContext,
+    StreamID,
+)
+from tracecat.dsl.types import (
+    ActionErrorInfo,
+    Task,
+)
 from tracecat.identifiers.workflow import WorkflowUUID
+from tracecat.runtime.errors import (
+    RetryDisposition,
+    RuntimeErrorClassification,
+    RuntimeErrorKind,
+    RuntimeErrorOwner,
+)
+from tracecat.temporal.errors import (
+    build_error_transport_detail,
+    extract_error_classifications,
+)
+from tracecat.temporal.patches import WorkflowPatch
 
 
 def _build_scheduler(
     *,
-    total_tasks: int,
     executor: Callable[[ActionStatement], Awaitable[None]],
+    total_tasks: int = 0,
+    actions: list[ActionStatement] | None = None,
     max_pending_tasks: int | None = None,
 ) -> DSLScheduler:
+    if actions is None:
+        actions = [
+            ActionStatement(ref=f"task_{index}", action="core.noop")
+            for index in range(total_tasks)
+        ]
     dsl = DSLInput(
         title="test",
         description="test",
-        entrypoint=DSLEntrypoint(ref="task_0"),
-        actions=[
-            ActionStatement(ref=f"task_{index}", action="core.noop")
-            for index in range(total_tasks)
-        ],
+        entrypoint=DSLEntrypoint(ref=actions[0].ref),
+        actions=actions,
     )
     wf_id = WorkflowUUID.new_uuid4()
     test_role = Role(
@@ -48,10 +76,348 @@ def _build_scheduler(
     return DSLScheduler(
         executor=executor,
         dsl=dsl,
-        max_pending_tasks=max_pending_tasks or total_tasks,
+        max_pending_tasks=max_pending_tasks or len(actions),
         context=ExecutionContext(ACTIONS={}, TRIGGER=None),
         role=test_role,
         run_context=test_run_context,
+    )
+
+
+def _cancelled_activity_error() -> ActivityError:
+    try:
+        raise ActivityError(
+            "Activity failed",
+            scheduled_event_id=1,
+            started_event_id=2,
+            identity="test-worker",
+            activity_type="test-activity",
+            activity_id="test-activity-id",
+            retry_state=None,
+        ) from CancelledError("cancelled by sibling")
+    except ActivityError as error:
+        return error
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("preserve_cancellation", [True, False])
+async def test_scheduler_preserves_temporal_cancellation_with_replay_gate(
+    preserve_cancellation: bool,
+) -> None:
+    activity_error = _cancelled_activity_error()
+
+    async def executor(_: ActionStatement) -> None:
+        raise activity_error
+
+    scheduler = _build_scheduler(total_tasks=1, executor=executor)
+    with patch(
+        "tracecat.dsl.scheduler.workflow.patched",
+        return_value=preserve_cancellation,
+    ):
+        if preserve_cancellation:
+            with pytest.raises(ActivityError) as exc_info:
+                await scheduler.start()
+            assert exc_info.value is activity_error
+            assert not scheduler.task_exceptions
+        else:
+            await scheduler.start()
+            assert "task_0" in scheduler.task_exceptions
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("preserve_cancellation", [True, False])
+async def test_run_if_preserves_temporal_cancellation_with_replay_gate(
+    preserve_cancellation: bool,
+) -> None:
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    activity_error = _cancelled_activity_error()
+    stmt = ActionStatement(ref="task_0", action="core.noop", run_if="${{ True }}")
+    scheduler = _build_scheduler(executor=executor, actions=[stmt])
+    task = Task(stmt.ref, ROOT_STREAM)
+    with (
+        patch.object(scheduler, "resolve_expression", side_effect=activity_error),
+        patch(
+            "tracecat.dsl.scheduler.workflow.patched",
+            return_value=preserve_cancellation,
+        ) as patched,
+    ):
+        if preserve_cancellation:
+            with pytest.raises(ActivityError) as exc_info:
+                await scheduler._task_should_skip(task, stmt)
+            assert exc_info.value is activity_error
+        else:
+            with pytest.raises(ApplicationError, match="Error evaluating `run_if`"):
+                await scheduler._task_should_skip(task, stmt)
+
+    patched.assert_called_once_with(WorkflowPatch.PRESERVE_RUN_IF_CANCELLATION)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("preserve_cancellation", [True, False])
+async def test_scheduler_cancellation_does_not_hide_same_batch_error(
+    preserve_cancellation: bool,
+) -> None:
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(total_tasks=2, executor=executor)
+    ready: set[str] = set()
+    all_ready = asyncio.Event()
+
+    async def schedule_task(task: Task) -> None:
+        ready.add(task.ref)
+        if len(ready) == 2:
+            all_ready.set()
+        await all_ready.wait()
+        if task.ref == "task_0":
+            raise asyncio.CancelledError
+        raise RuntimeError("causal scheduler failure")
+
+    with (
+        patch.object(scheduler, "_schedule_task", new=schedule_task),
+        patch(
+            "tracecat.dsl.scheduler.workflow.patched",
+            return_value=preserve_cancellation,
+        ) as patched,
+        pytest.raises(RuntimeError, match="causal scheduler failure"),
+    ):
+        await scheduler.start()
+
+    patched.assert_called_once_with(WorkflowPatch.PRESERVE_TEMPORAL_CANCELLATION)
+
+
+@pytest.mark.anyio
+async def test_scheduler_unwraps_classified_action_error_payload() -> None:
+    """Transported diagnostics become task error info and retain classification."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(total_tasks=1, executor=executor)
+    classification = RuntimeErrorClassification.user(
+        kind=RuntimeErrorKind.ACTION_EXECUTION_FAILED,
+        message="The action failed",
+        retry_disposition=RetryDisposition.NON_RETRYABLE,
+    )
+    payload = ActionErrorInfo(
+        ref="task_0",
+        message="The action failed",
+        type="ValueError",
+    )
+    error = _capture_application_error(
+        classification, build_error_transport_detail(classification, payload)
+    )
+
+    await scheduler._handle_error_path(Task(ref="task_0", stream_id=ROOT_STREAM), error)
+
+    details = scheduler.task_exceptions["task_0"].details
+    assert details == payload
+    assert scheduler.stream_error_classifications[ROOT_STREAM] == classification
+
+
+@pytest.mark.anyio
+async def test_scheduler_rebinds_classified_action_error_to_current_stream() -> None:
+    """An unwrapped payload is rebound to the failing task's ref and stream."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(total_tasks=1, executor=executor)
+    stream_id = StreamID.new("task_0", 2)
+    classification = RuntimeErrorClassification.user(
+        kind=RuntimeErrorKind.ACTION_EXECUTION_FAILED,
+        message="The action failed",
+        retry_disposition=RetryDisposition.NON_RETRYABLE,
+    )
+    error = _capture_application_error(
+        classification,
+        build_error_transport_detail(
+            classification,
+            ActionErrorInfo(
+                ref="legacy_ref",
+                message=classification.message,
+                type="ValueError",
+            ),
+        ),
+    )
+
+    await scheduler._handle_error_path(Task(ref="task_0", stream_id=stream_id), error)
+
+    details = scheduler.stream_exceptions[stream_id].details
+    assert details.ref == "task_0"
+    assert details.stream_id == stream_id
+    assert details.message == classification.message
+    assert scheduler.stream_error_classifications[stream_id] == classification
+
+
+@pytest.mark.anyio
+async def test_scheduler_unwraps_classified_child_workflow_error_map() -> None:
+    """A child's terminal transport map becomes children payloads; ownership
+    aggregates platform-wins across entries, so a platform-owned entry after a
+    user-owned one still attributes the stream to the platform."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(total_tasks=1, executor=executor)
+    user_classification = RuntimeErrorClassification.user(
+        kind=RuntimeErrorKind.ACTION_EXECUTION_FAILED,
+        message="The child action failed",
+        retry_disposition=RetryDisposition.NON_RETRYABLE,
+    )
+    platform_classification = RuntimeErrorClassification.platform(
+        kind=RuntimeErrorKind.RUNTIME_UNCLASSIFIED,
+        message="Tracecat could not execute the child action",
+        retry_disposition=RetryDisposition.RETRYABLE,
+    )
+    user_detail = ActionErrorInfo(
+        ref="user_action",
+        message=user_classification.message,
+        type="UserError",
+    )
+    platform_detail = ActionErrorInfo(
+        ref="platform_action",
+        message=platform_classification.message,
+        type="RuntimeError",
+    )
+    error = _capture_application_error(
+        user_classification,
+        {
+            user_detail.ref: build_error_transport_detail(
+                user_classification, user_detail
+            ).model_dump(mode="json"),
+            platform_detail.ref: build_error_transport_detail(
+                platform_classification, platform_detail
+            ).model_dump(mode="json"),
+        },
+    )
+
+    await scheduler._handle_error_path(Task(ref="task_0", stream_id=ROOT_STREAM), error)
+
+    details = scheduler.task_exceptions["task_0"].details
+    assert details.ref == "task_0"
+    assert details.message == platform_classification.message
+    assert details.children == [user_detail, platform_detail]
+    assert (
+        scheduler.stream_error_classifications[ROOT_STREAM] == platform_classification
+    )
+    assert extract_error_classifications(error) == (
+        user_classification,
+        platform_classification,
+    )
+
+
+@pytest.mark.anyio
+async def test_scheduler_child_workflow_error_map_all_user_keeps_first_classification() -> (
+    None
+):
+    """An all-user terminal map still attributes the stream to the first entry."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(total_tasks=1, executor=executor)
+    first_classification = RuntimeErrorClassification.user(
+        kind=RuntimeErrorKind.ACTION_EXECUTION_FAILED,
+        message="The first child action failed",
+        retry_disposition=RetryDisposition.NON_RETRYABLE,
+    )
+    second_classification = RuntimeErrorClassification.user(
+        kind=RuntimeErrorKind.ACTION_EXECUTION_FAILED,
+        message="The second child action failed",
+        retry_disposition=RetryDisposition.NON_RETRYABLE,
+    )
+    error = _capture_application_error(
+        first_classification,
+        {
+            "first_action": build_error_transport_detail(
+                first_classification,
+                ActionErrorInfo(
+                    ref="first_action",
+                    message=first_classification.message,
+                    type="UserError",
+                ),
+            ).model_dump(mode="json"),
+            "second_action": build_error_transport_detail(
+                second_classification,
+                ActionErrorInfo(
+                    ref="second_action",
+                    message=second_classification.message,
+                    type="UserError",
+                ),
+            ).model_dump(mode="json"),
+        },
+    )
+
+    await scheduler._handle_error_path(Task(ref="task_0", stream_id=ROOT_STREAM), error)
+
+    details = scheduler.task_exceptions["task_0"].details
+    assert details.message == first_classification.message
+    assert scheduler.stream_error_classifications[ROOT_STREAM] == first_classification
+
+
+@pytest.mark.anyio
+async def test_scheduler_synthesizes_info_from_bare_transport_detail() -> None:
+    """A detail without diagnostics still yields synthesized task error info."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(total_tasks=1, executor=executor)
+    classification = RuntimeErrorClassification.platform(
+        kind=RuntimeErrorKind.RUNTIME_UNCLASSIFIED,
+        message="Tracecat could not execute the action",
+        retry_disposition=RetryDisposition.RETRYABLE,
+    )
+    error = _capture_application_error(classification)
+
+    await scheduler._handle_error_path(Task(ref="task_0", stream_id=ROOT_STREAM), error)
+
+    details = scheduler.task_exceptions["task_0"].details
+    assert details.ref == "task_0"
+    assert details.message == classification.message
+    assert details.children is None
+    assert scheduler.stream_error_classifications[ROOT_STREAM] == classification
+
+
+@pytest.mark.anyio
+async def test_scheduler_rejects_undiscriminated_classification() -> None:
+    """An undiscriminated classification never classifies the failure."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(total_tasks=1, executor=executor)
+    invalid_classification = RuntimeErrorClassification.user(
+        kind=RuntimeErrorKind.ACTION_EXECUTION_FAILED,
+        message="Invalid unversioned classification",
+        retry_disposition=RetryDisposition.NON_RETRYABLE,
+    )
+    fallback_classification = RuntimeErrorClassification.platform(
+        kind=RuntimeErrorKind.RUNTIME_UNCLASSIFIED,
+        message="Tracecat could not execute the action",
+        retry_disposition=RetryDisposition.RETRYABLE,
+    )
+    invalid_detail = build_error_transport_detail(
+        invalid_classification,
+        ActionErrorInfo(
+            ref="forged_action",
+            message=invalid_classification.message,
+            type="UserError",
+        ),
+    ).model_dump(mode="json")
+    invalid_detail["classification"].pop("schema")
+    error = _capture_application_error(fallback_classification, invalid_detail)
+
+    await scheduler._handle_error_path(Task(ref="task_0", stream_id=ROOT_STREAM), error)
+
+    details = scheduler.task_exceptions["task_0"].details
+    assert parse_classified_action_error_payload(invalid_detail) is None
+    assert details.ref == "task_0"
+    assert details.message == fallback_classification.message
+    assert (
+        scheduler.stream_error_classifications[ROOT_STREAM] == fallback_classification
     )
 
 
@@ -184,3 +550,89 @@ async def test_scheduler_stops_spawning_after_failure_during_spawn_yield() -> No
     first_unstarted_ref = f"task_{scheduler_module._SCHEDULER_TASK_SPAWN_YIELD_EVERY}"
     assert len(started_refs) == scheduler_module._SCHEDULER_TASK_SPAWN_YIELD_EVERY
     assert first_unstarted_ref not in started_refs
+
+
+@pytest.mark.anyio
+async def test_scheduler_classifies_unreachable_join_as_user_error() -> None:
+    """A join with a skipped sibling and ``join_strategy: all`` fails as a
+    user-owned ``workflow.join.unreachable`` error, not an unclassified one."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(
+        executor=executor,
+        actions=[
+            ActionStatement(ref="start", action="core.noop"),
+            ActionStatement(
+                ref="left",
+                action="core.noop",
+                depends_on=["start"],
+                run_if="${{ False }}",
+            ),
+            ActionStatement(ref="right", action="core.noop", depends_on=["start"]),
+            ActionStatement(
+                ref="join", action="core.noop", depends_on=["left", "right"]
+            ),
+        ],
+    )
+
+    async def resolve_expression(expression: str, _: ExecutionContext) -> Any:
+        return expression != "${{ False }}"
+
+    with patch.object(scheduler, "resolve_expression", new=resolve_expression):
+        task_exceptions = await scheduler.start()
+
+    assert task_exceptions is not None
+    assert set(task_exceptions) == {"join"}
+    info = task_exceptions["join"]
+    classifications = extract_error_classifications(info.exception)
+    assert len(classifications) == 1
+    classification = classifications[0]
+    assert classification.kind is RuntimeErrorKind.WORKFLOW_JOIN_UNREACHABLE
+    assert classification.owner is RuntimeErrorOwner.USER
+    assert classification.retry_disposition is RetryDisposition.NON_RETRYABLE
+    assert "'left'" in info.details.message
+    assert "'right'" not in info.details.message
+    assert "join_strategy: any" in info.details.message
+
+
+@pytest.mark.anyio
+async def test_scheduler_classifies_templated_scatter_interval_as_user_error() -> None:
+    """A stored scatter with an expression `interval` fails as a user error."""
+
+    async def executor(_: ActionStatement) -> None:
+        return None
+
+    scheduler = _build_scheduler(
+        executor=executor,
+        actions=[
+            ActionStatement(
+                ref="scatter",
+                action="core.transform.scatter",
+                args={
+                    "collection": "${{ [1, 2] }}",
+                    "interval": "${{ TRIGGER.delay }}",
+                },
+            ),
+            ActionStatement(
+                ref="gather",
+                action="core.transform.gather",
+                args={"items": "${{ ACTIONS.scatter.result }}"},
+                depends_on=["scatter"],
+            ),
+        ],
+    )
+
+    task_exceptions = await scheduler.start()
+
+    assert task_exceptions is not None
+    assert set(task_exceptions) == {"scatter"}
+    info = task_exceptions["scatter"]
+    [classification] = extract_error_classifications(info.exception)
+    assert classification.kind is RuntimeErrorKind.WORKFLOW_EXPRESSION_INVALID
+    assert classification.owner is RuntimeErrorOwner.USER
+    assert classification.retry_disposition is RetryDisposition.NON_RETRYABLE
+    assert info.details.message.startswith(
+        "Scatter action 'scatter' has invalid arguments: interval:"
+    )

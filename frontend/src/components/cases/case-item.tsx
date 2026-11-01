@@ -1,6 +1,5 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
 import {
   Check,
   CircleIcon,
@@ -8,6 +7,8 @@ import {
   Copy,
   ExternalLink,
   ListIcon,
+  ListTreeIcon,
+  PanelRight,
   ShieldAlertIcon,
   SignalHighIcon,
   SignalIcon,
@@ -34,7 +35,11 @@ import {
   casesSetCaseDropdownValue,
   casesUpdateCase,
 } from "@/client"
-import { CaseBadge, CaseColumnBadge } from "@/components/cases/case-badge"
+import {
+  CaseBadge,
+  CaseColumnBadge,
+  tintColor,
+} from "@/components/cases/case-badge"
 import {
   PRIORITIES,
   SEVERITIES,
@@ -42,11 +47,8 @@ import {
 } from "@/components/cases/case-categories"
 import { CaseUserAvatar } from "@/components/cases/case-panel-common"
 import { UNASSIGNED } from "@/components/cases/case-panel-selectors"
-import {
-  EventCreatedAt,
-  EventUpdatedAt,
-} from "@/components/cases/cases-feed-event"
 import { DynamicLucideIcon } from "@/components/dynamic-lucide-icon"
+import { RowTimestamps } from "@/components/timestamps"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import {
   ContextMenu,
@@ -70,25 +72,11 @@ import {
 import { toast } from "@/components/ui/use-toast"
 import { User } from "@/lib/auth"
 import { formatCaseFieldDisplayLabel } from "@/lib/case-field-display"
-import { durationToHumanReadable, parseISODuration } from "@/lib/time"
+import { caseHref } from "@/lib/cases/urls"
+import { useQueryClient } from "@/lib/query"
+import { durationToHumanReadable, formatISODurationCompact } from "@/lib/time"
 import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
-
-function formatCompactDuration(duration: string): string | null {
-  try {
-    const parsed = parseISODuration(duration)
-    if (parsed.years) return `${parsed.years}y`
-    if (parsed.months) return `${parsed.months}mo`
-    if (parsed.weeks) return `${parsed.weeks}w`
-    if (parsed.days) return `${parsed.days}d`
-    if (parsed.hours) return `${parsed.hours}h`
-    if (parsed.minutes) return `${parsed.minutes}m`
-    if (parsed.seconds) return `${parsed.seconds}s`
-    return "0s"
-  } catch {
-    return null
-  }
-}
 
 function withBadgeTooltip(
   badge: ReactNode,
@@ -107,15 +95,6 @@ function withBadgeTooltip(
       </TooltipContent>
     </Tooltip>
   )
-}
-
-function formatFieldTooltipLabel(fieldId: string): string {
-  const normalized = fieldId.replace(/[_-]+/g, " ").trim()
-  if (!normalized) {
-    return fieldId
-  }
-
-  return normalized.charAt(0).toUpperCase() + normalized.slice(1)
 }
 
 function formatTooltipTimestamp(timestamp?: string | null): string | null {
@@ -157,12 +136,19 @@ interface CaseItemProps {
   onCheckChange?: (checked: boolean) => void
   onClick: () => void
   onDeleteRequest?: (caseData: CaseReadMinimal) => void
+  /** Adds an "Open in side panel" context menu item when set. */
+  onOpenInSidePanel?: (caseData: CaseReadMinimal) => void
   tags?: CaseTagRead[]
   members?: WorkspaceMember[]
   dropdownDefinitions?: CaseDropdownDefinitionRead[]
-  fieldTypesById?: ReadonlyMap<string, CaseFieldReadMinimal["type"]>
+  fieldMetadataById?: ReadonlyMap<
+    string,
+    Pick<CaseFieldReadMinimal, "display_name" | "type">
+  >
   durationNamesById?: ReadonlyMap<CaseDurationDefinitionRead["id"], string>
   visibleColumnIds?: string[]
+  /** Shows the hover checkbox for bulk selection. */
+  selectable?: boolean
 }
 
 export function CaseItem({
@@ -172,12 +158,14 @@ export function CaseItem({
   onCheckChange,
   onClick,
   onDeleteRequest,
+  onOpenInSidePanel,
   tags,
   members,
   dropdownDefinitions,
-  fieldTypesById,
+  fieldMetadataById,
   durationNamesById,
   visibleColumnIds,
+  selectable = true,
 }: CaseItemProps) {
   const workspaceId = useWorkspaceId()
   const queryClient = useQueryClient()
@@ -228,10 +216,8 @@ export function CaseItem({
         const fieldId = columnId.slice("field:".length)
         const value = caseData.field_values?.[fieldId]
         if (value != null) {
-          const label = formatCaseFieldDisplayLabel(
-            value,
-            fieldTypesById?.get(fieldId)
-          )
+          const fieldMetadata = fieldMetadataById?.get(fieldId)
+          const label = formatCaseFieldDisplayLabel(value, fieldMetadata?.type)
           const badge = (
             <CaseColumnBadge
               key={columnId}
@@ -240,7 +226,11 @@ export function CaseItem({
             />
           )
           badges.push(
-            withBadgeTooltip(badge, formatFieldTooltipLabel(fieldId), columnId)
+            withBadgeTooltip(
+              badge,
+              fieldMetadata?.display_name ?? fieldId,
+              columnId
+            )
           )
         }
       }
@@ -248,7 +238,7 @@ export function CaseItem({
     return badges.length > 0 ? badges : null
   }, [
     visibleColumnIds,
-    fieldTypesById,
+    fieldMetadataById,
     caseData.dropdown_values,
     caseData.field_values,
   ])
@@ -270,7 +260,9 @@ export function CaseItem({
         continue
       }
 
-      const formattedValue = formatCompactDuration(dur.duration)
+      const formattedValue = formatISODurationCompact(dur.duration, {
+        maxUnits: 1,
+      })
       if (!formattedValue) {
         continue
       }
@@ -530,28 +522,30 @@ export function CaseItem({
           )}
         >
           {/* Checkbox - flat design, hidden by default, shown on hover or when checked */}
-          <button
-            type="button"
-            className="flex h-7 w-7 shrink-0 items-center justify-center"
-            onClick={handleCheckboxClick}
-            role="checkbox"
-            aria-checked={isChecked}
-            aria-label={`Select case ${caseData.short_id}`}
-          >
-            <span
-              className={cn(
-                "flex size-4 shrink-0 items-center justify-center rounded-sm border transition-colors",
-                // Hidden by default, visible on hover or when checked
-                !isChecked && "opacity-0 group-hover/item:opacity-100",
-                // Flat design - no shadows
-                isChecked
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "border-muted-foreground/40 bg-transparent"
-              )}
+          {selectable && (
+            <button
+              type="button"
+              className="flex h-7 w-7 shrink-0 items-center justify-center"
+              onClick={handleCheckboxClick}
+              role="checkbox"
+              aria-checked={isChecked}
+              aria-label={`Select case ${caseData.short_id}`}
             >
-              {isChecked && <Check className="size-3" aria-hidden />}
-            </span>
-          </button>
+              <span
+                className={cn(
+                  "flex size-4 shrink-0 items-center justify-center rounded-sm border transition-colors",
+                  // Hidden by default, visible on hover or when checked
+                  !isChecked && "opacity-0 group-hover/item:opacity-100",
+                  // Flat design - no shadows
+                  isChecked
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-muted-foreground/40 bg-transparent"
+                )}
+              >
+                {isChecked && <Check className="size-3" aria-hidden />}
+              </span>
+            </button>
+          )}
 
           {/* Case ID + Summary + Badges */}
           <TooltipProvider delayDuration={0} skipDelayDuration={0}>
@@ -560,32 +554,65 @@ export function CaseItem({
               onClick={onClick}
               className="flex min-w-0 flex-1 items-center gap-3 bg-transparent p-0 text-left"
             >
-              <div className="flex min-w-0 flex-1 items-center gap-2">
-                <span className="shrink-0 text-xs font-medium text-muted-foreground">
-                  {caseData.short_id}
-                </span>
-                <span className="truncate text-xs">{caseData.summary}</span>
-                {/* Badges - right next to summary */}
-                {priorityConfig && (
-                  <CaseBadge
-                    value={caseData.priority}
-                    label={priorityConfig.label}
-                    icon={priorityConfig.icon}
-                    color={priorityConfig.color}
-                    className="h-5 shrink-0 px-1.5 py-0 text-[10px]"
-                  />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+                  <span className="shrink-0 text-xs font-medium text-muted-foreground">
+                    {caseData.short_id}
+                  </span>
+                  <span className="truncate text-xs">{caseData.summary}</span>
+                  {caseData.parent && (
+                    <span
+                      className="shrink-0 text-[10px] text-muted-foreground"
+                      title={`Sub-case of ${caseData.parent.short_id}: ${caseData.parent.summary}`}
+                    >
+                      ↳ {caseData.parent.short_id}
+                    </span>
+                  )}
+                  {caseData.num_sub_cases > 0 && (
+                    <span
+                      className="inline-flex h-5 shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 text-[10px] text-muted-foreground"
+                      title={`${caseData.num_sub_cases} sub-case${caseData.num_sub_cases === 1 ? "" : "s"}`}
+                    >
+                      <ListTreeIcon className="size-3" aria-hidden />
+                      {caseData.num_sub_cases}
+                    </span>
+                  )}
+                  {/* Badges - right next to summary */}
+                  {priorityConfig && (
+                    <CaseBadge
+                      value={caseData.priority}
+                      label={priorityConfig.label}
+                      icon={priorityConfig.icon}
+                      color={priorityConfig.color}
+                      className="h-5 shrink-0 px-1.5 py-0 text-[10px]"
+                    />
+                  )}
+                  {severityConfig && (
+                    <CaseBadge
+                      value={caseData.severity}
+                      label={severityConfig.label}
+                      icon={severityConfig.icon}
+                      color={severityConfig.color}
+                      className="h-5 shrink-0 px-1.5 py-0 text-[10px]"
+                    />
+                  )}
+                  {/* Custom column badges */}
+                  {summaryColumnBadges}
+                </div>
+                {caseData.search_match && (
+                  <div className="mt-1 truncate text-[11px] text-muted-foreground">
+                    <span className="font-medium">
+                      Matched{" "}
+                      {caseData.search_match.matched_columns?.join(", ")}
+                    </span>
+                    {(caseData.search_match.excerpts?.length ?? 0) > 0 && (
+                      <span>
+                        {" "}
+                        · {caseData.search_match.excerpts?.join(" · ")}
+                      </span>
+                    )}
+                  </div>
                 )}
-                {severityConfig && (
-                  <CaseBadge
-                    value={caseData.severity}
-                    label={severityConfig.label}
-                    icon={severityConfig.icon}
-                    color={severityConfig.color}
-                    className="h-5 shrink-0 px-1.5 py-0 text-[10px]"
-                  />
-                )}
-                {/* Custom column badges */}
-                {summaryColumnBadges}
               </div>
 
               {/* Tags - right aligned */}
@@ -601,7 +628,7 @@ export function CaseItem({
                       style={
                         tag.color
                           ? {
-                              backgroundColor: `${tag.color}20`,
+                              backgroundColor: tintColor(tag.color),
                               color: tag.color,
                             }
                           : undefined
@@ -639,10 +666,10 @@ export function CaseItem({
               )}
 
               {/* Timestamps */}
-              <div className="flex shrink-0 items-center gap-2">
-                <EventCreatedAt createdAt={caseData.created_at} />
-                <EventUpdatedAt updatedAt={caseData.updated_at} />
-              </div>
+              <RowTimestamps
+                createdAt={caseData.created_at}
+                updatedAt={caseData.updated_at}
+              />
             </button>
           </TooltipProvider>
         </div>
@@ -650,7 +677,7 @@ export function CaseItem({
       <ContextMenuContent className="w-48">
         <ContextMenuItem asChild className="text-xs">
           <Link
-            href={`/workspaces/${workspaceId}/cases/${caseData.id}`}
+            href={caseHref(workspaceId, caseData.id)}
             target="_blank"
             rel="noopener noreferrer"
           >
@@ -658,6 +685,16 @@ export function CaseItem({
             Open in new tab
           </Link>
         </ContextMenuItem>
+
+        {onOpenInSidePanel && (
+          <ContextMenuItem
+            className="text-xs"
+            onClick={() => onOpenInSidePanel(caseData)}
+          >
+            <PanelRight className="mr-2 size-3.5" />
+            Open in side panel
+          </ContextMenuItem>
+        )}
 
         <ContextMenuItem className="text-xs" onClick={handleCopyId}>
           <Copy className="mr-2 size-3.5" />
@@ -902,15 +939,18 @@ export function CaseItem({
           )
         })}
 
-        <ContextMenuSeparator />
-
-        <ContextMenuItem
-          className="text-xs text-rose-500 focus:text-rose-600"
-          onClick={() => onDeleteRequest?.(caseData)}
-        >
-          <Trash2 className="mr-2 size-3.5" />
-          Delete
-        </ContextMenuItem>
+        {onDeleteRequest && (
+          <>
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              className="text-xs text-rose-500 focus:text-rose-600"
+              onClick={() => onDeleteRequest(caseData)}
+            >
+              <Trash2 className="mr-2 size-3.5" />
+              Delete
+            </ContextMenuItem>
+          </>
+        )}
       </ContextMenuContent>
     </ContextMenu>
   )

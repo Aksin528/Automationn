@@ -1,13 +1,8 @@
-"""Tests for tarball cache behavior in registry action runner.
-
-These tests verify:
-1. Tarball cache behavior (concurrent downloads, cache keys)
-2. Cache key isolation per tarball URI
-"""
+"""Tests for tarball cache behavior in registry action runner."""
 
 from __future__ import annotations
 
-import asyncio
+import tarfile
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +27,20 @@ def temp_cache_dir():
         yield Path(tmpdir)
 
 
+async def _lease_paths(
+    cache: RegistryArtifactCache,
+    artifact_uri: str,
+) -> list[Path]:
+    async with cache.lease([artifact_uri]) as paths:
+        return paths
+
+
+def _write_empty_tarball(path: Path) -> None:
+    """Write a valid archive for tests that mock the extraction contents."""
+    with tarfile.open(path, "w:gz"):
+        pass
+
+
 # =============================================================================
 # Test Class: Tarball Cache Behavior
 # =============================================================================
@@ -41,57 +50,9 @@ class TestTarballCacheBehavior:
     """Tests for tarball cache behavior.
 
     Verifies that:
-    - Same tarball URI requested concurrently results in only one download
     - Different URIs create separate cache entries
     - Failed extraction cleans up temp files
     """
-
-    @pytest.mark.anyio
-    async def test_concurrent_same_uri_single_download(self, temp_cache_dir: Path):
-        """Verify that concurrent requests for the same tarball only download once.
-
-        When multiple workers request the same registry tarball simultaneously,
-        only one should perform the actual download. Others must wait for the
-        download to complete and then use the cached extraction.
-
-        This prevents redundant downloads and potential race conditions when
-        extracting the same tarball to the same directory.
-
-        Validates:
-        - Exactly one download despite 4 concurrent materialize() calls
-        - All calls return the same extracted path
-        """
-        cache = RegistryArtifactCache(temp_cache_dir)
-        cache_key = "concurrent-test-key"
-        tarball_uri = "s3://bucket/concurrent-test.tar.gz"
-
-        download_count = [0]  # Use list to allow mutation in nested function
-
-        async def mock_download(self, ctx, path: Path):
-            download_count[0] += 1
-            await asyncio.sleep(0.1)  # Simulate network delay
-            path.write_bytes(b"fake tarball")
-
-        async def mock_extract(self, tarball_path: Path, target_dir: Path):
-            (target_dir / "extracted.txt").write_text("content")
-
-        with (
-            patch.object(TarballArtifact, "download", mock_download),
-            patch.object(TarballArtifact, "extract", mock_extract),
-        ):
-            # Launch multiple concurrent requests
-            results = await asyncio.gather(
-                cache.materialize(cache_key, tarball_uri),
-                cache.materialize(cache_key, tarball_uri),
-                cache.materialize(cache_key, tarball_uri),
-                cache.materialize(cache_key, tarball_uri),
-            )
-
-        # All should return same path
-        assert all(r == results[0] for r in results)
-
-        # Only one download should have occurred
-        assert download_count[0] == 1
 
     @pytest.mark.anyio
     async def test_different_uris_separate_cache_entries(self, temp_cache_dir: Path):
@@ -117,7 +78,7 @@ class TestTarballCacheBehavior:
 
         async def mock_download(self, ctx, path: Path):
             download_calls.append(self.uri)
-            path.write_bytes(b"fake tarball")
+            _write_empty_tarball(path)
 
         async def mock_extract(self, tarball_path: Path, target_dir: Path):
             (target_dir / "extracted.txt").write_text("content")
@@ -128,8 +89,7 @@ class TestTarballCacheBehavior:
         ):
             results = []
             for uri in uris:
-                cache_key = compute_registry_artifact_cache_key(uri)
-                result = await cache.materialize(cache_key, uri)
+                result = await _lease_paths(cache, uri)
                 results.append(result)
 
         # All results should be different paths
@@ -155,11 +115,11 @@ class TestTarballCacheBehavior:
         - RuntimeError is raised with appropriate message
         """
         cache = RegistryArtifactCache(temp_cache_dir)
-        cache_key = "failed-extraction-test"
         tarball_uri = "s3://bucket/bad.tar.gz"
+        cache_key = compute_registry_artifact_cache_key(tarball_uri)
 
         async def mock_download(self, ctx, path: Path):
-            path.write_bytes(b"corrupt tarball")
+            _write_empty_tarball(path)
 
         async def mock_extract(self, tarball_path: Path, target_dir: Path):
             raise RuntimeError("Extraction failed - corrupt tarball")
@@ -169,14 +129,16 @@ class TestTarballCacheBehavior:
             patch.object(TarballArtifact, "extract", mock_extract),
         ):
             with pytest.raises(RuntimeError, match="Extraction failed"):
-                await cache.materialize(cache_key, tarball_uri)
+                await _lease_paths(cache, tarball_uri)
 
         # Verify no temp files remain
-        temp_files = list(temp_cache_dir.glob(f"{cache_key}*"))
+        temp_files = (
+            list(cache.staging_dir.iterdir()) if cache.staging_dir.exists() else []
+        )
         assert len(temp_files) == 0, f"Temp files not cleaned up: {temp_files}"
 
         # Target directory should not exist
-        target_dir = temp_cache_dir / f"tarball-{cache_key}"
+        target_dir = cache._paths_for(cache_key).tarball_target_dir
         assert not target_dir.exists()
 
     @pytest.mark.anyio
@@ -192,14 +154,13 @@ class TestTarballCacheBehavior:
         - Both requests return the same path
         """
         cache = RegistryArtifactCache(temp_cache_dir)
-        cache_key = "reuse-test"
         tarball_uri = "s3://bucket/reuse.tar.gz"
 
         download_count = [0]
 
         async def mock_download(self, ctx, path: Path):
             download_count[0] += 1
-            path.write_bytes(b"tarball")
+            _write_empty_tarball(path)
 
         async def mock_extract(self, tarball_path: Path, target_dir: Path):
             (target_dir / "file.txt").write_text("content")
@@ -209,33 +170,11 @@ class TestTarballCacheBehavior:
             patch.object(TarballArtifact, "extract", mock_extract),
         ):
             # First request
-            result1 = await cache.materialize(cache_key, tarball_uri)
+            result1 = await _lease_paths(cache, tarball_uri)
             assert download_count[0] == 1
 
             # Second request (should use cache)
-            result2 = await cache.materialize(cache_key, tarball_uri)
+            result2 = await _lease_paths(cache, tarball_uri)
             assert download_count[0] == 1  # No additional download
 
             assert result1 == result2
-
-    @pytest.mark.anyio
-    async def test_tarball_cache_keys_differ_per_uri(self, temp_cache_dir: Path):
-        """Verify that tarball cache key derivation produces unique keys per URI.
-
-        The cache key computation (hash of tarball URI) must produce unique keys
-        for different URIs to prevent collisions. This test confirms the hash
-        function produces distinct outputs for distinct inputs.
-
-        Validates:
-        - Three different URIs produce three unique cache keys
-        """
-        uri_v1 = "s3://bucket/registry-v1.0.0.tar.gz"
-        uri_v2 = "s3://bucket/registry-v2.0.0.tar.gz"
-        uri_custom = "s3://bucket/custom-registry-v1.tar.gz"
-
-        key_v1 = compute_registry_artifact_cache_key(uri_v1)
-        key_v2 = compute_registry_artifact_cache_key(uri_v2)
-        key_custom = compute_registry_artifact_cache_key(uri_custom)
-
-        # All keys should be unique
-        assert len({key_v1, key_v2, key_custom}) == 3

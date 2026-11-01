@@ -26,10 +26,11 @@ Architecture:
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Never
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     import tempfile
@@ -57,7 +58,15 @@ with workflow.unsafe.imports_passed_through():
         RegistrySyncRequest,
         RegistrySyncResult,
     )
+    from tracecat.runtime.errors import (
+        RetryDisposition,
+        RuntimeErrorClassification,
+        RuntimeErrorKind,
+    )
     from tracecat.storage import blob
+    from tracecat.temporal.errors import raise_application_error_from_classification
+
+REGISTRY_SYNC_WORKFLOW_EXECUTION_TIMEOUT = timedelta(minutes=20)
 
 
 @workflow.defn
@@ -86,7 +95,6 @@ class RegistrySyncWorkflow:
             origin_type=request.origin_type,
         )
 
-        # Execute the sync activity with start_to_close timeout only.
         # We don't use heartbeat_timeout because the subprocess operations
         # (package install, action discovery) can take several minutes without
         # natural checkpoints for heartbeating.
@@ -94,6 +102,14 @@ class RegistrySyncWorkflow:
             sync_registry_activity,
             request,
             start_to_close_timeout=timedelta(minutes=15),
+            # Bounded retries fail the workflow before its own timeout expires.
+            schedule_to_close_timeout=(
+                REGISTRY_SYNC_WORKFLOW_EXECUTION_TIMEOUT - timedelta(minutes=2)
+            ),
+            retry_policy=RetryPolicy(
+                maximum_attempts=2,
+                initial_interval=timedelta(seconds=5),
+            ),
         )
 
         workflow.logger.info(
@@ -162,6 +178,22 @@ class RegistryArtifactsBackfillWorkflow:
         )
 
 
+def _raise_registry_sync_validation_error(
+    message: str,
+    *,
+    cause: BaseException | None = None,
+) -> Never:
+    """Raise an attributed, non-retryable registry content failure."""
+    raise_application_error_from_classification(
+        RuntimeErrorClassification.user(
+            kind=RuntimeErrorKind.REGISTRY_SYNC_VALIDATION_FAILED,
+            message=message,
+            retry_disposition=RetryDisposition.NON_RETRYABLE,
+            cause=cause,
+        )
+    )
+
+
 @activity.defn
 async def sync_registry_activity(request: RegistrySyncRequest) -> RegistrySyncResult:
     """Execute registry sync with nsjail sandboxing.
@@ -196,20 +228,12 @@ async def sync_registry_activity(request: RegistrySyncRequest) -> RegistrySyncRe
     except RegistrySyncValidationError as exc:
         # Validation failures are caused by repository content, not worker
         # capacity. Fail fast so users see the actionable error immediately.
-        raise ApplicationError(
-            str(exc),
-            non_retryable=True,
-            type="RegistrySyncValidationError",
-        ) from exc
+        _raise_registry_sync_validation_error(str(exc), cause=exc)
     except ActionDiscoveryError as exc:
         if exc.non_retryable:
             # Some discovery failures are deterministic content errors, such as
             # template parsing failures. Keep transient subprocess failures retryable.
-            raise ApplicationError(
-                str(exc),
-                non_retryable=True,
-                type="RegistrySyncValidationError",
-            ) from exc
+            _raise_registry_sync_validation_error(str(exc), cause=exc)
         raise
 
     if result.validation_errors:
@@ -221,14 +245,10 @@ async def sync_registry_activity(request: RegistrySyncRequest) -> RegistrySyncRe
             if first_error is not None and first_error.details
             else ""
         )
-        raise ApplicationError(
-            (
-                "Registry sync validation failed: "
-                f"{error_count} validation error(s). "
-                f"First error in '{first_action}': {first_detail}"
-            ),
-            non_retryable=True,
-            type="RegistrySyncValidationError",
+        _raise_registry_sync_validation_error(
+            "Registry sync validation failed: "
+            f"{error_count} validation error(s). "
+            f"First error in '{first_action}': {first_detail}"
         )
 
     logger.info(

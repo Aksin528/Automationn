@@ -73,3 +73,9 @@ def test_get_platform_catalog_models_filters_malformed_entries(
             metadata={"family": "gpt"},
         )
     ]
+
+
+def test_bundled_platform_catalog_loads() -> None:
+    entries = loader.get_platform_catalog_models()
+
+    assert {entry.model_provider for entry in entries} >= {"openai", "anthropic"}

@@ -48,7 +48,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { useCaseTagCatalog } from "@/lib/hooks"
+import { createCaseFieldDisplayNameMap } from "@/lib/case-field-display"
+import { useCaseFields, useCaseTagCatalog } from "@/lib/hooks"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 interface CaseDurationsTableProps {
@@ -111,6 +112,7 @@ export function CaseDurationsTable({
   const { caseTags } = useCaseTagCatalog(workspaceId ?? "", {
     enabled: Boolean(workspaceId),
   })
+  const { caseFields } = useCaseFields(workspaceId ?? "", Boolean(workspaceId))
 
   const tagLabelByRef = useMemo(() => {
     const map = new Map<string, string>()
@@ -124,6 +126,10 @@ export function CaseDurationsTable({
 
     return map
   }, [caseTags])
+  const caseFieldDisplayNameById = useMemo(
+    () => createCaseFieldDisplayNameMap(caseFields),
+    [caseFields]
+  )
 
   const handleUpdateDialogChange = (open: boolean) => {
     setIsUpdateDialogOpen(open)
@@ -167,6 +173,8 @@ export function CaseDurationsTable({
           valueLabels.push(option?.label ?? value)
         } else if (isCaseTagEventType(anchor.event_type)) {
           valueLabels.push(tagLabelByRef.get(value) ?? value)
+        } else if (isCaseFieldEventType(anchor.event_type)) {
+          valueLabels.push(caseFieldDisplayNameById.get(value) ?? value)
         } else {
           valueLabels.push(value)
         }
@@ -309,7 +317,7 @@ export function CaseDurationsTable({
                           className="text-rose-500 focus:text-rose-600"
                           onClick={() => setSelectedDuration(row.original)}
                         >
-                          Delete duration
+                          Delete
                         </DropdownMenuItem>
                       </AlertDialogTrigger>
                     </DropdownMenuContent>

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import uuid
+from typing import cast
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.exc import IntegrityError, NoResultFound
 
 from tracecat import config
 from tracecat.auth.credentials import RoleACL
+from tracecat.auth.dependencies import OrgActorRole
 from tracecat.auth.types import Role
 from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.engine import get_async_session_context_manager
+from tracecat.db.errors import is_unique_violation
 from tracecat.db.models import RegistryRepository
 from tracecat.exceptions import (
     EntitlementRequired,
@@ -23,6 +26,7 @@ from tracecat.exceptions import (
 )
 from tracecat.git.utils import list_git_commits, parse_git_url
 from tracecat.logger import logger
+from tracecat.parse import safe_url
 from tracecat.registry.actions.service import RegistryActionsService
 from tracecat.registry.common import ensure_org_repositories
 from tracecat.registry.constants import DEFAULT_REGISTRY_ORIGIN, REGISTRY_REPOS_PATH
@@ -47,6 +51,14 @@ from tracecat.tiers.entitlements import Entitlement, check_entitlement
 
 router = APIRouter(prefix=REGISTRY_REPOS_PATH, tags=["registry-repositories"])
 
+_NO_REGISTRY_SSH_KEY_DETAIL = "No registry SSH key configured"
+
+
+async def _get_configured_custom_registry_origin(role: Role) -> str | None:
+    remote_url = cast(str | None, await get_setting("git_repo_url", role=role))
+    return safe_url(remote_url) if remote_url else None
+
+
 # Controls
 
 
@@ -65,11 +77,7 @@ router = APIRouter(prefix=REGISTRY_REPOS_PATH, tags=["registry-repositories"])
 @require_scope("org:registry:update")
 async def sync_registry_repository(
     *,
-    role: Role = RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-    ),
+    role: OrgActorRole,
     session: AsyncDBSession,
     repository_id: uuid.UUID,
     sync_params: RegistryRepositorySync | None = None,
@@ -189,6 +197,7 @@ async def list_registry_repositories(
     """
     # Ensure org-scoped repos exist before listing
     await ensure_org_repositories(session, role)
+    configured_origin = await _get_configured_custom_registry_origin(role)
 
     stmt = select(
         RegistryRepository.id,
@@ -197,6 +206,14 @@ async def list_registry_repositories(
         RegistryRepository.commit_sha,
         RegistryRepository.current_version_id,
     ).where(RegistryRepository.organization_id == role.organization_id)
+
+    if configured_origin:
+        stmt = stmt.order_by(
+            case((RegistryRepository.origin == configured_origin, 0), else_=1),
+            RegistryRepository.surrogate_id.asc(),
+        )
+    else:
+        stmt = stmt.order_by(RegistryRepository.surrogate_id.asc())
 
     result = await session.execute(stmt)
     rows = result.tuples().all()
@@ -309,7 +326,7 @@ async def list_repository_commits(
             if ssh_env is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No SSH key found for git operations",
+                    detail=_NO_REGISTRY_SSH_KEY_DETAIL,
                 )
 
             # List commits from the repository
@@ -330,6 +347,8 @@ async def list_repository_commits(
 
             return commits
 
+    except HTTPException:
+        raise
     except ValueError as e:
         logger.error("Invalid git URL", origin=repo.origin, error=str(e))
         raise HTTPException(
@@ -341,6 +360,12 @@ async def list_repository_commits(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to list commits: {str(e)}",
+        ) from e
+    except TracecatCredentialsNotFoundError as e:
+        logger.warning(_NO_REGISTRY_SSH_KEY_DETAIL, origin=repo.origin)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_NO_REGISTRY_SSH_KEY_DETAIL,
         ) from e
     except Exception as e:
         logger.error("Unexpected error listing commits", exc=e)
@@ -381,11 +406,11 @@ async def create_registry_repository(
     try:
         created_repository = await service.create_repository(params)
     except IntegrityError as e:
-        msg = str(e)
-        logger.error("Error creating registry repository", exc=e)
+        if not is_unique_violation(e, "uq_registry_repository_organization_id_origin"):
+            raise
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=msg,
+            detail="Registry repository already exists",
         ) from e
     except TracecatValidationError as e:
         logger.error("Error creating registry repository", exc=e)
@@ -444,7 +469,15 @@ async def update_registry_repository(
 
     await check_entitlement(session, role, Entitlement.CUSTOM_REGISTRY)
 
-    updated_repository = await repos_service.update_repository(repository, params)
+    try:
+        updated_repository = await repos_service.update_repository(repository, params)
+    except IntegrityError as e:
+        if not is_unique_violation(e, "uq_registry_repository_organization_id_origin"):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Registry repository already exists",
+        ) from e
     actions = await actions_service.list_actions_from_index_by_repository(repository_id)
     return RegistryRepositoryRead(
         id=updated_repository.id,

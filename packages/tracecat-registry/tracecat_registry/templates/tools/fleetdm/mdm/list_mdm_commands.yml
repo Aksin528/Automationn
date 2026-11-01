@@ -1,0 +1,67 @@
+type: action
+definition:
+  title: List MDM commands
+  description: List MDM commands issued to a host, optionally filtered by request type and status.
+  display_group: Fleet
+  doc_url: https://fleetdm.com/docs/rest-api/rest-api#list-mdm-commands
+  namespace: tools.fleetdm
+  name: list_mdm_commands
+  secrets:
+    - name: fleetdm
+      keys: ["FLEETDM_API_TOKEN"]
+  expects:
+    base_url:
+      type: str
+      description: Fleet server base URL (e.g. https://fleet.example.com).
+    host_identifier:
+      type: str
+      description: Host hostname, UUID, or hardware serial to scope commands to (required by Fleet; omitting it is deprecated and removed in Fleet 5).
+    request_type:
+      type: str | None
+      description: Filter by MDM command request type (e.g. DeviceLock, EraseDevice).
+      default: null
+    command_status:
+      type: str | None
+      description: Filter by command status (ran, pending, failed).
+      default: null
+    page:
+      type: int
+      description: Page number to retrieve (0-indexed).
+      default: 0
+    per_page:
+      type: int
+      description: Results per page. Maximum is 1,000 records.
+      default: 50
+    order_key:
+      type: str | None
+      description: 'What to order results by. Allowed values: `host_uuid`, `command_uuid`, `status`,
+        `updated_at`, `request_type`, `hostname`. Default is `updated_at`.'
+      default: null
+    order_direction:
+      type: str | None
+      description: '**Requires `order_key`**. The direction of the order given the order key. Options
+        include `"asc"` and `"desc"`. Default is `"asc"`.'
+      default: null
+    after:
+      type: str | None
+      description: The value to get results after. This needs `order_key` defined, as that's the column
+        that would be used.
+      default: null
+  steps:
+    - ref: list_commands
+      action: core.http_request
+      args:
+        url: ${{ inputs.base_url }}/api/v1/fleet/commands
+        method: GET
+        headers:
+          Authorization: Bearer ${{ SECRETS.fleetdm.FLEETDM_API_TOKEN }}
+        params:
+          host_identifier: ${{ inputs.host_identifier }}
+          request_type: ${{ inputs.request_type }}
+          command_status: ${{ inputs.command_status }}
+          page: ${{ inputs.page }}
+          per_page: ${{ inputs.per_page }}
+          order_key: ${{ inputs.order_key }}
+          order_direction: ${{ inputs.order_direction }}
+          after: ${{ inputs.after }}
+  returns: ${{ steps.list_commands.result.data }}

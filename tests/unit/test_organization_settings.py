@@ -1,22 +1,31 @@
+import uuid
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import orjson
 import pytest
 from fastapi import HTTPException
+from pydantic import HttpUrl
+from pydantic_core import to_jsonable_python
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat import config
+from tracecat.agent.otel_config import AgentOtelConfig
 from tracecat.auth.enums import AuthType
 from tracecat.auth.types import Role
 from tracecat.contexts import ctx_role
 from tracecat.db.models import OrganizationDomain
+from tracecat.exceptions import TracecatConflictError
 from tracecat.organization.domains import normalize_domain
+from tracecat.settings import service as settings_service_module
 from tracecat.settings.constants import SENSITIVE_SETTINGS_KEYS
 from tracecat.settings.router import (
     check_other_auth_enabled,
     check_saml_domain_prerequisites,
 )
 from tracecat.settings.schemas import (
+    AgentOtelSettingsUpdate,
     AuditSettingsUpdate,
     GitSettingsUpdate,
     SAMLSettingsUpdate,
@@ -24,7 +33,13 @@ from tracecat.settings.schemas import (
     SettingUpdate,
     ValueType,
 )
-from tracecat.settings.service import SettingsService, get_setting, get_setting_override
+from tracecat.settings.service import (
+    AgentOtelEndpointNotAllowedError,
+    SettingsService,
+    get_setting,
+    get_setting_override,
+    workspace_allows_error_details,
+)
 
 pytestmark = pytest.mark.usefixtures("db")
 
@@ -78,6 +93,15 @@ async def test_create_and_get_org_setting(
     assert settings_service.get_value(retrieved_setting) == settings_service.get_value(
         created_setting
     )
+
+
+@pytest.mark.anyio
+async def test_duplicate_setting_key_is_conflict(
+    settings_service: SettingsService, create_params: SettingCreate
+) -> None:
+    await settings_service.create_org_setting(create_params)
+    with pytest.raises(TracecatConflictError):
+        await settings_service.create_org_setting(create_params)
 
 
 @pytest.mark.anyio
@@ -221,30 +245,50 @@ async def test_update_git_settings(
 @pytest.mark.anyio
 async def test_update_audit_settings(
     settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ensure audit webhook updates persist."""
     service = settings_service_with_defaults
+    clear_audit_cache = MagicMock()
+    monkeypatch.setattr(
+        settings_service_module,
+        "clear_audit_setting_cache",
+        clear_audit_cache,
+    )
     await service.update_audit_settings(
         AuditSettingsUpdate(audit_webhook_url="https://example.com/audit")
     )
     settings = await service.list_org_settings(keys={"audit_webhook_url"})
     settings_dict = {setting.key: service.get_value(setting) for setting in settings}
     assert settings_dict["audit_webhook_url"] == "https://example.com/audit"
+    clear_audit_cache.assert_called_once_with()
 
 
 @pytest.mark.anyio
-async def test_update_audit_settings_can_clear(
+async def test_update_audit_settings_persists_falsy_values_and_can_clear(
     settings_service_with_defaults: SettingsService,
 ) -> None:
-    """Ensure audit webhook can be unset."""
+    """Falsy delivery options persist, and the webhook URL can be unset."""
     service = settings_service_with_defaults
     await service.update_audit_settings(
-        AuditSettingsUpdate(audit_webhook_url="https://example.com/audit")
+        AuditSettingsUpdate(
+            audit_webhook_url="https://example.com/audit",
+            audit_webhook_verify_ssl=False,
+            audit_webhook_payload_attribute="event",
+        )
     )
     await service.update_audit_settings(AuditSettingsUpdate(audit_webhook_url=None))
-    settings = await service.list_org_settings(keys={"audit_webhook_url"})
+
+    keys = {
+        "audit_webhook_url",
+        "audit_webhook_verify_ssl",
+        "audit_webhook_payload_attribute",
+    }
+    settings = await service.list_org_settings(keys=keys)
     settings_dict = {setting.key: service.get_value(setting) for setting in settings}
     assert settings_dict["audit_webhook_url"] is None
+    assert settings_dict["audit_webhook_verify_ssl"] is False
+    assert settings_dict["audit_webhook_payload_attribute"] == "event"
 
 
 @pytest.mark.anyio
@@ -289,99 +333,12 @@ async def test_update_audit_custom_payload_encrypted_at_rest(
     assert setting.value != orjson.dumps(custom_payload, option=orjson.OPT_SORT_KEYS)
 
 
-@pytest.mark.anyio
-async def test_update_audit_verify_ssl_setting(
-    settings_service_with_defaults: SettingsService,
-) -> None:
-    """Ensure SSL verification toggle is persisted for audit webhook delivery."""
-    service = settings_service_with_defaults
-    await service.update_audit_settings(
-        AuditSettingsUpdate(audit_webhook_verify_ssl=False)
-    )
-
-    settings = await service.list_org_settings(keys={"audit_webhook_verify_ssl"})
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
-    assert settings_dict["audit_webhook_verify_ssl"] is False
-
-
-@pytest.mark.anyio
-async def test_update_audit_payload_attribute_setting(
-    settings_service_with_defaults: SettingsService,
-) -> None:
-    """Ensure payload wrapper attribute is persisted for audit webhook delivery."""
-    service = settings_service_with_defaults
-    await service.update_audit_settings(
-        AuditSettingsUpdate(audit_webhook_payload_attribute="event")
-    )
-
-    settings = await service.list_org_settings(keys={"audit_webhook_payload_attribute"})
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
-    assert settings_dict["audit_webhook_payload_attribute"] == "event"
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "valid_url",
-    [
-        "git+ssh://git@github.com/org/repo.git",
-        "git+ssh://git@gitlab.example.com:2222/org/repo.git",
-        "git+ssh://git@gitlab.com/org/team/subteam/repo.git",
-        "git+ssh://git@github.com/org/repo.git@main",
-        "git+ssh://git@github.com/org/repo.git@feature/custom-branch",
-        "git+ssh://git@github.com/org/repo",  # Without .git suffix
-        "git+ssh://git@example.com/very/deep/nested/org/repo.git",
-        "git+ssh://someuser@git.example.com/very/deep/nested/org/repo.git",
-    ],
-)
-async def test_git_settings_valid_ssh_urls(
-    settings_service_with_defaults: SettingsService,
-    valid_url: str,
-) -> None:
-    """Test that valid Git SSH URLs are accepted."""
-    service = settings_service_with_defaults
-
-    # This should not raise an exception
-    test_params = GitSettingsUpdate(git_repo_url=valid_url)
-    await service.update_git_settings(test_params)
-
-    # Verify the URL was saved
-    git_settings = await service.list_org_settings(keys={"git_repo_url"})
-    settings_dict = {
-        setting.key: service.get_value(setting) for setting in git_settings
-    }
-    assert settings_dict["git_repo_url"] == valid_url
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "invalid_url",
-    [
-        "https://github.com/org/repo.git",  # Wrong protocol
-        "git+ssh://github.com/org/repo.git",  # Missing SSH user
-        "git+ssh://git@github.com/",  # No path
-        "git+ssh://git@/org/repo.git",  # No host
-        "git://git@github.com/org/repo.git",  # Missing +ssh
-        "not-a-url",  # Not a URL at all
-        "",  # Empty string
-        "git+ssh://git@github.com:not_a_port/org/repo.git",  # Non numeric port
-        "git+ssh://git@github.com:/org/repo.git",  # Missing port after colon
-        "git+ssh://git@github.com/repo.git",  # Missing org segment
-    ],
-)
-async def test_git_settings_invalid_ssh_urls(
-    settings_service_with_defaults: SettingsService,
-    invalid_url: str,
-) -> None:
-    """Test that invalid Git SSH URLs are rejected."""
+def test_git_settings_rejects_invalid_ssh_url() -> None:
+    """GitSettingsUpdate applies the shared Git SSH URL regex."""
     from pydantic import ValidationError
 
-    # This should raise a ValidationError
-    with pytest.raises(ValidationError) as exc_info:
-        GitSettingsUpdate(git_repo_url=invalid_url)
-
-    # Verify the error message mentions Git SSH URL
-    error_detail = str(exc_info.value)
-    assert "Must be a valid Git SSH URL" in error_detail
+    with pytest.raises(ValidationError, match="Must be a valid Git SSH URL"):
+        GitSettingsUpdate(git_repo_url="https://github.com/org/repo.git")
 
 
 @pytest.mark.anyio
@@ -424,6 +381,109 @@ async def test_update_saml_settings(
     assert settings_dict["saml_idp_metadata_url"] == "https://test-idp.com"
 
 
+@pytest.fixture
+def allow_agent_otel_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve the example collector to a public address without real DNS."""
+
+    async def _noop(url: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        settings_service_module, "validate_url_resolves_public_async", _noop
+    )
+
+
+@pytest.mark.anyio
+async def test_update_agent_otel_settings_encrypts_headers(
+    settings_service_with_defaults: SettingsService,
+    allow_agent_otel_endpoint: None,
+) -> None:
+    service = settings_service_with_defaults
+    await service.update_agent_otel_settings(
+        AgentOtelSettingsUpdate(
+            agent_otel_config=AgentOtelConfig(
+                enabled=True,
+                endpoint=HttpUrl("https://collector.example.com"),
+                logs_enabled=False,
+            ),
+            agent_otel_headers={"Authorization": "Bearer token"},
+        )
+    )
+
+    settings = await service.list_org_settings(
+        keys={"agent_otel_config", "agent_otel_headers"}
+    )
+    settings_by_key = {setting.key: setting for setting in settings}
+
+    assert service.get_value(settings_by_key["agent_otel_config"]) == {
+        "enabled": True,
+        "endpoint": "https://collector.example.com/",
+        "logs_enabled": False,
+    }
+    assert settings_by_key["agent_otel_headers"].is_encrypted is True
+    assert service.get_value(settings_by_key["agent_otel_headers"]) == {
+        "Authorization": "Bearer token"
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "endpoint",
+    ["http://127.0.0.1:4318", "http://169.254.169.254"],
+    ids=["loopback", "link-local"],
+)
+async def test_update_agent_otel_settings_rejects_private_endpoint(
+    settings_service_with_defaults: SettingsService,
+    endpoint: str,
+) -> None:
+    """A collector on a private address is rejected and never persisted."""
+    service = settings_service_with_defaults
+
+    with pytest.raises(AgentOtelEndpointNotAllowedError) as exc_info:
+        await service.update_agent_otel_settings(
+            AgentOtelSettingsUpdate(
+                agent_otel_config=AgentOtelConfig(
+                    enabled=True, endpoint=HttpUrl(endpoint)
+                ),
+                agent_otel_headers={"Authorization": "Bearer token"},
+            )
+        )
+
+    # The rejection must not echo the resolved address back to the caller.
+    assert endpoint.split("//")[1] not in str(exc_info.value)
+    settings = await service.list_org_settings(
+        keys={"agent_otel_config", "agent_otel_headers"}
+    )
+    values, _ = service.get_values_with_decryption_fallback(settings)
+    assert values.get("agent_otel_config", {}).get("endpoint") is None
+
+
+@pytest.mark.anyio
+async def test_update_agent_otel_settings_skips_validation_when_disabled(
+    settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabled telemetry never resolves the endpoint host."""
+    calls: list[str] = []
+
+    async def _record(url: str) -> None:
+        calls.append(url)
+
+    monkeypatch.setattr(
+        settings_service_module, "validate_url_resolves_public_async", _record
+    )
+
+    await settings_service_with_defaults.update_agent_otel_settings(
+        AgentOtelSettingsUpdate(
+            agent_otel_config=AgentOtelConfig(
+                enabled=False, endpoint=HttpUrl("http://127.0.0.1:4318")
+            )
+        )
+    )
+
+    assert calls == []
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "setting_key",
@@ -432,6 +492,7 @@ async def test_update_saml_settings(
         "audit_webhook_url",
         "audit_webhook_custom_headers",
         "audit_webhook_custom_payload",
+        "agent_otel_headers",
     ],
 )
 async def test_get_values_with_decryption_fallback_for_invalid_encrypted_settings(
@@ -631,7 +692,7 @@ async def test_init_default_settings(
     defaults = {key: value for cls in settings_service.groups for key, value in cls()}
     for setting in settings:
         value = settings_service.get_value(setting)
-        assert value == defaults[setting.key]
+        assert value == to_jsonable_python(defaults[setting.key])
 
     # Test idempotency - running again shouldn't create duplicates
     await settings_service.init_default_settings()
@@ -694,3 +755,50 @@ async def test_setting_with_override(
         default=default_value,
     )
     assert no_override_value == default_value
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(None, False, id="missing"),
+        pytest.param([], False, id="empty"),
+        pytest.param("not-a-list", False, id="malformed"),
+        pytest.param([str(uuid.UUID(int=9))], False, id="other-workspace"),
+        pytest.param([str(uuid.UUID(int=7))], True, id="allowed"),
+        pytest.param([uuid.UUID(int=7)], True, id="allowed-uuid-objects"),
+    ],
+)
+async def test_workspace_allows_error_details(
+    stored: object, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The allow-list check only passes for a listed workspace and fails closed."""
+    monkeypatch.setattr(
+        settings_service_module,
+        "get_setting_from_bypass_session",
+        AsyncMock(return_value=[] if stored is None else stored),
+    )
+    result = await workspace_allows_error_details(
+        organization_id=uuid.uuid4(),
+        workspace_id=uuid.UUID(int=7),
+        session=MagicMock(),
+    )
+    assert result is expected
+
+
+@pytest.mark.anyio
+async def test_workspace_allows_error_details_fails_closed_on_db_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed allow-list lookup denies the workspace instead of raising."""
+    monkeypatch.setattr(
+        settings_service_module,
+        "get_setting_from_bypass_session",
+        AsyncMock(side_effect=SQLAlchemyError("boom")),
+    )
+    result = await workspace_allows_error_details(
+        organization_id=uuid.uuid4(),
+        workspace_id=uuid.UUID(int=7),
+        session=MagicMock(),
+    )
+    assert result is False

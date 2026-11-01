@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from inspect import unwrap
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -19,6 +20,58 @@ from tracecat.registry.repositories.schemas import (
 )
 
 pytestmark = pytest.mark.usefixtures("db")
+
+
+@pytest.mark.anyio
+async def test_list_registry_repositories_returns_configured_custom_origin_first(
+    session: AsyncSession,
+    test_role: Role,
+) -> None:
+    """The active custom registry setting should win over stale repository rows."""
+    list_repositories = unwrap(registry_repos_router.list_registry_repositories)
+    configured_origin = "git+ssh://current@git.example.com/acme/registry.git"
+    session.add(
+        Organization(
+            id=test_role.organization_id,
+            name="Configured registry test org",
+            slug="configured-registry-test-org",
+            is_active=True,
+        )
+    )
+    await session.flush()
+    session.add_all(
+        [
+            RegistryRepository(
+                organization_id=test_role.organization_id,
+                origin="git+ssh://old@git.example.com/acme/registry.git",
+            ),
+            RegistryRepository(
+                organization_id=test_role.organization_id,
+                origin="git+ssh://older@git.example.com/acme/registry.git",
+            ),
+            RegistryRepository(
+                organization_id=test_role.organization_id,
+                origin=configured_origin,
+            ),
+        ]
+    )
+    await session.commit()
+
+    with (
+        patch.object(
+            registry_repos_router,
+            "ensure_org_repositories",
+            new=AsyncMock(),
+        ),
+        patch.object(
+            registry_repos_router,
+            "get_setting",
+            new=AsyncMock(return_value=configured_origin),
+        ),
+    ):
+        repositories = await list_repositories(role=test_role, session=session)
+
+    assert repositories[0].origin == configured_origin
 
 
 @pytest.mark.anyio
@@ -75,3 +128,48 @@ async def test_update_registry_repository_rejects_platform_builtin_origin(
 
     assert exc_info.value.status_code == 400
     assert "platform-scoped" in str(exc_info.value.detail)
+
+
+@pytest.mark.anyio
+async def test_update_registry_repository_rejects_duplicate_origin(
+    session: AsyncSession,
+    test_role: Role,
+) -> None:
+    update_repository = unwrap(registry_repos_router.update_registry_repository)
+    session.add(
+        Organization(
+            id=test_role.organization_id,
+            name="Registry duplicate test org",
+            slug="registry-duplicate-test-org",
+            is_active=True,
+        )
+    )
+    await session.flush()
+    existing = "git+ssh://git@git.example.com/acme/first.git"
+    repository = RegistryRepository(
+        organization_id=test_role.organization_id,
+        origin="git+ssh://git@git.example.com/acme/second.git",
+    )
+    session.add_all(
+        [
+            RegistryRepository(
+                organization_id=test_role.organization_id, origin=existing
+            ),
+            repository,
+        ]
+    )
+    await session.commit()
+
+    with (
+        patch.object(registry_repos_router, "check_entitlement", new=AsyncMock()),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await update_repository(
+            role=test_role,
+            session=session,
+            repository_id=repository.id,
+            params=RegistryRepositoryUpdate(origin=existing),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Registry repository already exists"

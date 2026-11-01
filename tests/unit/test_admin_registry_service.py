@@ -8,6 +8,7 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat.admin.registry.schemas import RegistryArtifactsBackfillStartRequest
@@ -34,6 +35,47 @@ def platform_role() -> PlatformRole:
     )
 
 
+async def _repo(session: AsyncSession) -> PlatformRegistryRepository:
+    repo = PlatformRegistryRepository(origin="tracecat_registry")
+    session.add(repo)
+    await session.flush()
+    return repo
+
+
+def _version(
+    repo: PlatformRegistryRepository, version: str, uri_dir: str, ext: str = "tar.gz"
+) -> PlatformRegistryVersion:
+    return PlatformRegistryVersion(
+        repository_id=repo.id,
+        version=version,
+        manifest={"schema_version": "1.0", "actions": {}},
+        tarball_uri=f"s3://registry-artifacts/platform/{uri_dir}/site-packages.{ext}",
+    )
+
+
+async def _workflow_with_definitions(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    registry_origins: list[object],
+) -> None:
+    """Persist one workflow with a definition per registry lock ``origins`` value."""
+    workflow = Workflow(workspace_id=workspace_id, title="Workflow", description="")
+    session.add(workflow)
+    await session.flush()
+    session.add_all(
+        [
+            WorkflowDefinition(
+                workflow_id=workflow.id,
+                workspace_id=workspace_id,
+                version=idx,
+                content={},
+                registry_lock={"origins": origins, "actions": {}},
+            )
+            for idx, origins in enumerate(registry_origins, start=1)
+        ]
+    )
+
+
 @pytest.mark.anyio
 async def test_list_versions_includes_artifact_and_usage_status(
     session: AsyncSession,
@@ -41,79 +83,22 @@ async def test_list_versions_includes_artifact_and_usage_status(
     platform_role: PlatformRole,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = PlatformRegistryRepository(origin="tracecat_registry")
-    session.add(repo)
-    await session.flush()
+    repo = await _repo(session)
 
-    version_in_definition = PlatformRegistryVersion(
-        repository_id=repo.id,
-        version="1.0.0",
-        manifest={"schema_version": "1.0", "actions": {}},
-        tarball_uri="s3://registry-artifacts/platform/v1/site-packages.tar.gz",
-    )
-    current_version = PlatformRegistryVersion(
-        repository_id=repo.id,
-        version="2.0.0",
-        manifest={"schema_version": "1.0", "actions": {}},
-        tarball_uri="s3://registry-artifacts/platform/v2/site-packages.tar.gz",
-    )
+    version_in_definition = _version(repo, "1.0.0", "v1")
+    current_version = _version(repo, "2.0.0", "v2")
     session.add_all([version_in_definition, current_version])
     await session.flush()
 
     repo.current_version_id = current_version.id
     session.add(repo)
 
-    workflow = Workflow(
-        workspace_id=svc_workspace.id,
-        title="Workflow using old registry version",
-        description="",
+    await _workflow_with_definitions(
+        session,
+        svc_workspace.id,
+        [{"tracecat_registry": "1.0.0"}, {"tracecat_registry": "2.0.0"}],
     )
-    session.add(workflow)
-    await session.flush()
-
-    session.add_all(
-        [
-            WorkflowDefinition(
-                workflow_id=workflow.id,
-                workspace_id=svc_workspace.id,
-                version=1,
-                content={},
-                registry_lock={
-                    "origins": {"tracecat_registry": "1.0.0"},
-                    "actions": {},
-                },
-            ),
-            WorkflowDefinition(
-                workflow_id=workflow.id,
-                workspace_id=svc_workspace.id,
-                version=2,
-                content={},
-                registry_lock={
-                    "origins": {"tracecat_registry": "2.0.0"},
-                    "actions": {},
-                },
-            ),
-        ]
-    )
-    malformed_lock_workflow = Workflow(
-        workspace_id=svc_workspace.id,
-        title="Workflow with malformed registry lock",
-        description="",
-    )
-    session.add(malformed_lock_workflow)
-    await session.flush()
-    session.add(
-        WorkflowDefinition(
-            workflow_id=malformed_lock_workflow.id,
-            workspace_id=svc_workspace.id,
-            version=1,
-            content={},
-            registry_lock={
-                "origins": ["tracecat_registry"],
-                "actions": {},
-            },
-        )
-    )
+    await _workflow_with_definitions(session, svc_workspace.id, [["tracecat_registry"]])
     await session.commit()
 
     async def fake_artifacts_ready(
@@ -183,16 +168,9 @@ async def test_promote_version_requires_ready_artifact(
     platform_role: PlatformRole,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = PlatformRegistryRepository(origin="tracecat_registry")
-    session.add(repo)
-    await session.flush()
+    repo = await _repo(session)
 
-    version = PlatformRegistryVersion(
-        repository_id=repo.id,
-        version="1.0.0",
-        manifest={"schema_version": "1.0", "actions": {}},
-        tarball_uri="s3://registry-artifacts/platform/v1/site-packages.squashfs",
-    )
+    version = _version(repo, "1.0.0", "v1", "squashfs")
     session.add(version)
     await session.commit()
 
@@ -222,16 +200,9 @@ async def test_promote_version_allows_ready_legacy_tarball_artifact(
     platform_role: PlatformRole,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = PlatformRegistryRepository(origin="tracecat_registry")
-    session.add(repo)
-    await session.flush()
+    repo = await _repo(session)
 
-    version = PlatformRegistryVersion(
-        repository_id=repo.id,
-        version="1.0.0",
-        manifest={"schema_version": "1.0", "actions": {}},
-        tarball_uri="s3://registry-artifacts/platform/v1/site-packages.tar.gz",
-    )
+    version = _version(repo, "1.0.0", "v1")
     session.add(version)
     await session.commit()
 
@@ -270,16 +241,9 @@ async def test_promote_version_allows_backfilled_legacy_squashfs_sidecar(
     platform_role: PlatformRole,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = PlatformRegistryRepository(origin="tracecat_registry")
-    session.add(repo)
-    await session.flush()
+    repo = await _repo(session)
 
-    version = PlatformRegistryVersion(
-        repository_id=repo.id,
-        version="1.0.0",
-        manifest={"schema_version": "1.0", "actions": {}},
-        tarball_uri="s3://registry-artifacts/platform/v1/site-packages.tar.gz",
-    )
+    version = _version(repo, "1.0.0", "v1")
     session.add(version)
     await session.commit()
 
@@ -312,14 +276,99 @@ async def test_promote_version_allows_backfilled_legacy_squashfs_sidecar(
 
 
 @pytest.mark.anyio
+async def test_delete_version_removes_unused_non_current_version(
+    session: AsyncSession,
+    platform_role: PlatformRole,
+) -> None:
+    repo = await _repo(session)
+
+    unused_version = _version(repo, "1.0.0", "v1")
+    current_version = _version(repo, "2.0.0", "v2")
+    session.add_all([unused_version, current_version])
+    await session.flush()
+
+    repo.current_version_id = current_version.id
+    session.add(repo)
+    await session.commit()
+
+    service = AdminRegistryService(session, platform_role)
+    await service.delete_version(repo.id, unused_version.id)
+
+    deleted = await session.scalar(
+        select(PlatformRegistryVersion).where(
+            PlatformRegistryVersion.id == unused_version.id
+        )
+    )
+    assert deleted is None
+
+
+@pytest.mark.anyio
+async def test_delete_version_rejects_current_version(
+    session: AsyncSession,
+    platform_role: PlatformRole,
+) -> None:
+    repo = await _repo(session)
+
+    current_version = _version(repo, "1.0.0", "v1")
+    session.add(current_version)
+    await session.flush()
+
+    repo.current_version_id = current_version.id
+    session.add(repo)
+    await session.commit()
+
+    service = AdminRegistryService(session, platform_role)
+    with pytest.raises(TracecatValidationError, match="currently promoted"):
+        await service.delete_version(repo.id, current_version.id)
+
+    persisted = await session.scalar(
+        select(PlatformRegistryVersion).where(
+            PlatformRegistryVersion.id == current_version.id
+        )
+    )
+    assert persisted is not None
+
+
+@pytest.mark.anyio
+async def test_delete_version_rejects_version_used_by_any_workflow_definition(
+    session: AsyncSession,
+    svc_workspace: Workspace,
+    platform_role: PlatformRole,
+) -> None:
+    repo = await _repo(session)
+
+    target_version = _version(repo, "1.0.0", "v1")
+    current_version = _version(repo, "2.0.0", "v2")
+    session.add_all([target_version, current_version])
+    await session.flush()
+
+    repo.current_version_id = current_version.id
+    await _workflow_with_definitions(
+        session,
+        svc_workspace.id,
+        [{"tracecat_registry": "1.0.0"}, {"tracecat_registry": "2.0.0"}],
+    )
+    await session.commit()
+
+    service = AdminRegistryService(session, platform_role)
+    with pytest.raises(TracecatValidationError, match="in use"):
+        await service.delete_version(repo.id, target_version.id)
+
+    persisted = await session.scalar(
+        select(PlatformRegistryVersion).where(
+            PlatformRegistryVersion.id == target_version.id
+        )
+    )
+    assert persisted is not None
+
+
+@pytest.mark.anyio
 async def test_start_artifacts_backfill_scales_workflow_timeout(
     session: AsyncSession,
     platform_role: PlatformRole,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = PlatformRegistryRepository(origin="tracecat_registry")
-    session.add(repo)
-    await session.flush()
+    repo = await _repo(session)
 
     versions = [
         PlatformRegistryVersion(

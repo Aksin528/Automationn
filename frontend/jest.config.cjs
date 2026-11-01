@@ -11,9 +11,16 @@ module.exports = {
         },
       },
     ],
+    // The AI SDK ships ESM only, so its dist files need a CJS transform.
+    "^.+\\.m?js$": [
+      "ts-jest",
+      { tsconfig: { allowJs: true, jsx: "react-jsx", module: "commonjs" } },
+    ],
   },
   testPathIgnorePatterns: ["/node_modules/", "/.next/", "/tests/smoke/"],
-  transformIgnorePatterns: ["node_modules/(?!(yaml)/)"],
+  transformIgnorePatterns: [
+    "/node_modules/(?!(\\.pnpm|yaml|ai|@ai-sdk|@shadcn|@workflow)/)",
+  ],
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/src/$1",
     "^lucide-react/dynamicIconImports$":
@@ -22,7 +29,8 @@ module.exports = {
     "\\.(css|less|scss|sass)$": "identity-obj-proxy",
     "\\.(jpg|jpeg|png|gif|eot|otf|webp|svg|ttf|woff|woff2|mp4|webm|wav|mp3|m4a|aac|oga)$":
       "jest-transform-stub",
-    // Mock yaml module for Jest
-    "^yaml$": "identity-obj-proxy",
+    // jsdom resolves the "default" export condition, which points at yaml's
+    // ESM browser build. Force the CJS build so Jest can require it.
+    "^yaml$": "<rootDir>/node_modules/yaml/dist/index.js",
   },
 }

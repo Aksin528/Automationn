@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -10,9 +11,17 @@ from sqlalchemy import select
 from tracecat.db.models import Webhook, Workflow, WorkflowTag, WorkflowTagLink
 from tracecat.dsl.common import DSLInput
 from tracecat.dsl.enums import PlatformAction
-from tracecat.exceptions import TracecatAuthorizationError
+from tracecat.exceptions import (
+    EntitlementRequired,
+    RegistryError,
+    RegistryLockActionNotFoundError,
+    TracecatAuthorizationError,
+)
+from tracecat.forms.enums import FormStatus
+from tracecat.forms.service import FormsService
 from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.logger import logger
+from tracecat.registry.lock.service import RegistryLockService
 from tracecat.service import BaseWorkspaceService
 from tracecat.sync import PullDiagnostic, PullResult
 from tracecat.workflow.case_triggers.schemas import (
@@ -27,11 +36,32 @@ from tracecat.workflow.schedules.schemas import ScheduleCreate
 from tracecat.workflow.schedules.service import WorkflowSchedulesService
 from tracecat.workflow.store.schemas import (
     RemoteCaseTrigger,
+    RemoteForm,
     RemoteWebhook,
     RemoteWorkflowDefinition,
     RemoteWorkflowSchedule,
     RemoteWorkflowTag,
 )
+
+
+class WorkflowImportError(Exception):
+    """A single workflow failed to import.
+
+    Carries which workflow failed so a caller that rolls back the whole batch
+    can name it. The message is the underlying error's.
+    """
+
+    def __init__(
+        self,
+        cause: Exception,
+        *,
+        workflow_id: WorkflowUUID,
+        workflow_title: str,
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.workflow_id = workflow_id
+        self.workflow_title = workflow_title
 
 
 class WorkflowImportService(BaseWorkspaceService):
@@ -50,6 +80,7 @@ class WorkflowImportService(BaseWorkspaceService):
         self,
         remote_workflows: list[RemoteWorkflowDefinition],
         commit_sha: str,
+        sync_schedules: bool = False,
     ) -> PullResult:
         """Import workflows atomically - either all succeed or all fail.
 
@@ -58,6 +89,8 @@ class WorkflowImportService(BaseWorkspaceService):
         Args:
             remote_workflows: List of remote workflow definitions to import
             commit_sha: The commit SHA these workflows came from
+            sync_schedules: Whether to apply remote schedules. Defaults off to
+                preserve destination schedule configuration.
 
         Returns:
             PullResult with success status and diagnostics
@@ -73,7 +106,7 @@ class WorkflowImportService(BaseWorkspaceService):
             )
 
         # Phase 1: Validation - check everything before touching database
-        diagnostics = await self._validate_all_workflows(remote_workflows)
+        diagnostics = await self.validate_workflows(remote_workflows)
 
         if diagnostics:
             return PullResult(
@@ -88,8 +121,10 @@ class WorkflowImportService(BaseWorkspaceService):
         # Phase 2: Atomic import - all operations in single transaction
         try:
             async with self.session.begin_nested():
-                for remote_workflow in remote_workflows:
-                    await self._import_single_workflow(remote_workflow)
+                await self.import_workflows(
+                    remote_workflows,
+                    sync_schedules=sync_schedules,
+                )
                 # XXX: We need to commit here to ensure that the transaction is committed
                 await self.session.commit()
 
@@ -102,8 +137,8 @@ class WorkflowImportService(BaseWorkspaceService):
                 message=f"Successfully imported {len(remote_workflows)} workflows",
             )
 
-        except Exception as e:
-            logger.error(f"Failed to import workflows: {e}")
+        except Exception:
+            logger.exception("Failed to import workflows")
             return PullResult(
                 success=False,
                 commit_sha=commit_sha,
@@ -114,23 +149,30 @@ class WorkflowImportService(BaseWorkspaceService):
                         workflow_path="",
                         workflow_title=None,
                         error_type="transaction",
-                        message=f"Transaction failed: {str(e)}",
-                        details={"exception": str(e)},
+                        message="Import transaction failed",
+                        details={},
                     )
                 ],
                 message="Import transaction failed",
             )
 
-    async def _validate_all_workflows(
+    async def validate_workflows(
         self,
         remote_workflows: list[RemoteWorkflowDefinition],
+        *,
+        normalize_existing: bool = True,
     ) -> list[PullDiagnostic]:
         """Validate all workflows before import. Returns list of diagnostics."""
         diagnostics: list[PullDiagnostic] = []
 
         for remote_workflow in remote_workflows:
-            workflow_diagnostics = await self._validate_single_workflow(remote_workflow)
+            workflow_diagnostics = await self._validate_single_workflow(
+                remote_workflow,
+                normalize_existing=normalize_existing,
+            )
             diagnostics.extend(workflow_diagnostics)
+
+        diagnostics.extend(await self._validate_registry_actions(remote_workflows))
 
         # Cross-workflow integrity: validate alias references in child workflow actions
         cross_diagnostics = await self._validate_cross_workflow_integrity(
@@ -140,9 +182,32 @@ class WorkflowImportService(BaseWorkspaceService):
 
         return diagnostics
 
+    async def import_workflows(
+        self,
+        remote_workflows: list[RemoteWorkflowDefinition],
+        *,
+        sync_schedules: bool,
+    ) -> None:
+        """Import workflows without committing the active transaction."""
+        await self._release_changing_workflow_aliases(remote_workflows)
+        for remote_workflow in remote_workflows:
+            try:
+                await self._import_single_workflow(
+                    remote_workflow,
+                    sync_schedules=sync_schedules,
+                )
+            except Exception as e:
+                raise WorkflowImportError(
+                    e,
+                    workflow_id=WorkflowUUID.new(remote_workflow.id),
+                    workflow_title=remote_workflow.definition.title,
+                ) from e
+
     async def _validate_single_workflow(
         self,
         remote_workflow: RemoteWorkflowDefinition,
+        *,
+        normalize_existing: bool = True,
     ) -> list[PullDiagnostic]:
         """Validate a single workflow. Returns list of diagnostics."""
         diagnostics: list[PullDiagnostic] = []
@@ -165,7 +230,7 @@ class WorkflowImportService(BaseWorkspaceService):
 
             # Check for conflicts
             wf_id = WorkflowUUID.new(remote_workflow.id)
-            await self.wf_mgmt.get_workflow(wf_id)
+            await self.wf_mgmt.get_workflow(wf_id, normalize=normalize_existing)
 
         except ValidationError as e:
             diagnostics.append(
@@ -177,18 +242,64 @@ class WorkflowImportService(BaseWorkspaceService):
                     details={"validation_errors": e.errors()},
                 )
             )
-        except Exception as e:
-            diagnostics.append(
-                PullDiagnostic(
-                    workflow_path=workflow_path,
-                    workflow_title=getattr(remote_workflow.definition, "title", None),
-                    error_type="validation",
-                    message=f"Unexpected validation error: {str(e)}",
-                    details={"exception": str(e)},
-                )
-            )
 
         return diagnostics
+
+    async def _validate_registry_actions(
+        self, remote_workflows: list[RemoteWorkflowDefinition]
+    ) -> list[PullDiagnostic]:
+        """Check that every action in the batch resolves against the current registries.
+
+        Imported definitions carry no registry lock, so creating a workflow and
+        running one both resolve a lock with ``resolve_lock_with_bindings``.
+        Resolving it here, once over the whole batch, fails the pull before any
+        write. A missing action is reported on each workflow that uses it.
+        """
+        action_names = {
+            action.action
+            for remote_workflow in remote_workflows
+            for action in remote_workflow.definition.actions
+        }
+        if not action_names:
+            return []
+        try:
+            await RegistryLockService(
+                self.session, self.role
+            ).resolve_lock_with_bindings(action_names)
+        except RegistryLockActionNotFoundError as e:
+            diagnostics = [
+                PullDiagnostic(
+                    workflow_path=f"workflows/{remote_workflow.id}/definition.yml",
+                    workflow_title=remote_workflow.definition.title,
+                    error_type="dependency",
+                    message=(
+                        f"Workflow {remote_workflow.definition.title!r} uses action "
+                        f"{e.action_name!r}, which is in no registry"
+                    ),
+                    details={"action_name": e.action_name, "registries": e.origins},
+                )
+                for remote_workflow in remote_workflows
+                if any(
+                    action.action == e.action_name
+                    for action in remote_workflow.definition.actions
+                )
+            ]
+            # A template step is in no workflow's own actions; report it once.
+            return diagnostics or [_registry_diagnostic(str(e))]
+        except (RegistryError, EntitlementRequired) as e:
+            return [_registry_diagnostic(str(e))]
+        except Exception:
+            logger.exception("Workflow registry validation failed")
+            return [
+                PullDiagnostic(
+                    workflow_path="",
+                    workflow_title=None,
+                    error_type="validation",
+                    message="Unexpected registry validation error",
+                    details={},
+                )
+            ]
+        return []
 
     async def _validate_cross_workflow_integrity(
         self, remote_workflows: list[RemoteWorkflowDefinition]
@@ -237,7 +348,18 @@ class WorkflowImportService(BaseWorkspaceService):
                         if isinstance(action.args, dict)
                         else None
                     )
-                    if not alias:
+                    if alias is None or alias == "":
+                        continue
+                    if not isinstance(alias, str):
+                        diagnostics.append(
+                            PullDiagnostic(
+                                workflow_path=workflow_path,
+                                workflow_title=remote_workflow.definition.title,
+                                error_type="validation",
+                                message="Child workflow alias must be a string",
+                                details={"action_ref": action.ref},
+                            )
+                        )
                         continue
 
                     if await _is_alias_valid(alias):
@@ -260,14 +382,14 @@ class WorkflowImportService(BaseWorkspaceService):
                             },
                         )
                     )
-                except Exception as e:
+                except ValidationError:
                     diagnostics.append(
                         PullDiagnostic(
                             workflow_path=workflow_path,
                             workflow_title=remote_workflow.definition.title,
                             error_type="validation",
                             message="Error validating child workflow alias reference",
-                            details={"exception": str(e)},
+                            details={},
                         )
                     )
 
@@ -277,19 +399,124 @@ class WorkflowImportService(BaseWorkspaceService):
     async def _import_single_workflow(
         self,
         remote_workflow: RemoteWorkflowDefinition,
+        *,
+        sync_schedules: bool = False,
     ) -> None:
         """Import a single workflow. Must be called within a transaction.
 
         Existing workflows will be overwritten with new definitions.
         """
+        # `ai.agent` model selections carry a per-environment ``catalog_id``.
+        # Best-effort re-map it to the equivalent local model so synced
+        # workflows resolve credentials in this environment. Running it here
+        # (the single create/update chokepoint) means existing git-synced
+        # workflows self-heal on the next pull.
+        remote_workflow.definition = await self.wf_mgmt.correlate_agent_catalog_ids(
+            remote_workflow.definition
+        )
+
         wf_id = WorkflowUUID.new(remote_workflow.id)
-        if existing_workflow := await self.wf_mgmt.get_workflow(wf_id):
-            await self._update_existing_workflow(existing_workflow, remote_workflow)
+        # Locked reads normalize legacy resources without committing, so the
+        # caller can atomically persist the import and its durable receipt.
+        if existing_workflow := await self.wf_mgmt.get_workflow(wf_id, for_update=True):
+            await self._update_existing_workflow(
+                existing_workflow,
+                remote_workflow,
+                sync_schedules=sync_schedules,
+            )
         else:
-            await self._create_new_workflow(remote_workflow)
+            await self._create_new_workflow(
+                remote_workflow,
+                sync_schedules=sync_schedules,
+            )
+
+    async def _release_changing_workflow_aliases(
+        self,
+        remote_workflows: list[RemoteWorkflowDefinition],
+    ) -> None:
+        """Park existing workflows whose aliases change in this import batch."""
+        target_aliases_by_id: dict[uuid.UUID, str | None] = {
+            uuid.UUID(int=WorkflowUUID.new(remote.id).int): remote.alias
+            for remote in remote_workflows
+        }
+        duplicate_aliases = sorted(
+            _duplicates(
+                alias for alias in target_aliases_by_id.values() if alias is not None
+            )
+        )
+        if duplicate_aliases:
+            raise ValueError(
+                "Workflow import specs must have unique aliases: "
+                + ", ".join(repr(alias) for alias in duplicate_aliases)
+            )
+
+        workflow_ids = set(target_aliases_by_id)
+        workflows = list(
+            (
+                await self.session.scalars(
+                    select(Workflow).where(
+                        Workflow.workspace_id == self.workspace_id,
+                        Workflow.id.in_(workflow_ids),
+                    )
+                )
+            ).all()
+        )
+        workflows_by_id = {workflow.id: workflow for workflow in workflows}
+
+        for workflow in workflows:
+            target_alias = target_aliases_by_id[workflow.id]
+            if target_alias is None or target_alias == workflow.alias:
+                continue
+            conflict_id = await self.session.scalar(
+                select(Workflow.id).where(
+                    Workflow.workspace_id == self.workspace_id,
+                    Workflow.alias == target_alias,
+                    Workflow.id != workflow.id,
+                )
+            )
+            if conflict_id is None:
+                continue
+            if (
+                conflict_id not in workflow_ids
+                or target_aliases_by_id[conflict_id] == target_alias
+            ):
+                raise ValueError(
+                    f"Workflow alias {target_alias!r} is already used by another "
+                    "workflow."
+                )
+
+        reserved_aliases = {
+            alias
+            for alias in (
+                await self.session.scalars(
+                    select(Workflow.alias).where(
+                        Workflow.workspace_id == self.workspace_id,
+                        Workflow.alias.is_not(None),
+                    )
+                )
+            ).all()
+            if alias is not None
+        } | {alias for alias in target_aliases_by_id.values() if alias is not None}
+        changed = False
+        for workflow_id, workflow in workflows_by_id.items():
+            target_alias = target_aliases_by_id[workflow_id]
+            if workflow.alias == target_alias:
+                continue
+            workflow.alias = _unique_temporary_workflow_alias(
+                workflow,
+                reserved_aliases,
+            )
+            self.session.add(workflow)
+            changed = True
+        if changed:
+            await self.session.flush()
 
     async def _update_existing_workflow(
-        self, existing_workflow: Workflow, remote_workflow: RemoteWorkflowDefinition
+        self,
+        existing_workflow: Workflow,
+        remote_workflow: RemoteWorkflowDefinition,
+        *,
+        sync_schedules: bool,
     ) -> None:
         """Update existing workflow with new definition and related entities."""
         dsl = remote_workflow.definition
@@ -327,12 +554,19 @@ class WorkflowImportService(BaseWorkspaceService):
             existing_workflow.folder_id = None
 
         # 6. Update related entities
-        await self._update_schedules(existing_workflow, remote_workflow.schedules)
+        if sync_schedules:
+            await self._update_schedules(existing_workflow, remote_workflow.schedules)
         await self._update_webhook(existing_workflow.webhook, remote_workflow.webhook)
         await self._update_case_trigger(existing_workflow, remote_workflow.case_trigger)
+        await self._update_form(existing_workflow, remote_workflow.form)
         await self._update_tags(existing_workflow, remote_workflow.tags)
 
-    async def _create_new_workflow(self, remote_defn: RemoteWorkflowDefinition) -> None:
+    async def _create_new_workflow(
+        self,
+        remote_defn: RemoteWorkflowDefinition,
+        *,
+        sync_schedules: bool,
+    ) -> None:
         """Create a new workflow entity with all related entities."""
         wf_id = WorkflowUUID.new(remote_defn.id)
         dsl = remote_defn.definition
@@ -364,9 +598,11 @@ class WorkflowImportService(BaseWorkspaceService):
         workflow.version = defn.version
 
         # Handle additional remote-specific entities
-        await self._create_schedules(workflow, remote_defn.schedules)
+        if sync_schedules:
+            await self._create_schedules(workflow, remote_defn.schedules)
         await self._update_webhook(workflow.webhook, remote_defn.webhook)
         await self._update_case_trigger(workflow, remote_defn.case_trigger)
+        await self._update_form(workflow, remote_defn.form)
         await self._create_tags(workflow, remote_defn.tags)
 
     async def _update_schedules(
@@ -446,7 +682,7 @@ class WorkflowImportService(BaseWorkspaceService):
             return
         service = CaseTriggersService(session=self.session, role=self.role)
         config = CaseTriggerConfig.model_validate(remote_case_trigger.model_dump())
-        await service.upsert_case_trigger(
+        await service.sync_case_trigger(
             WorkflowUUID.new(workflow.id),
             config,
             create_missing_tags=True,
@@ -467,6 +703,21 @@ class WorkflowImportService(BaseWorkspaceService):
         case_trigger.tag_filters = []
         self.session.add(case_trigger)
         await self.session.flush()
+
+    async def _update_form(
+        self, workflow: Workflow, remote_form: RemoteForm | None
+    ) -> None:
+        """Apply the ``form:`` block of a workflow file.
+
+        A file with no block takes the form offline and clears its config, as
+        for a case trigger; the row and its submissions are kept. The block is
+        stored as written, even if it no longer matches the inputs (a push
+        never checks it) or the organization lacks the forms entitlement.
+        """
+        status = remote_form.status if remote_form else FormStatus.OFFLINE
+        await FormsService(session=self.session, role=self.role).sync_form(
+            workflow.id, remote_form, status
+        )
 
     async def _update_tags(
         self, workflow: Workflow, remote_tags: list[RemoteWorkflowTag] | None = None
@@ -540,19 +791,14 @@ class WorkflowImportService(BaseWorkspaceService):
             raise ValueError("Invalid folder path")
 
         # Remove leading/trailing slashes and split into segments
-        path_segments = folder_path.strip("/").split("/")
+        path_segments = [
+            segment for segment in folder_path.strip("/").split("/") if segment
+        ]
         current_path = "/"
 
         for segment in path_segments:
-            if not segment:  # Skip empty segments
-                continue
-
             parent_path = current_path
-            current_path = (
-                f"{current_path}{segment}/"
-                if current_path == "/"
-                else f"{current_path}{segment}/"
-            )
+            current_path = f"{current_path}{segment}/"
 
             # Check if folder exists at current path
             existing_folder = await self.folder_service.get_folder_by_path(current_path)
@@ -564,8 +810,45 @@ class WorkflowImportService(BaseWorkspaceService):
                 )
 
         # Return the final folder's ID
-        final_folder = await self.folder_service.get_folder_by_path(folder_path)
+        final_folder = await self.folder_service.get_folder_by_path(current_path)
         if not final_folder:
             raise ValueError(f"Failed to create or find folder at path: {folder_path}")
 
         return final_folder.id
+
+
+def _registry_diagnostic(message: str) -> PullDiagnostic:
+    """A registry problem that affects the whole batch rather than one workflow."""
+    return PullDiagnostic(
+        workflow_path="",
+        workflow_title=None,
+        error_type="dependency",
+        message=message,
+        details={"exception": message},
+    )
+
+
+def _duplicates(values: Iterable[str]) -> set[str]:
+    """Return duplicate string values from an iterable."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for value in values:
+        if value in seen:
+            duplicates.add(value)
+        seen.add(value)
+    return duplicates
+
+
+def _unique_temporary_workflow_alias(
+    workflow: Workflow,
+    reserved_aliases: set[str],
+) -> str:
+    """Return a temporary workflow alias that does not collide."""
+    base = f"tracecat-sync-tmp-{workflow.id.hex}"
+    candidate = base
+    suffix = 1
+    while candidate in reserved_aliases:
+        suffix += 1
+        candidate = f"{base}-{suffix}"
+    reserved_aliases.add(candidate)
+    return candidate

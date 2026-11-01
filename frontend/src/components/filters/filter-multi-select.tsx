@@ -4,7 +4,6 @@ import { Cross2Icon } from "@radix-ui/react-icons"
 import {
   ArrowDownIcon,
   ArrowUpIcon,
-  Check,
   ChevronDown,
   Minus,
   Plus,
@@ -16,6 +15,7 @@ import {
   useMemo,
   useState,
 } from "react"
+import { CheckIndicator } from "@/components/ui/check-indicator"
 import {
   Command,
   CommandEmpty,
@@ -60,6 +60,8 @@ interface FilterMultiSelectProps<T extends string> {
   emptyMessage?: string
   /** Enable sort controls in the dropdown */
   showSort?: boolean
+  /** Explain a sort key when it differs from the displayed option label. */
+  sortDescription?: string
   /** Current sort direction (null means no sorting applied) */
   sortDirection?: SortDirection
   /** Callback when sort direction changes */
@@ -68,6 +70,7 @@ interface FilterMultiSelectProps<T extends string> {
   modeLabel?: string
 }
 
+/** Dropdown for filters and optional sorting of their associated column. */
 export function FilterMultiSelect<T extends string>({
   placeholder,
   icon: Icon,
@@ -80,6 +83,7 @@ export function FilterMultiSelect<T extends string>({
   className,
   emptyMessage = "No results found.",
   showSort = false,
+  sortDescription,
   sortDirection = null,
   onSortDirectionChange,
   allowExclude = true,
@@ -201,6 +205,11 @@ export function FilterMultiSelect<T extends string>({
             </div>
           </div>
         )}
+        {showSort && sortDescription && (
+          <p className="border-b px-2 py-1.5 text-[11px] text-muted-foreground">
+            {sortDescription}
+          </p>
+        )}
         <Command>
           <CommandInput
             placeholder={`Search ${placeholder.toLowerCase()}...`}
@@ -222,18 +231,9 @@ export function FilterMultiSelect<T extends string>({
                       onChange(nextValue)
                       setOpen(true)
                     }}
-                    className="flex items-center gap-2 text-xs"
+                    className="group flex items-center gap-2 text-xs"
                   >
-                    <div
-                      className={cn(
-                        "flex size-4 shrink-0 items-center justify-center rounded-sm border",
-                        isSelected
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-muted-foreground/40"
-                      )}
-                    >
-                      {isSelected && <Check className="size-3" aria-hidden />}
-                    </div>
+                    <CheckIndicator checked={isSelected} />
                     {option.renderIcon
                       ? option.renderIcon()
                       : option.icon && (

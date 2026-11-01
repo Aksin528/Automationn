@@ -18,18 +18,24 @@ from tracecat_ee.rbac.schemas import (
     UserRoleAssignmentCreate,
     UserRoleAssignmentList,
     UserRoleAssignmentReadWithDetails,
+    UserRoleAssignmentsReplace,
     UserRoleAssignmentUpdate,
 )
 from tracecat_ee.rbac.service import RBACService
 
 from tracecat.auth.credentials import RoleACL
-from tracecat.auth.dependencies import OrgUserRole
+from tracecat.auth.dependencies import OrgActorRole
 from tracecat.auth.types import Role
 from tracecat.authz.controls import require_scope
+from tracecat.authz.scopes import ORG_MEMBER_ROLE_SLUG
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.models import Role as DBRole
 from tracecat.db.models import UserRoleAssignment
-from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
+from tracecat.exceptions import (
+    TracecatConflictError,
+    TracecatNotFoundError,
+    TracecatValidationError,
+)
 
 # =============================================================================
 # User Scopes Schemas (kept here for OSS endpoint)
@@ -82,7 +88,7 @@ roles_router = APIRouter(prefix="/rbac/roles", tags=["rbac"])
 @roles_router.get("", response_model=RoleList)
 async def list_roles(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
 ) -> RoleList:
     """List roles for the organization.
@@ -97,7 +103,10 @@ async def list_roles(
 
     stmt = (
         select(DBRole)
-        .where(DBRole.organization_id == role.organization_id)
+        .where(
+            DBRole.organization_id == role.organization_id,
+            DBRole.slug.is_distinct_from(ORG_MEMBER_ROLE_SLUG),
+        )
         .options(selectinload(DBRole.scopes))
         .order_by(DBRole.name)
     )
@@ -152,7 +161,7 @@ def _assignment_to_read(
 @require_scope("org:rbac:read")
 async def list_user_assignments(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     user_id: UUID | None = Query(None, description="Filter by user ID"),
     workspace_id: UUID | None = Query(None, description="Filter by workspace ID"),
@@ -169,13 +178,33 @@ async def list_user_assignments(
     )
 
 
+@user_assignments_router.put("", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("org:rbac:read")
+async def replace_user_assignments(
+    *,
+    role: OrgActorRole,
+    session: AsyncDBSession,
+    params: UserRoleAssignmentsReplace,
+) -> None:
+    """Save a member's staged direct role changes in one transaction."""
+    service = RBACService(session, role=role)
+    try:
+        await service.replace_user_assignments(params)
+    except TracecatConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TracecatNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TracecatValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @user_assignments_router.get(
     "/{assignment_id}", response_model=UserRoleAssignmentReadWithDetails
 )
 @require_scope("org:rbac:read")
 async def get_user_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     assignment_id: UUID,
 ) -> UserRoleAssignmentReadWithDetails:
@@ -192,11 +221,22 @@ async def get_user_assignment(
     "",
     response_model=UserRoleAssignmentReadWithDetails,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Organization role assigned on a workspace."
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "description": "User, role, or workspace not found."
+        },
+        status.HTTP_409_CONFLICT: {
+            "description": "User already has an assignment for this workspace."
+        },
+    },
 )
 @require_scope("org:rbac:create")
 async def create_user_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     params: UserRoleAssignmentCreate,
 ) -> UserRoleAssignmentReadWithDetails:
@@ -217,21 +257,29 @@ async def create_user_assignment(
         )
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except TracecatConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TracecatValidationError as e:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(e),
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         ) from e
     return _assignment_to_read(a)
 
 
 @user_assignments_router.patch(
-    "/{assignment_id}", response_model=UserRoleAssignmentReadWithDetails
+    "/{assignment_id}",
+    response_model=UserRoleAssignmentReadWithDetails,
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Organization role assigned on a workspace."
+        },
+        status.HTTP_404_NOT_FOUND: {"description": "Assignment or role not found."},
+    },
 )
 @require_scope("org:rbac:update")
 async def update_user_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     assignment_id: UUID,
     params: UserRoleAssignmentUpdate,
@@ -245,16 +293,24 @@ async def update_user_assignment(
         a = await service.update_user_assignment(assignment_id, role_id=params.role_id)
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
     return _assignment_to_read(a)
 
 
 @user_assignments_router.delete(
-    "/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT
+    "/{assignment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "User role assignment not found."},
+    },
 )
 @require_scope("org:rbac:delete")
 async def delete_user_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     assignment_id: UUID,
 ) -> None:

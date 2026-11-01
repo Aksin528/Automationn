@@ -12,6 +12,11 @@ from fastapi.testclient import TestClient
 from temporalio.client import WorkflowExecutionStatus
 
 from tracecat.agent import router as agent_router
+from tracecat.agent.catalog import router as agent_catalog_router
+from tracecat.agent.catalog.schemas import (
+    WorkspaceAgentModelListResponse,
+    WorkspaceAgentModelRead,
+)
 from tracecat.auth.dependencies import (
     WorkspaceActorRouteRole,
     WorkspaceUserRouteRole,
@@ -24,6 +29,7 @@ from tracecat.integrations import router as integrations_router
 from tracecat.integrations.enums import OAuthGrantType
 from tracecat.organization import router as organization_router
 from tracecat.pagination import CursorPaginatedResponse
+from tracecat.registry.repositories import router as registry_repos_router
 from tracecat.settings import router as settings_router
 from tracecat.vcs import router as vcs_router
 from tracecat.workflow.executions import router as workflow_executions_router
@@ -367,18 +373,10 @@ async def test_service_account_can_get_workflow_execution_by_workflow_route(
     mock_service.get_execution.return_value = mock_execution
     mock_service.list_workflow_execution_events.return_value = []
 
-    with (
-        patch.object(
-            WorkflowExecutionsService, "connect", new_callable=AsyncMock
-        ) as mock_connect,
-        patch.object(
-            workflow_executions_router,
-            "_list_interactions",
-            new_callable=AsyncMock,
-        ) as mock_list_interactions,
-    ):
+    with patch.object(
+        WorkflowExecutionsService, "connect", new_callable=AsyncMock
+    ) as mock_connect:
         mock_connect.return_value = mock_service
-        mock_list_interactions.return_value = []
 
         token = ctx_role.set(workspace_targeted_service_account_role)
         try:
@@ -394,7 +392,6 @@ async def test_service_account_can_get_workflow_execution_by_workflow_route(
     assert response.json()["id"] == wf_exec_id
     mock_service.get_execution.assert_awaited_once_with(wf_exec_id)
     mock_service.list_workflow_execution_events.assert_awaited_once_with(wf_exec_id)
-    mock_list_interactions.assert_awaited_once()
 
 
 @pytest.mark.anyio
@@ -505,16 +502,34 @@ def test_delete_organization_route_remains_user_only() -> None:
     assert delete_organization_role == organization_router.OrgUserRole
 
 
-def test_org_settings_routes_remain_user_only() -> None:
+def test_list_org_members_route_accepts_org_actors() -> None:
+    role = get_type_hints(organization_router.list_org_members, include_extras=True)[
+        "role"
+    ]
+
+    assert role == organization_router.OrgActorRole
+
+
+def test_git_settings_routes_accept_org_actors() -> None:
     endpoints = [
         settings_router.get_git_settings,
         settings_router.update_git_settings,
+    ]
+
+    for endpoint in endpoints:
+        role = get_type_hints(endpoint, include_extras=True)["role"]
+        assert role == settings_router.OrgActorRole
+
+
+def test_non_git_org_settings_routes_remain_user_only() -> None:
+    endpoints = [
         settings_router.get_saml_settings,
         settings_router.update_saml_settings,
         settings_router.get_app_settings,
         settings_router.update_app_settings,
         settings_router.get_audit_settings,
         settings_router.update_audit_settings,
+        settings_router.test_audit_webhook,
         settings_router.get_agent_settings,
         settings_router.update_agent_settings,
     ]
@@ -548,18 +563,132 @@ def test_org_agent_routes_remain_user_only() -> None:
     assert workspace_status_role == WorkspaceActorRouteRole
 
 
+def test_agent_catalog_read_routes_accept_org_actors() -> None:
+    endpoints = [
+        agent_catalog_router.list_catalog,
+        agent_catalog_router.get_catalog_entry,
+    ]
+
+    for endpoint in endpoints:
+        role = get_type_hints(endpoint, include_extras=True)["role"]
+        assert role == agent_catalog_router.OrgActorRole
+
+
+def test_workspace_agent_models_route_accepts_workspace_actors() -> None:
+    role = get_type_hints(
+        agent_catalog_router.get_workspace_models, include_extras=True
+    )["role"]
+    assert role == WorkspaceActorRouteRole
+
+
+@pytest.mark.anyio
+async def test_workspace_service_account_can_list_workspace_agent_models(
+    client: TestClient,
+    workspace_bound_service_account_role: Role,
+) -> None:
+    role = workspace_bound_service_account_role.model_copy(
+        update={"scopes": frozenset({"agent:read"})}
+    )
+    workspace_id = role.workspace_id
+    assert workspace_id is not None
+    catalog_id = uuid.uuid4()
+    model = WorkspaceAgentModelRead(
+        id=catalog_id,
+        organization_id=role.organization_id,
+        custom_provider_id=None,
+        model_provider="anthropic",
+        model_name="claude-sonnet-4-5-20250929",
+        model_metadata={},
+    )
+
+    with patch.object(
+        agent_catalog_router, "AgentModelAccessService"
+    ) as mock_service_cls:
+        mock_svc = AsyncMock()
+        mock_svc.list_workspace_models.return_value = WorkspaceAgentModelListResponse(
+            items=[model], default_catalog_id=catalog_id, has_org_default=True
+        )
+        mock_service_cls.return_value = mock_svc
+
+        token = ctx_role.set(role)
+        try:
+            response = client.get(f"/workspaces/{workspace_id}/agent-models")
+        finally:
+            ctx_role.reset(token)
+
+    assert response.status_code == status.HTTP_200_OK
+    payload = response.json()
+    assert payload["default_catalog_id"] == str(catalog_id)
+    assert [item["id"] for item in payload["items"]] == [str(catalog_id)]
+    assert payload["items"][0]["model_provider"] == "anthropic"
+    mock_svc.list_workspace_models.assert_awaited_once_with(workspace_id=workspace_id)
+
+
+@pytest.mark.anyio
+async def test_workspace_service_account_cannot_list_other_workspace_agent_models(
+    client: TestClient,
+    workspace_bound_service_account_role: Role,
+) -> None:
+    role = workspace_bound_service_account_role.model_copy(
+        update={"scopes": frozenset({"agent:read"})}
+    )
+
+    with patch.object(
+        agent_catalog_router, "AgentModelAccessService"
+    ) as mock_service_cls:
+        token = ctx_role.set(role)
+        try:
+            response = client.get(f"/workspaces/{uuid.uuid4()}/agent-models")
+        finally:
+            ctx_role.reset(token)
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    mock_service_cls.assert_not_called()
+
+
+def test_agent_catalog_mutation_routes_remain_user_only() -> None:
+    endpoints = [
+        agent_catalog_router.create_catalog_entry,
+        agent_catalog_router.update_catalog_entry,
+        agent_catalog_router.delete_catalog_entry,
+    ]
+
+    for endpoint in endpoints:
+        role = get_type_hints(endpoint, include_extras=True)["role"]
+        assert role == agent_catalog_router.OrgUserRole
+
+
 def test_github_manifest_flow_routes_remain_user_only() -> None:
     endpoints = [
         (vcs_router.get_github_app_manifest, "_role"),
         (vcs_router.github_app_install_callback, "role"),
-        (vcs_router.save_github_app_credentials, "role"),
-        (vcs_router.delete_github_app_credentials, "role"),
-        (vcs_router.get_github_app_credentials_status, "role"),
     ]
 
     for endpoint, role_param in endpoints:
         role = get_type_hints(endpoint, include_extras=True)[role_param]
         assert role == vcs_router.OrgUserRole
+
+
+def test_vcs_credential_routes_accept_org_actors() -> None:
+    endpoints = [
+        (vcs_router.save_github_app_credentials, "role"),
+        (vcs_router.delete_github_app_credentials, "role"),
+        (vcs_router.get_github_app_credentials_status, "role"),
+        (vcs_router.save_gitlab_token_credentials, "role"),
+        (vcs_router.delete_gitlab_token_credentials, "role"),
+        (vcs_router.get_gitlab_token_credentials_status, "role"),
+    ]
+
+    for endpoint, role_param in endpoints:
+        role = get_type_hints(endpoint, include_extras=True)[role_param]
+        assert role == vcs_router.OrgActorRole
+
+
+def test_registry_repository_sync_route_accepts_org_actors() -> None:
+    role = get_type_hints(
+        registry_repos_router.sync_registry_repository, include_extras=True
+    )["role"]
+    assert role == registry_repos_router.OrgActorRole
 
 
 def test_draft_workflow_execution_route_remains_user_only() -> None:

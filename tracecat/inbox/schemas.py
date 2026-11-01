@@ -19,12 +19,13 @@ class WorkflowSummary(BaseModel):
     alias: str | None = Field(default=None, description="Workflow alias")
 
 
-class CaseSummary(BaseModel):
-    """Summary of a case for inbox item context."""
+class UserSummary(BaseModel):
+    """Summary of a user for inbox item context."""
 
-    id: uuid.UUID = Field(..., description="Case ID")
-    short_id: str = Field(..., description="Human-readable case ID, e.g. CASE-0123")
-    summary: str = Field(..., description="Case summary/title")
+    id: uuid.UUID = Field(..., description="User ID")
+    email: str = Field(..., description="User email")
+    first_name: str | None = Field(default=None, description="User first name")
+    last_name: str | None = Field(default=None, description="User last name")
 
 
 class InboxItemRead(BaseModel):
@@ -41,8 +42,9 @@ class InboxItemRead(BaseModel):
     workflow: WorkflowSummary | None = Field(
         default=None, description="Associated workflow"
     )
-    case: CaseSummary | None = Field(
-        default=None, description="Associated case, when entity_type is 'case'"
+    created_by: UserSummary | None = Field(
+        default=None,
+        description="User who created the source entity (None for automation-initiated items)",
     )
     source_id: uuid.UUID = Field(..., description="ID of the source entity")
     source_type: str = Field(

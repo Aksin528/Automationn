@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from tracecat_registry.sdk.cases import CasesClient
     from tracecat_registry.sdk.client import TracecatClient
     from tracecat_registry.sdk.deduplicate import DeduplicateClient
+    from tracecat_registry.sdk.forms import FormsClient
     from tracecat_registry.sdk.tables import TablesClient
     from tracecat_registry.sdk.variables import VariablesClient
     from tracecat_registry.sdk.workflows import WorkflowsClient
@@ -103,8 +104,10 @@ class RegistryContext:
         """Get the SDK client for this context."""
         from tracecat_registry.sdk.client import TracecatClient
 
+        if self._client is not None:
+            return self._client
+
         return TracecatClient(
-            api_url=self.api_url,
             token=self.token,
             workspace_id=self.workspace_id,
         )
@@ -123,6 +126,11 @@ class RegistryContext:
     def agents(self) -> "AgentsClient":
         """Get the Agents API client."""
         return self.client.agents
+
+    @property
+    def forms(self) -> "FormsClient":
+        """Get the Forms API client."""
+        return self.client.forms
 
     @property
     def tables(self) -> "TablesClient":

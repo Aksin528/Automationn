@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 from typing import cast as typing_cast
 
+from cachetools import LRUCache
 from pydantic import ValidationError
 from pydantic_core import ErrorDetails, to_jsonable_python
 from sqlalchemy import (
@@ -64,7 +67,13 @@ from tracecat.registry.actions.schemas import (
     RegistryActionValidationErrorInfo,
     TemplateAction,
 )
-from tracecat.registry.actions.types import IndexedActionResult, IndexEntry
+from tracecat.registry.actions.types import (
+    IndexedActionResult,
+    IndexEntry,
+    MissingActionAttribution,
+    RegistrySource,
+    RepositorySyncOutcome,
+)
 from tracecat.registry.constants import DEFAULT_REGISTRY_ORIGIN
 from tracecat.registry.loaders import (
     LoaderMode,
@@ -82,6 +91,44 @@ from tracecat.tiers.service import TierService
 
 if TYPE_CHECKING:
     from tracecat.ssh import SshEnv
+
+# Parsed manifests by registry version, shared across requests in this process.
+# Versions are immutable, so an entry never goes stale; the bounds cap memory.
+# A parsed manifest takes about 4x its JSON size (the builtin registry's 7.5 MB
+# manifest parses to about 28 MB). Org manifests vary in size, so their bound
+# counts JSON bytes, not manifests. Callers must not mutate a cached manifest.
+PLATFORM_MANIFEST_CACHE_SIZE = 2
+ORG_MANIFEST_CACHE_MAX_JSON_BYTES = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedOrgManifest:
+    manifest: RegistryVersionManifest
+    json_size: int
+
+
+def _parse_manifest(manifest_json: str) -> RegistryVersionManifest:
+    """Validate a registry version manifest from its JSONB text.
+
+    Pydantic's JSON parser caps nesting depth, which JSONB does not, so text it
+    rejects is validated again from ``json.loads`` (the driver's former path).
+    Real validation errors raise from there. orjson is not used because it
+    turns integers beyond 64 bits into floats.
+    """
+    try:
+        return RegistryVersionManifest.model_validate_json(manifest_json)
+    except ValidationError:
+        return RegistryVersionManifest.model_validate(json.loads(manifest_json))
+
+
+_platform_manifests: LRUCache[uuid.UUID, RegistryVersionManifest] = LRUCache(
+    maxsize=PLATFORM_MANIFEST_CACHE_SIZE
+)
+_org_manifests: LRUCache[tuple[uuid.UUID, uuid.UUID], _CachedOrgManifest] = LRUCache(
+    maxsize=ORG_MANIFEST_CACHE_MAX_JSON_BYTES,
+    getsizeof=lambda entry: entry.json_size,
+)
+
 
 # NamedTuple types for UNION ALL query results.
 # Used with typing_cast since SQLAlchemy's Row objects support attribute access.
@@ -102,8 +149,8 @@ class _IndexSelectRow(NamedTuple):
     source: str
 
 
-class _ActionIndexRow(NamedTuple):
-    """Action index row with manifest: get_action_from_index, get_actions_from_index."""
+class _ActionMetadataRow(NamedTuple):
+    """Action metadata row for batched index lookups."""
 
     id: uuid.UUID
     namespace: str
@@ -112,13 +159,21 @@ class _ActionIndexRow(NamedTuple):
     description: str
     default_title: str | None
     display_group: str | None
-    options: dict
+    options: dict[str, object]
     doc_url: str | None
     author: str | None
     deprecated: str | None
-    manifest: dict
+    registry_version_id: uuid.UUID
     origin: str
     repo_id: uuid.UUID
+    source: RegistrySource
+
+
+class _VersionManifestRow(NamedTuple):
+    """One manifest payload for a selected registry version."""
+
+    registry_version_id: uuid.UUID
+    manifest_json: str
     source: str
 
 
@@ -165,6 +220,35 @@ class SecretAggregate(TypedDict):
     optional: bool
     actions: set[str]
     secret_type: str | None
+
+
+def action_browse_sort_key(action_name: str) -> tuple[int, str, str, str, str]:
+    """Stable ordering for browsing action names and seek cursors."""
+    namespace, name = action_name.rsplit(".", 1)
+    return 0, namespace.casefold(), name.casefold(), namespace, name
+
+
+def action_search_sort_key(
+    action_name: str, query: str
+) -> tuple[int, str, str, str, str]:
+    """Put exact and prefix matches ahead of broader substring matches."""
+    namespace, name = action_name.rsplit(".", 1)
+    normalized_query = query.casefold()
+    name_parts = (
+        action_name.casefold(),
+        namespace.casefold(),
+        namespace.rsplit(".", 1)[-1].casefold(),
+        name.casefold(),
+    )
+    if normalized_query in name_parts:
+        rank = 0
+    elif any(part.startswith(normalized_query) for part in name_parts):
+        rank = 1
+    elif normalized_query in action_name.casefold():
+        rank = 2
+    else:
+        rank = 3
+    return rank, action_name.casefold(), action_name, "", ""
 
 
 def _infer_secret_type_from_keys(keys: list[str]) -> str:
@@ -389,8 +473,16 @@ class RegistryActionsService(BaseOrgService):
                 options=row.options or {},
             )
             entries.append((entry, row.origin))
-        return await self._filter_index_entries_by_entitlements(
+        filtered = await self._filter_index_entries_by_entitlements(
             entries, include_locked=include_locked
+        )
+        # Sort after deduplication and entitlement filtering so org overrides
+        # retain precedence while browsing has a stable order across pages.
+        return sorted(
+            filtered,
+            key=lambda item: action_browse_sort_key(
+                f"{item[0].namespace}.{item[0].name}"
+            ),
         )
 
     async def list_actions_from_index_by_repository(
@@ -542,6 +634,40 @@ class RegistryActionsService(BaseOrgService):
         except ValueError:
             return None
 
+        # Retry once if the selected version is replaced before its manifest loads.
+        for _ in range(2):
+            row = await self._select_action_row(namespace, name)
+            if row is None:
+                return None
+            manifests = await self._load_action_manifests([row])
+            manifest = manifests.get((row.source, row.registry_version_id))
+            if manifest is None:
+                continue
+            return IndexedActionResult(
+                index_entry=IndexEntry(
+                    id=row.id,
+                    namespace=row.namespace,
+                    name=row.name,
+                    action_type=row.action_type,
+                    description=row.description,
+                    default_title=row.default_title,
+                    display_group=row.display_group,
+                    options=row.options or {},
+                    doc_url=row.doc_url,
+                    author=row.author,
+                    deprecated=row.deprecated,
+                ),
+                manifest=manifest,
+                origin=row.origin,
+                repository_id=row.repo_id,
+                source=row.source,
+            )
+        raise RegistryError("Manifest missing for a selected registry action version")
+
+    async def _select_action_row(
+        self, namespace: str, name: str
+    ) -> _ActionMetadataRow | None:
+        """Select the index row that serves an action, org rows first."""
         # Org-scoped query - select explicit columns for UNION ALL compatibility
         org_statement = (
             select(
@@ -556,7 +682,7 @@ class RegistryActionsService(BaseOrgService):
                 RegistryIndex.doc_url,
                 RegistryIndex.author,
                 RegistryIndex.deprecated,
-                RegistryVersion.manifest,
+                RegistryIndex.registry_version_id,
                 RegistryRepository.origin,
                 RegistryRepository.id.label("repo_id"),
                 literal("org", type_=String).label("source"),
@@ -591,7 +717,7 @@ class RegistryActionsService(BaseOrgService):
                 PlatformRegistryIndex.doc_url,
                 PlatformRegistryIndex.author,
                 PlatformRegistryIndex.deprecated,
-                PlatformRegistryVersion.manifest,
+                PlatformRegistryIndex.registry_version_id,
                 PlatformRegistryRepository.origin,
                 PlatformRegistryRepository.id.label("repo_id"),
                 literal("platform", type_=String).label("source"),
@@ -617,7 +743,7 @@ class RegistryActionsService(BaseOrgService):
             text("source")  # "org" < "platform" alphabetically
         )
         result = await self.session.execute(combined)
-        rows = typing_cast(list[_ActionIndexRow], result.all())
+        rows = typing_cast(list[_ActionMetadataRow], result.all())
         if not rows:
             return None
 
@@ -634,25 +760,7 @@ class RegistryActionsService(BaseOrgService):
                     enabled_entitlements = await self._get_enabled_entitlements()
                 if not required.issubset(enabled_entitlements):
                     continue
-            manifest = RegistryVersionManifest.model_validate(row.manifest)
-            return IndexedActionResult(
-                index_entry=IndexEntry(
-                    id=row.id,
-                    namespace=row.namespace,
-                    name=row.name,
-                    action_type=row.action_type,
-                    description=row.description,
-                    default_title=row.default_title,
-                    display_group=row.display_group,
-                    options=row.options or {},
-                    doc_url=row.doc_url,
-                    author=row.author,
-                    deprecated=row.deprecated,
-                ),
-                manifest=manifest,
-                origin=row.origin,
-                repository_id=row.repo_id,
-            )
+            return row
         return None
 
     async def get_actions_from_index(
@@ -669,6 +777,145 @@ class RegistryActionsService(BaseOrgService):
         Returns:
             Dict mapping action_name -> IndexedActionResult.
             Actions not found are omitted from the result.
+        """
+        actions = await self._get_actions_from_index_once(action_names)
+        if actions is not None:
+            return actions
+
+        actions = await self._get_actions_from_index_once(action_names)
+        if actions is None:
+            raise RegistryError(
+                "Manifest missing for a selected registry action version"
+            )
+        return actions
+
+    async def classify_missing_actions(
+        self, action_names: list[str]
+    ) -> MissingActionAttribution:
+        """Attribute actions that ``get_actions_from_index`` did not return.
+
+        Following lookup precedence, selectable org rows shadow platform rows.
+        An action is entitlement-denied when every selectable row needs a
+        disabled entitlement, or when the custom registry entitlement hides
+        every row. Any other platform row, including one only in a retired
+        version, marks the action as platform-provided.
+        """
+        action_parts = [
+            tuple(action_name.rsplit(".", 1))
+            for action_name in action_names
+            if "." in action_name
+        ]
+        if not action_parts:
+            return MissingActionAttribution()
+        platform_statement = (
+            select(
+                PlatformRegistryIndex.namespace,
+                PlatformRegistryIndex.name,
+                PlatformRegistryIndex.options,
+                PlatformRegistryRepository.origin,
+                (
+                    PlatformRegistryRepository.current_version_id
+                    == PlatformRegistryIndex.registry_version_id
+                ).label("is_current"),
+            )
+            .join(
+                PlatformRegistryVersion,
+                PlatformRegistryIndex.registry_version_id == PlatformRegistryVersion.id,
+            )
+            .join(
+                PlatformRegistryRepository,
+                PlatformRegistryVersion.repository_id == PlatformRegistryRepository.id,
+            )
+            .where(
+                tuple_(PlatformRegistryIndex.namespace, PlatformRegistryIndex.name).in_(
+                    action_parts
+                )
+            )
+        )
+        org_statement = (
+            select(
+                RegistryIndex.namespace,
+                RegistryIndex.name,
+                RegistryIndex.options,
+                RegistryRepository.origin,
+            )
+            .join(
+                RegistryVersion,
+                RegistryIndex.registry_version_id == RegistryVersion.id,
+            )
+            .join(
+                RegistryRepository,
+                RegistryVersion.repository_id == RegistryRepository.id,
+            )
+            .where(
+                RegistryRepository.organization_id == self.organization_id,
+                RegistryRepository.current_version_id == RegistryVersion.id,
+                tuple_(RegistryIndex.namespace, RegistryIndex.name).in_(action_parts),
+            )
+        )
+        platform: set[str] = set()
+        # (origin, required entitlements) per current row, by action name.
+        current_org: dict[str, list[tuple[str, set[str]]]] = {}
+        current_platform: dict[str, list[tuple[str, set[str]]]] = {}
+        for namespace, name, options, origin, is_current in (
+            await self.session.execute(platform_statement)
+        ).tuples():
+            action_name = f"{namespace}.{name}"
+            platform.add(action_name)
+            if is_current:
+                current_platform.setdefault(action_name, []).append(
+                    (origin, self._normalize_required_entitlements(options or {}))
+                )
+        for namespace, name, options, origin in (
+            await self.session.execute(org_statement)
+        ).tuples():
+            current_org.setdefault(f"{namespace}.{name}", []).append(
+                (origin, self._normalize_required_entitlements(options or {}))
+            )
+
+        allow_custom_origins = await self._allow_custom_origins_for_rows(
+            origin
+            for rows_by_action in (current_org, current_platform)
+            for rows in rows_by_action.values()
+            for origin, _ in rows
+        )
+        enabled_entitlements: set[str] | None = None
+        denied: set[str] = set()
+        for action_name in current_org.keys() | current_platform.keys():
+            # Mirror lookup precedence: selectable org rows shadow platform rows.
+            candidates: list[set[str]] = []
+            for rows in (
+                current_org.get(action_name, []),
+                current_platform.get(action_name, []),
+            ):
+                candidates = [
+                    required
+                    for origin, required in rows
+                    if allow_custom_origins or not self._is_custom_origin(origin)
+                ]
+                if candidates:
+                    break
+            if any(not required for required in candidates):
+                continue
+            if candidates:
+                if enabled_entitlements is None:
+                    enabled_entitlements = await self._get_enabled_entitlements()
+                if any(required <= enabled_entitlements for required in candidates):
+                    continue
+            denied.add(action_name)
+        entitlement_denied = frozenset(denied)
+        return MissingActionAttribution(
+            platform=frozenset(platform - entitlement_denied),
+            entitlement_denied=entitlement_denied,
+        )
+
+    async def _get_actions_from_index_once(
+        self,
+        action_names: list[str],
+    ) -> dict[str, IndexedActionResult] | None:
+        """Run one metadata and manifest lookup attempt.
+
+        Returns ``None`` when a selected version disappears between statements.
         """
         if not action_names:
             return {}
@@ -711,7 +958,7 @@ class RegistryActionsService(BaseOrgService):
                 RegistryIndex.doc_url,
                 RegistryIndex.author,
                 RegistryIndex.deprecated,
-                RegistryVersion.manifest,
+                RegistryIndex.registry_version_id,
                 RegistryRepository.origin,
                 RegistryRepository.id.label("repo_id"),
                 literal("org", type_=String).label("source"),
@@ -745,7 +992,7 @@ class RegistryActionsService(BaseOrgService):
                 PlatformRegistryIndex.doc_url,
                 PlatformRegistryIndex.author,
                 PlatformRegistryIndex.deprecated,
-                PlatformRegistryVersion.manifest,
+                PlatformRegistryIndex.registry_version_id,
                 PlatformRegistryRepository.origin,
                 PlatformRegistryRepository.id.label("repo_id"),
                 literal("platform", type_=String).label("source"),
@@ -770,21 +1017,41 @@ class RegistryActionsService(BaseOrgService):
             text("source")  # "org" < "platform" alphabetically
         )
         result = await self.session.execute(combined)
-        rows = typing_cast(list[_ActionIndexRow], result.all())
+        rows = typing_cast(list[_ActionMetadataRow], result.all())
         allow_custom_origins = await self._allow_custom_origins_for_rows(
             row.origin for row in rows
         )
 
-        actions: dict[str, IndexedActionResult] = {}
+        selected_rows: dict[str, _ActionMetadataRow] = {}
         for row in rows:
             if not allow_custom_origins and self._is_custom_origin(row.origin):
                 continue
             action_name = f"{row.namespace}.{row.name}"
             # Skip if already found (org-scoped takes precedence)
-            if action_name in actions:
+            if action_name in selected_rows:
                 continue
+            selected_rows[action_name] = row
 
-            manifest = RegistryVersionManifest.model_validate(row.manifest)
+        required_any: set[str] = set()
+        for row in selected_rows.values():
+            required_any |= self._normalize_required_entitlements(row.options or {})
+        if required_any:
+            enabled = await self._get_enabled_entitlements()
+            selected_rows = {
+                name: row
+                for name, row in selected_rows.items()
+                if self._normalize_required_entitlements(row.options or {}).issubset(
+                    enabled
+                )
+            }
+
+        manifests = await self._load_action_manifests(list(selected_rows.values()))
+
+        actions: dict[str, IndexedActionResult] = {}
+        for action_name, row in selected_rows.items():
+            manifest = manifests.get((row.source, row.registry_version_id))
+            if manifest is None:
+                return None
             actions[action_name] = IndexedActionResult(
                 index_entry=IndexEntry(
                     id=row.id,
@@ -802,24 +1069,72 @@ class RegistryActionsService(BaseOrgService):
                 manifest=manifest,
                 origin=row.origin,
                 repository_id=row.repo_id,
+                source=row.source,
             )
-
-        required_any: set[str] = set()
-        for result in actions.values():
-            required_any |= self._normalize_required_entitlements(
-                result.index_entry.options
-            )
-        if required_any:
-            enabled = await self._get_enabled_entitlements()
-            actions = {
-                name: result
-                for name, result in actions.items()
-                if self._normalize_required_entitlements(
-                    result.index_entry.options
-                ).issubset(enabled)
-            }
 
         return actions
+
+    async def _load_action_manifests(
+        self,
+        rows: Sequence[_ActionMetadataRow],
+    ) -> dict[tuple[str, uuid.UUID], RegistryVersionManifest]:
+        """Load and validate each registry version manifest once per process.
+
+        Only versions missing from the process cache are read, through this
+        service's session. An organization's manifests are cached under its ID.
+        """
+        if not rows:
+            return {}
+
+        manifests: dict[tuple[str, uuid.UUID], RegistryVersionManifest] = {}
+        org_version_ids: set[uuid.UUID] = set()
+        platform_version_ids: set[uuid.UUID] = set()
+        for row in rows:
+            version_id = row.registry_version_id
+            if row.source == "org":
+                entry = _org_manifests.get((self.organization_id, version_id))
+                cached = entry.manifest if entry is not None else None
+                missing = org_version_ids
+            else:
+                cached = _platform_manifests.get(version_id)
+                missing = platform_version_ids
+            if cached is not None:
+                manifests[(row.source, version_id)] = cached
+            else:
+                missing.add(version_id)
+        if not org_version_ids and not platform_version_ids:
+            return manifests
+
+        org_statement = select(
+            RegistryVersion.id.label("registry_version_id"),
+            cast(RegistryVersion.manifest, String).label("manifest_json"),
+            literal("org", type_=String).label("source"),
+        ).where(
+            RegistryVersion.organization_id == self.organization_id,
+            RegistryVersion.id.in_(org_version_ids),
+        )
+        platform_statement = select(
+            PlatformRegistryVersion.id.label("registry_version_id"),
+            cast(PlatformRegistryVersion.manifest, String).label("manifest_json"),
+            literal("platform", type_=String).label("source"),
+        ).where(PlatformRegistryVersion.id.in_(platform_version_ids))
+
+        result = await self.session.execute(
+            union_all(org_statement, platform_statement)
+        )
+        manifest_rows = typing_cast(list[_VersionManifestRow], result.all())
+        for row in manifest_rows:
+            manifest = _parse_manifest(row.manifest_json)
+            if row.source == "org":
+                json_size = len(row.manifest_json)
+                # LRUCache rejects an entry larger than its whole bound.
+                if json_size <= ORG_MANIFEST_CACHE_MAX_JSON_BYTES:
+                    key = (self.organization_id, row.registry_version_id)
+                    _org_manifests[key] = _CachedOrgManifest(manifest, json_size)
+            else:
+                _platform_manifests[row.registry_version_id] = manifest
+            manifests[(row.source, row.registry_version_id)] = manifest
+        return manifests
 
     async def search_actions_from_index(
         self,
@@ -827,7 +1142,7 @@ class RegistryActionsService(BaseOrgService):
         *,
         limit: int | None = None,
     ) -> list[tuple[IndexEntry, str]]:
-        """Search actions by name or description using ilike.
+        """Search actions by literal, case-insensitive name or description text.
 
         Searches both org-scoped and platform registries.
 
@@ -840,8 +1155,6 @@ class RegistryActionsService(BaseOrgService):
         """
         if not query:
             return []
-
-        search_pattern = f"%{query}%"
 
         # Org-scoped query - select explicit columns for UNION ALL compatibility
         org_statement = (
@@ -872,10 +1185,12 @@ class RegistryActionsService(BaseOrgService):
                 RegistryRepository.organization_id == self.organization_id,
                 RegistryRepository.current_version_id == RegistryVersion.id,
                 or_(
-                    func.concat(RegistryIndex.namespace, ".", RegistryIndex.name).ilike(
-                        search_pattern
+                    func.concat(
+                        RegistryIndex.namespace, ".", RegistryIndex.name
+                    ).icontains(query, autoescape=True, escape="\\"),
+                    RegistryIndex.description.icontains(
+                        query, autoescape=True, escape="\\"
                     ),
-                    RegistryIndex.description.ilike(search_pattern),
                 ),
             )
         )
@@ -911,16 +1226,19 @@ class RegistryActionsService(BaseOrgService):
                 or_(
                     func.concat(
                         PlatformRegistryIndex.namespace, ".", PlatformRegistryIndex.name
-                    ).ilike(search_pattern),
-                    PlatformRegistryIndex.description.ilike(search_pattern),
+                    ).icontains(query, autoescape=True, escape="\\"),
+                    PlatformRegistryIndex.description.icontains(
+                        query, autoescape=True, escape="\\"
+                    ),
                 ),
             )
         )
 
-        # Combine with UNION ALL and optionally apply limit
-        combined = union_all(org_statement, platform_statement)
-        if limit is not None:
-            combined = combined.limit(limit)
+        # Org overrides must be considered first when the same action is indexed
+        # in both registries. Limit only after deduplication and relevance ranking.
+        combined = union_all(org_statement, platform_statement).order_by(
+            text("source"), text("namespace"), text("name"), text("id")
+        )
         result = await self.session.execute(combined)
         rows = typing_cast(list[_SearchIndexRow], result.all())
         allow_custom_origins = await self._allow_custom_origins_for_rows(
@@ -958,7 +1276,15 @@ class RegistryActionsService(BaseOrgService):
                 )
             )
 
-        return await self._filter_index_entries_by_entitlements(entries)
+        filtered = await self._filter_index_entries_by_entitlements(entries)
+        # Rank only visible, deduplicated actions so the limit selects the most
+        # relevant available results rather than whichever rows SQL returned first.
+        filtered.sort(
+            key=lambda item: action_search_sort_key(
+                f"{item[0].namespace}.{item[0].name}", query
+            )
+        )
+        return filtered[:limit] if limit is not None else filtered
 
     async def get_aggregated_secrets(self) -> list[SecretDefinition]:
         """Aggregate secrets from all actions in both org and platform registries.
@@ -1235,7 +1561,7 @@ class RegistryActionsService(BaseOrgService):
         target_commit_sha: str | None = None,
         git_repo_package_name: str | None = None,
         ssh_env: SshEnv | None = None,
-    ) -> tuple[str | None, str | None]:
+    ) -> RepositorySyncOutcome:
         """Sync actions from a repository using the versioned flow.
 
         This creates an immutable RegistryVersion snapshot with:
@@ -1254,7 +1580,7 @@ class RegistryActionsService(BaseOrgService):
             ssh_env: SSH environment for git operations (required for git+ssh repos).
 
         Returns:
-            Tuple of (commit_sha, version_string)
+            The synced repository commit SHA and version.
 
         Raises:
             RegistryArtifactBuildError: If artifact building fails (no version is created)
@@ -1290,7 +1616,10 @@ class RegistryActionsService(BaseOrgService):
             num_actions=sync_result.num_actions,
         )
 
-        return sync_result.commit_sha, sync_result.version_string
+        return RepositorySyncOutcome(
+            commit_sha=sync_result.commit_sha,
+            version=sync_result.version_string,
+        )
 
     async def get_action_or_none(self, action_name: str) -> RegistryAction | None:
         """Get an action by name, returning None if it doesn't exist."""

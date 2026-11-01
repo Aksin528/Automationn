@@ -1,48 +1,32 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
 import {
   type ChatOnDataCallback,
   type ChatStatus,
   getToolName,
   isToolUIPart,
-  type UIDataTypes,
   type UIMessage,
-  type UIMessagePart,
-  type UITools,
 } from "ai"
-import {
-  CheckIcon,
-  Loader2,
-  MousePointer2OffIcon,
-  MousePointerClickIcon,
-  PencilIcon,
-  RefreshCcwIcon,
-  TriangleAlertIcon,
-  XIcon,
-} from "lucide-react"
+import { Loader2, MousePointerClickIcon, XIcon } from "lucide-react"
 import { motion } from "motion/react"
 import {
   type ChangeEvent,
   type FocusEvent,
-  Fragment,
   type KeyboardEvent,
-  memo,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react"
 import type {
-  AgentPresetReadMinimal,
   AgentSessionEntity,
   AgentSessionReadVercel,
   ApprovalDecision,
   ChatReadVercel,
 } from "@/client"
-import { Action, Actions } from "@/components/ai-elements/actions"
 import {
   Conversation,
   ConversationContent,
@@ -50,19 +34,8 @@ import {
 } from "@/components/ai-elements/conversation"
 import { Message, MessageContent } from "@/components/ai-elements/message"
 import {
-  ModelSelector,
-  ModelSelectorContent,
-  ModelSelectorEmpty,
-  ModelSelectorGroup,
-  ModelSelectorInput,
-  ModelSelectorItem,
-  ModelSelectorList,
-  ModelSelectorTrigger,
-} from "@/components/ai-elements/model-selector"
-import {
   PromptInput,
   PromptInputBody,
-  PromptInputButton,
   PromptInputFooter,
   PromptInputHeader,
   type PromptInputMessage,
@@ -70,11 +43,6 @@ import {
   PromptInputTextarea,
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input"
-import {
-  Reasoning,
-  ReasoningContent,
-  ReasoningTrigger,
-} from "@/components/ai-elements/reasoning"
 import { Response } from "@/components/ai-elements/response"
 import {
   Source,
@@ -82,71 +50,115 @@ import {
   SourcesContent,
   SourcesTrigger,
 } from "@/components/ai-elements/sources"
+import { useScopeCheck } from "@/components/auth/scope-guard"
+import { AgentTurn, groupThread } from "@/components/chat/agent-turn"
 import {
-  getStatusBadge,
-  Tool,
-  ToolContent,
-  ToolHeader,
-  ToolInput,
-  ToolOutput,
-} from "@/components/ai-elements/tool"
+  AGENT_EXECUTE_REQUIRED_MESSAGE,
+  ApprovalComposerContext,
+  ApprovalRequestPart,
+  ApprovalsAlreadyDecidedError,
+} from "@/components/chat/approval-request-part"
 import { ChatEmptyHero } from "@/components/chat/chat-empty-hero"
 import { ChatToolsPicker } from "@/components/chat/chat-tools-picker"
-import { SmoothResponse } from "@/components/chat/smooth-response"
-import { CodeEditor } from "@/components/editor/codemirror/code-editor"
-import { getIcon, ProviderIcon } from "@/components/icons"
-import { JsonViewWithControls } from "@/components/json-viewer"
-import { Dots } from "@/components/loading/dots"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { Textarea } from "@/components/ui/textarea"
-import { toast } from "@/components/ui/use-toast"
+import { RetryAction, TurnErrorLine } from "@/components/chat/chat-turn-error"
 import {
-  type ApprovalCard,
+  getRunningLineLabel,
+  isAwaitingOutput,
+  MessageParts,
+  RunningLine,
+} from "@/components/chat/message-part"
+import { getIcon, ProviderIcon } from "@/components/icons"
+import { MentionHint } from "@/components/mentions/mention-hint"
+import { MentionPopover } from "@/components/mentions/mention-popover"
+import { Badge } from "@/components/ui/badge"
+import { Trace } from "@/components/ui/trace"
+import { toast } from "@/components/ui/use-toast"
+import { extensions } from "@/extensions"
+import {
   makeContinueMessage,
   parseChatError,
+  useAdoptServerTranscript,
+  useCancelChatTurn,
+  useGetChatVercel,
+  usePendingMessages,
   useUpdateChat,
   useVercelChat,
 } from "@/hooks/use-chat"
-import type { ModelInfo } from "@/lib/chat"
 import {
+  ChatVerbosityContext,
+  getChatVerbosityPolicy,
+  useChatVerbosityPreference,
+} from "@/hooks/use-chat-verbosity"
+import { useFormsAccess } from "@/hooks/use-forms-access"
+import { useMentions } from "@/hooks/use-mentions"
+import { useOverflowBadges } from "@/hooks/use-overflow-badges"
+import { SubagentStreamContext } from "@/hooks/use-subagent-stream"
+import { isAgentToolSelectable } from "@/lib/agent-tools"
+import {
+  CANCELLED_DATA_PART_TYPE,
+  collectCancelledTurns,
   ENTITY_TO_INVALIDATION,
+  getPendingApprovalIds,
+  getSessionLastError,
+  isApprovalCardArray,
+  type ModelInfo,
+  markLiveDenials,
   toUIMessage,
   transformMessages,
+  withoutStreamedError,
 } from "@/lib/chat"
+import type { RunningComposer } from "@/lib/extensions"
 import { useBuilderRegistryActions, useListMcpIntegrations } from "@/lib/hooks"
+import { findAgentMention, type MentionRange } from "@/lib/mentions"
+import { useQueryClient } from "@/lib/query"
 import { cn } from "@/lib/utils"
+import { PageContext } from "@/providers/chat-page-context"
 import type { ChatSurface } from "@/types/chat-surface"
 import { ARTIFACT_DATA_PART_TYPE } from "@/types/workspace-chat-artifacts"
 
-const MAX_TOOL_MENTION_RESULTS = 40
-const AGENT_TOOL_NAMES = new Set(["Agent", "Task"])
-const AGENT_TOOL_TARGET_KEYS = ["subagent_type", "agent_type", "type", "name"]
-const AGENT_TOOL_NESTED_INPUT_KEYS = ["args", "input", "tool_input"]
+/** How often an idle pane checks whether a waiting approval was decided. */
+const APPROVAL_REFRESH_MS = 5_000
 
-type ToolMentionToken = {
-  start: number
-  end: number
-  query: string
-}
-
-type ToolMentionState = ToolMentionToken & {
-  activeIndex: number
-}
-
-const TOOL_ICON_PROPS = { className: "size-5 p-[3px]" } as const
-
-type ToolSuggestion = {
-  value: string
-  label: string
-  description?: string
-  group?: string
-}
-
-function messageHasVisibleParts(message: UIMessage): boolean {
+/** Whether a message draws anything in the thread. */
+function messageHasVisibleParts(message: Pick<UIMessage, "parts">): boolean {
   return message.parts.some((part) => part.type !== ARTIFACT_DATA_PART_TYPE)
 }
+
+/**
+ * Whether a message is a request the server can run as a turn: a user prompt
+ * with text, or an approval submission. Reloaded history can also hold
+ * user-role tool results, which are neither.
+ */
+function isTurnRequest({ role, parts }: UIMessage): boolean {
+  return (
+    role === "user" &&
+    parts.some(
+      (part) =>
+        (part.type === "text" && part.text.length > 0) ||
+        part.type === "data-continue"
+    )
+  )
+}
+
+/**
+ * Raised to abandon a submit that sent no message.
+ *
+ * `submitPrompt` runs its cleanup after any submit that resolves, clearing
+ * attachments and blanking the textarea, so a turn that produced nothing has to
+ * reject to leave the composer alone. It swallows the rejection. Anything worth
+ * telling the user is reported before this is thrown.
+ */
+class SubmitAbandonedError extends Error {
+  constructor(reason: string) {
+    super(reason)
+    this.name = "SubmitAbandonedError"
+  }
+}
+
+/** The installed running-composer slot; Tracecat leaves the composer disabled. */
+const useRunningComposer =
+  extensions.useRunningComposer ??
+  ((): RunningComposer | undefined => undefined)
 
 function matchingUserTextPartKeys(
   messages: UIMessage[],
@@ -186,43 +198,20 @@ function areToolListsEqual(left: string[], right: string[]): boolean {
   )
 }
 
-function getToolMentionToken(
-  text: string,
-  caret: number
-): ToolMentionToken | undefined {
-  const beforeCaret = text.slice(0, caret)
-  const atIndex = beforeCaret.lastIndexOf("@")
-  if (atIndex < 0) {
-    return undefined
-  }
-
-  const priorChar = atIndex === 0 ? " " : beforeCaret[atIndex - 1]
-  if (priorChar.trim() !== "") {
-    return undefined
-  }
-
-  const query = beforeCaret.slice(atIndex + 1)
-  if (/\s/.test(query)) {
-    return undefined
-  }
-
-  return {
-    start: atIndex,
-    end: caret,
-    query,
-  }
-}
-
+/**
+ * Session preset wiring for the composer. The list itself comes from the
+ * mention popover, so this only carries the active selection and the write.
+ */
 type ChatPresetSelector = {
   label: string
-  presets?: AgentPresetReadMinimal[]
-  presetsIsLoading: boolean
-  presetsError: unknown
   selectedPresetId: string | null
-  onSelect: (presetId: string | null) => void | Promise<void>
+  /**
+   * Awaited before a message is sent so the preset lands on the same turn.
+   * Resolves false when the write failed, which aborts the send.
+   */
+  onSelect: (presetId: string | null) => Promise<boolean>
   disabled?: boolean
   showSpinner?: boolean
-  noPresetDescription?: string
 }
 
 export interface ChatSessionPaneProps {
@@ -234,9 +223,14 @@ export interface ChatSessionPaneProps {
   placeholder?: string
   onMessagesChange?: (messages: UIMessage[]) => void
   onData?: ChatOnDataCallback<UIMessage>
-  modelInfo: ModelInfo
+  /** Called whenever the underlying chat transport status changes. */
+  onStatusChange?: (status: ChatStatus) => void
+  modelInfo?: ModelInfo
+  /** Shown in the message area until the conversation has content. */
+  emptyState?: ReactNode
   toolsEnabled?: boolean
-  agentAddonsEnabled?: boolean
+  /** Whether `@` offers agent presets on this surface. */
+  agentMentionsSupported?: boolean
   mcpEnabled?: boolean
   /** Autofocus the prompt input when the pane mounts. */
   autoFocusInput?: boolean
@@ -281,7 +275,17 @@ export interface ChatSessionPaneProps {
   presetSelector?: ChatPresetSelector
   /** Selects the chat stream projection and surrounding UI surface. */
   surface?: ChatSurface
+  /** Center the thread and prompt in a readable column. Defaults to on for workspace chat. */
+  centered?: boolean
+  /**
+   * Reconnect to the live event stream on mount. Defaults to true. Set to
+   * false for terminal sessions whose history is already loaded, to avoid
+   * replaying the last turn on top of the seeded messages.
+   */
+  resume?: boolean
 }
+
+export { AGENT_EXECUTE_REQUIRED_MESSAGE }
 
 export function ChatSessionPane({
   chat,
@@ -292,9 +296,11 @@ export function ChatSessionPane({
   placeholder = "Ask your question...",
   onMessagesChange,
   onData,
+  onStatusChange,
   modelInfo,
+  emptyState,
   toolsEnabled = true,
-  agentAddonsEnabled = true,
+  agentMentionsSupported = false,
   mcpEnabled = false,
   autoFocusInput = false,
   onBeforeSend,
@@ -305,8 +311,12 @@ export function ChatSessionPane({
   inputDisabledPlaceholder,
   presetSelector,
   surface = "regular",
+  centered,
+  resume = true,
 }: ChatSessionPaneProps) {
   const queryClient = useQueryClient()
+  const pageContext = useContext(PageContext)
+  const formsAccess = useFormsAccess()
   const promptInputContainerRef = useRef<HTMLDivElement>(null)
   const promptTextareaFocusedRef = useRef(false)
   const shouldRestoreInputFocusRef = useRef(false)
@@ -321,7 +331,26 @@ export function ChatSessionPane({
   >(undefined)
 
   const [input, setInput] = useState<string>("")
-  const [toolMention, setToolMention] = useState<ToolMentionState>()
+  const [isInputFocused, setIsInputFocused] = useState(false)
+  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const getInputText = useCallback(() => input, [input])
+  const mentions = useMentions({
+    workspaceId,
+    textareaRef: promptTextareaRef,
+    getText: getInputText,
+    setText: setInput,
+    // Chat offers no `/` workflow commands.
+    agents: agentMentionsSupported
+      ? { entitlements: [], single: true }
+      : undefined,
+  })
+  const {
+    handleTextChange: handleMentionTextChange,
+    handleKeyDown: handleMentionKeyDown,
+    dismiss: dismissMentions,
+    dropPrefix: dropMentionPrefix,
+    applySplice: applyMentionSplice,
+  } = mentions
   const [selectedTools, setSelectedTools] = useState<string[]>([])
   const [selectedMcpIntegrations, setSelectedMcpIntegrations] = useState<
     string[]
@@ -331,38 +360,120 @@ export function ChatSessionPane({
   >(null)
   const optimisticMessageKnownTextPartKeysRef = useRef<Set<string>>(new Set())
   const { updateChat, isUpdating: isUpdatingTools } = useUpdateChat(workspaceId)
-  const { registryActions, registryActionsIsLoading } =
-    useBuilderRegistryActions()
+  const { cancelChatTurn, isCancellingChatTurn } =
+    useCancelChatTurn(workspaceId)
+  const { registryActions } = useBuilderRegistryActions()
   const sessionMcpEnabled = mcpEnabled && entityType === "copilot"
   const { mcpIntegrations } = useListMcpIntegrations(workspaceId, undefined, {
     enabled: toolsEnabled && sessionMcpEnabled,
   })
 
-  // Check if this is a legacy read-only session
+  // Read-only state includes ownership, backend availability, and entitlements.
   const isReadonly = chat ? "is_readonly" in chat && chat.is_readonly : false
+  // Sending, retrying and approving all run the agent. `undefined` means the
+  // scopes are still loading, which must not disable anything.
+  const cannotExecuteAgents = useScopeCheck("agent:execute") === false
+  let readonlyDescription =
+    chat && "user_id" in chat
+      ? "This legacy conversation is read-only."
+      : "This conversation is read-only."
+  if (chat && "spawned_by_session_id" in chat && chat.spawned_by_session_id) {
+    readonlyDescription =
+      "This subagent conversation is read-only. Message the parent conversation instead."
+  }
 
   const uiMessages = useMemo(
     () => (chat?.messages || []).map(toUIMessage),
     [chat?.messages]
   )
   const isWorkspaceChat = surface === "workspace-chat"
-  const chatContentCenterClass = isWorkspaceChat
+  const isCentered = centered ?? isWorkspaceChat
+  const chatContentCenterClass = isCentered
     ? "mx-auto w-full max-w-[56rem]"
     : undefined
-  const promptCenterClass = isWorkspaceChat
+  const promptCenterClass = isCentered
     ? "relative mx-auto w-full max-w-[56rem]"
     : "relative"
-  const promptInputClassName = isWorkspaceChat
+  const promptInputClassName = isCentered
     ? "[&_[data-slot=input-group]]:rounded-2xl [&_[data-slot=input-group]]:border-muted-foreground/25 [&_[data-slot=input-group]]:shadow-none"
     : undefined
-  const { sendMessage, messages, status, regenerate, lastError, clearError } =
-    useVercelChat({
-      chatId: chat?.id,
-      workspaceId,
-      messages: uiMessages,
-      modelInfo,
-      onData,
-    })
+  // A session opened to send its first message has no stream to resume, and a
+  // resume that finds none resets the send's status. Only that is frozen per
+  // chat; later resume changes still re-arm the reconnect.
+  const [openedToSend, setOpenedToSend] = useState(() => ({
+    chatId: chat?.id,
+    value: Boolean(pendingMessage),
+  }))
+  if (openedToSend.chatId !== chat?.id) {
+    setOpenedToSend({ chatId: chat?.id, value: Boolean(pendingMessage) })
+  }
+  const {
+    sendMessage,
+    messages,
+    setMessages,
+    status,
+    lastError,
+    lastErrorDisconnected,
+    clearError,
+    retryTurn,
+    subagentStore,
+  } = useVercelChat({
+    chatId: chat?.id,
+    workspaceId,
+    messages: uiMessages,
+    modelInfo,
+    onData,
+    pageContext,
+    resume: resume && !openedToSend.value,
+  })
+  const [verbosity] = useChatVerbosityPreference()
+  const verbosityPolicy = getChatVerbosityPolicy(verbosity)
+  const subagentStreamContext = useMemo(
+    () =>
+      subagentStore ? { store: subagentStore, workspaceId, status } : null,
+    [subagentStore, workspaceId, status]
+  )
+
+  // Prefer the live streaming error; fall back to the persisted last_error so a
+  // reopened session whose last run failed still surfaces why (the live error
+  // only exists during/right after the failing run).
+  //
+  // Suppress both the moment a new turn starts — optimistically on submit,
+  // before the backend clears last_error — because the new run (or a reload's
+  // replay of a dropped one) produces its own outcome that supersedes them.
+  const hasNewTurnStarted =
+    optimisticMessageText !== null ||
+    status === "submitted" ||
+    status === "streaming"
+  const persistedError = chat ? getSessionLastError(chat) : null
+  const displayedError = hasNewTurnStarted
+    ? null
+    : (lastError ?? persistedError)
+
+  useAdoptServerTranscript({
+    status,
+    serverMessages: uiMessages,
+    liveMessages: messages,
+    setMessages,
+  })
+
+  // Another tab or the Inbox can decide an approval this pane shows as
+  // waiting. Poll the session while one waits and the pane is idle, so the
+  // decision replaces the stale card through the adoption above.
+  const awaitingApproval = useMemo(
+    () => status === "ready" && getPendingApprovalIds(messages).size > 0,
+    [status, messages]
+  )
+  useGetChatVercel({
+    chatId: chat?.id,
+    workspaceId,
+    enabled: awaitingApproval,
+    refetchInterval: awaitingApproval ? APPROVAL_REFRESH_MS : false,
+  })
+
+  useEffect(() => {
+    onStatusChange?.(status)
+  }, [status, onStatusChange])
 
   const hasOptimisticMessageInStream = useMemo(
     () =>
@@ -388,7 +499,8 @@ export function ChatSessionPane({
 
   // Send pending message on mount (used after forking)
   useEffect(() => {
-    if (!pendingMessage || isReadonly || !chat) return
+    if (!pendingMessage || isReadonly || cannotExecuteAgents) return
+    if (!chat || !modelInfo) return
 
     const messageKey = `${chat.id}:${pendingMessage}`
     if (pendingMessageSentRef.current === messageKey) return
@@ -400,7 +512,9 @@ export function ChatSessionPane({
   }, [
     pendingMessage,
     isReadonly,
+    cannotExecuteAgents,
     chat,
+    modelInfo,
     clearError,
     sendMessage,
     onPendingMessageSent,
@@ -408,33 +522,115 @@ export function ChatSessionPane({
 
   // Allow input when ready OR in error state (so user can retry after transient failures)
   const canSubmit = status === "ready" || status === "error"
-
-  const isWaitingForResponse = useMemo(() => {
-    if (status === "submitted") return true
-    if (status === "streaming") {
-      const lastMessage = messages[messages.length - 1]
-      if (!lastMessage || lastMessage.role !== "assistant") return true
-
-      const lastPart = lastMessage.parts[lastMessage.parts.length - 1]
-      if (!lastPart) return true
-
-      const isStreamingVisual =
-        (lastPart.type === "text" && lastPart.text.length > 0) ||
-        (lastPart.type === "reasoning" && lastPart.text.length > 0) ||
-        (isToolUIPart(lastPart) && lastPart.state === "input-streaming")
-
-      if (lastPart.type === "data-approval-request") return false
-
-      return !isStreamingVisual
+  const isGeneratingTurn = status === "submitted" || status === "streaming"
+  const capabilities =
+    chat && "capabilities" in chat ? (chat.capabilities ?? {}) : {}
+  const { pending, refreshPending, withdraw } = usePendingMessages({
+    workspaceId,
+    chatId: chat?.id,
+    // The list is the owner's to withdraw; read-only viewers never fetch it.
+    enabled:
+      isGeneratingTurn &&
+      !isReadonly &&
+      !cannotExecuteAgents &&
+      !!capabilities.listing_pending,
+  })
+  const restoreInput = useCallback(
+    (text: string) => {
+      const draft = promptTextareaRef.current?.value ?? ""
+      const prefix = draft ? `${text}\n` : text
+      // Shift bound mentions past the restored text, and close an open
+      // mention query: its token offsets would otherwise point into the
+      // restored text.
+      dismissMentions()
+      applyMentionSplice({ start: 0, deleted: 0, inserted: prefix.length })
+      setInput(prefix + draft)
+    },
+    [applyMentionSplice, dismissMentions]
+  )
+  const runningComposer = useRunningComposer({
+    chatId: chat?.id,
+    workspaceId,
+    capabilities,
+    running: isGeneratingTurn,
+    messages,
+    pending,
+    refreshPending,
+    withdraw,
+    restoreInput,
+  })
+  // Takes the composer's input while a turn runs, when an extension offers it.
+  const steerComposer =
+    isGeneratingTurn && !isReadonly && !cannotExecuteAgents
+      ? runningComposer
+      : undefined
+  const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (handleMentionKeyDown(event)) return
+    // Escape during IME composition cancels the candidate, not the messages.
+    if (
+      event.key === "Escape" &&
+      !event.nativeEvent.isComposing &&
+      steerComposer?.onEscape
+    ) {
+      event.preventDefault()
+      steerComposer.onEscape()
     }
-    return false
-  }, [status, messages])
+  }
 
+  const isWaitingForResponse = useMemo(
+    () => isAwaitingOutput(status, messages),
+    [status, messages]
+  )
   const isOptimisticBeforeSendPending = optimisticMessageText !== null
   const isInputDisabled =
-    isReadonly || inputDisabled || isOptimisticBeforeSendPending || !canSubmit
+    isReadonly ||
+    cannotExecuteAgents ||
+    inputDisabled ||
+    isOptimisticBeforeSendPending ||
+    (!canSubmit && !steerComposer)
+
+  let composerPlaceholder = steerComposer?.placeholder ?? placeholder
+  if (isReadonly) {
+    composerPlaceholder = readonlyDescription
+  } else if (cannotExecuteAgents) {
+    composerPlaceholder = AGENT_EXECUTE_REQUIRED_MESSAGE
+  } else if (
+    (inputDisabled || isOptimisticBeforeSendPending) &&
+    inputDisabledPlaceholder
+  ) {
+    composerPlaceholder = inputDisabledPlaceholder
+  }
+
+  const [cancelRequested, setCancelRequested] = useState(false)
+
+  useEffect(() => {
+    if (!isGeneratingTurn) setCancelRequested(false)
+  }, [isGeneratingTurn])
+
+  const handleStop = useCallback(async () => {
+    if (!chat?.id || cancelRequested || isReadonly || cannotExecuteAgents)
+      return
+    setCancelRequested(true)
+    try {
+      await cancelChatTurn({ chatId: chat.id })
+    } catch (error) {
+      setCancelRequested(false)
+      toast({
+        title: "Failed to stop run",
+        description: parseChatError(error),
+      })
+    }
+  }, [
+    cancelChatTurn,
+    cancelRequested,
+    chat?.id,
+    isReadonly,
+    cannotExecuteAgents,
+  ])
   const isInputDisabledRef = useRef(isInputDisabled)
   isInputDisabledRef.current = isInputDisabled
+  /** Guards `handleSubmit` against re-entry while it awaits a preset write. */
+  const submitInFlightRef = useRef(false)
   const wasInputDisabledRef = useRef(isInputDisabled)
 
   useEffect(() => {
@@ -492,12 +688,55 @@ export function ChatSessionPane({
     }
   }, [isInputDisabled])
 
+  /**
+   * Approval IDs the session still waits on, read fresh from the server, or
+   * null when it cannot be read. A waiting approval's card is always in the
+   * session's history, so a missing card means it was decided.
+   */
+  const fetchPendingApprovalIds = useCallback(async () => {
+    if (!chat?.id) return null
+    const queryKey = ["chat", chat.id, workspaceId, "vercel"]
+    try {
+      await queryClient.refetchQueries(
+        { queryKey, exact: true },
+        { throwOnError: true }
+      )
+    } catch {
+      return null
+    }
+    const fresh = queryClient.getQueryData<
+      AgentSessionReadVercel | ChatReadVercel
+    >(queryKey)
+    return fresh
+      ? getPendingApprovalIds((fresh.messages ?? []).map(toUIMessage))
+      : null
+  }, [chat?.id, queryClient, workspaceId])
+
+  const [sentDecisions, setSentDecisions] = useState<ApprovalDecision[]>([])
   const handleSubmitApprovals = useCallback(
-    async (decisionPayload: ApprovalDecision[]) => {
-      if (!decisionPayload.length) return
+    async (decisionPayload: ApprovalDecision[]): Promise<string[]> => {
+      if (isReadonly || !decisionPayload.length) return []
+      // Another tab or the Inbox may have decided these since this pane last
+      // refreshed, so submit only the decisions the session still waits on.
+      const pendingIds = await fetchPendingApprovalIds()
+      const decisions = pendingIds
+        ? decisionPayload.filter(({ tool_call_id }) =>
+            pendingIds.has(tool_call_id)
+          )
+        : decisionPayload
+      if (decisions.length === 0) {
+        toast({
+          title: "Already decided",
+          description:
+            "This approval was decided elsewhere. The chat now shows the outcome.",
+        })
+        throw new ApprovalsAlreadyDecidedError()
+      }
       try {
         clearError()
-        await sendMessage(makeContinueMessage(decisionPayload))
+        await sendMessage(makeContinueMessage(decisions))
+        setSentDecisions((prev) => [...prev, ...decisions])
+        return decisions.map(({ tool_call_id }) => tool_call_id)
       } catch (error) {
         console.error("Failed to submit approvals", error)
         toast({
@@ -509,28 +748,49 @@ export function ChatSessionPane({
         throw error
       }
     },
-    [clearError, sendMessage]
+    [clearError, fetchPendingApprovalIds, isReadonly, sendMessage]
+  )
+
+  const [sentApprovalIds, setSentApprovalIds] = useState<ReadonlySet<string>>(
+    () => new Set()
+  )
+  const [deniedApprovalIds, setDeniedApprovalIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set())
+  const handleSubmitComposerApprovals = useCallback(
+    async (decisionPayload: ApprovalDecision[]): Promise<string[]> => {
+      const sentIds = await handleSubmitApprovals(decisionPayload)
+      const sent = new Set(sentIds)
+      const deniedIds = decisionPayload
+        .filter(
+          ({ action, tool_call_id }) =>
+            action === "deny" && sent.has(tool_call_id)
+        )
+        .map(({ tool_call_id }) => tool_call_id)
+      setSentApprovalIds((prev) => new Set([...prev, ...sentIds]))
+      setDeniedApprovalIds((prev) => new Set([...prev, ...deniedIds]))
+      return sentIds
+    },
+    [handleSubmitApprovals]
   )
 
   useEffect(() => {
     onMessagesChange?.(messages)
   }, [messages, onMessagesChange])
 
-  const toolSuggestions = useMemo<ToolSuggestion[]>(() => {
-    const actions = registryActions ?? []
-    return actions
-      .map((action) => ({
-        value: action.action,
-        label: action.default_title || action.action,
-        description: action.description ?? undefined,
-        group: action.namespace,
-      }))
-      .sort((left, right) => left.value.localeCompare(right.value))
-  }, [registryActions])
-
-  const toolSuggestionMap = useMemo(
-    () => new Map(toolSuggestions.map((tool) => [tool.value, tool])),
-    [toolSuggestions]
+  // Display labels for the selected-tool chips. Tools are picked in the Tools
+  // popover, which builds its own list, so nothing here needs ordering.
+  const toolLabels = useMemo(
+    () =>
+      new Map<string, string>(
+        (registryActions ?? [])
+          .filter((action) => isAgentToolSelectable(action.action))
+          .map((action) => [
+            action.action,
+            action.default_title || action.action,
+          ])
+      ),
+    [registryActions]
   )
 
   const persistToolsChainRef = useRef<Promise<void>>(Promise.resolve())
@@ -606,7 +866,11 @@ export function ChatSessionPane({
 
   const commitSelectedTools = useCallback(
     (next: string[]) => {
-      if (areToolListsEqual(selectedToolsRef.current, next)) {
+      // Changing a session's tools is a session update that needs agent:execute.
+      if (
+        cannotExecuteAgents ||
+        areToolListsEqual(selectedToolsRef.current, next)
+      ) {
         return
       }
 
@@ -621,7 +885,7 @@ export function ChatSessionPane({
       pendingPersistedToolsRef.current = next
       void queuePersistTools(next)
     },
-    [chat, isReadonly, queuePersistTools]
+    [cannotExecuteAgents, chat, isReadonly, queuePersistTools]
   )
 
   const persistMcpChainRef = useRef<Promise<void>>(Promise.resolve())
@@ -710,17 +974,6 @@ export function ChatSessionPane({
     [chat, isReadonly, updateChat]
   )
 
-  const addSelectedTool = useCallback(
-    (toolName: string) => {
-      if (selectedToolsRef.current.includes(toolName)) {
-        return
-      }
-
-      commitSelectedTools([...selectedToolsRef.current, toolName])
-    },
-    [commitSelectedTools]
-  )
-
   const removeSelectedTool = useCallback(
     (toolName: string) => {
       commitSelectedTools(
@@ -730,180 +983,23 @@ export function ChatSessionPane({
     [commitSelectedTools]
   )
 
-  const mentionEnabled =
-    toolsEnabled && !isReadonly && !inputDisabled && canSubmit
-
-  useEffect(() => {
-    if (!mentionEnabled) {
-      setToolMention(undefined)
-    }
-  }, [mentionEnabled])
-
-  const filteredToolSuggestions = useMemo(() => {
-    if (!toolMention) {
-      return []
-    }
-
-    const needle = toolMention.query.trim().toLowerCase()
-    const matches = toolSuggestions.filter((tool) => {
-      if (!needle) {
-        return true
-      }
-      return [tool.value, tool.label, tool.description ?? "", tool.group ?? ""]
-        .join(" ")
-        .toLowerCase()
-        .includes(needle)
-    })
-    return matches.slice(0, MAX_TOOL_MENTION_RESULTS)
-  }, [toolMention, toolSuggestions])
-
-  useEffect(() => {
-    if (!toolMention) {
-      return
-    }
-    if (filteredToolSuggestions.length === 0) {
-      setToolMention((current) => {
-        if (!current || current.activeIndex === 0) {
-          return current
-        }
-        return { ...current, activeIndex: 0 }
-      })
-      return
-    }
-
-    setToolMention((current) => {
-      if (!current) {
-        return current
-      }
-      const clampedIndex = Math.min(
-        current.activeIndex,
-        filteredToolSuggestions.length - 1
-      )
-      if (clampedIndex === current.activeIndex) {
-        return current
-      }
-      return { ...current, activeIndex: clampedIndex }
-    })
-  }, [filteredToolSuggestions.length, toolMention])
-
-  const handleSelectMentionTool = useCallback(
-    (toolName: string, textarea?: HTMLTextAreaElement) => {
-      const mention = toolMention
-      if (!mention) {
-        return
-      }
-
-      addSelectedTool(toolName)
-      setInput((current) => {
-        const before = current.slice(0, mention.start)
-        const after = current.slice(mention.end)
-        return `${before}${after}`
-      })
-      setToolMention(undefined)
-
-      if (!textarea) {
-        return
-      }
-
-      const caretPosition = mention.start
-      requestAnimationFrame(() => {
-        textarea.focus()
-        textarea.setSelectionRange(caretPosition, caretPosition)
-      })
-    },
-    [addSelectedTool, toolMention]
-  )
-
   const handleInputChange = useCallback(
     (event: ChangeEvent<HTMLTextAreaElement>) => {
       const nextText = event.target.value
+      // The mention layer diffs against the previous value, so it has to run
+      // before the new text lands in state.
+      handleMentionTextChange(
+        nextText,
+        event.target.selectionStart ?? nextText.length
+      )
       setInput(nextText)
-
-      if (!mentionEnabled) {
-        setToolMention(undefined)
-        return
-      }
-
-      const caret = event.target.selectionStart ?? nextText.length
-      const nextMention = getToolMentionToken(nextText, caret)
-      if (!nextMention) {
-        setToolMention(undefined)
-        return
-      }
-
-      setToolMention((current) => ({
-        ...nextMention,
-        activeIndex: current?.activeIndex ?? 0,
-      }))
     },
-    [mentionEnabled]
-  )
-
-  const handleInputKeyDown = useCallback(
-    (event: KeyboardEvent<HTMLTextAreaElement>) => {
-      if (!toolMention) {
-        return
-      }
-
-      if (event.key === "Escape") {
-        event.preventDefault()
-        setToolMention(undefined)
-        return
-      }
-
-      if (event.key === "ArrowDown") {
-        event.preventDefault()
-        if (filteredToolSuggestions.length === 0) {
-          return
-        }
-        setToolMention((current) => {
-          if (!current) {
-            return current
-          }
-          return {
-            ...current,
-            activeIndex:
-              (current.activeIndex + 1) % filteredToolSuggestions.length,
-          }
-        })
-        return
-      }
-
-      if (event.key === "ArrowUp") {
-        event.preventDefault()
-        if (filteredToolSuggestions.length === 0) {
-          return
-        }
-        setToolMention((current) => {
-          if (!current) {
-            return current
-          }
-          const nextIndex =
-            (current.activeIndex - 1 + filteredToolSuggestions.length) %
-            filteredToolSuggestions.length
-          return { ...current, activeIndex: nextIndex }
-        })
-        return
-      }
-
-      if (
-        (event.key === "Enter" || event.key === "Tab") &&
-        filteredToolSuggestions.length > 0
-      ) {
-        event.preventDefault()
-        const selected =
-          filteredToolSuggestions[toolMention.activeIndex] ??
-          filteredToolSuggestions[0]
-        if (selected) {
-          handleSelectMentionTool(selected.value, event.currentTarget)
-        }
-      }
-    },
-    [filteredToolSuggestions, handleSelectMentionTool, toolMention]
+    [handleMentionTextChange]
   )
 
   const handleInputFocus = useCallback(() => {
     promptTextareaFocusedRef.current = true
+    setIsInputFocused(true)
   }, [])
 
   const handlePromptPointerDownCapture = useCallback(() => {
@@ -919,7 +1015,8 @@ export function ChatSessionPane({
 
   const handleInputBlur = useCallback(
     (event: FocusEvent<HTMLTextAreaElement>) => {
-      setToolMention(undefined)
+      setIsInputFocused(false)
+      dismissMentions()
 
       const nextFocusedElement = event.relatedTarget
       if (
@@ -938,7 +1035,7 @@ export function ChatSessionPane({
         shouldRestoreInputFocusRef.current = false
       }
     },
-    []
+    [dismissMentions]
   )
 
   useEffect(() => {
@@ -951,22 +1048,117 @@ export function ChatSessionPane({
 
   const selectedToolBadges = useMemo(
     () =>
-      selectedTools.map((toolName) => {
-        const suggestion = toolSuggestionMap.get(toolName)
-        return {
-          value: toolName,
-          label: suggestion?.label ?? toolName,
-          icon: getIcon(toolName, {
-            className: "size-5 shrink-0",
-          }),
-        }
-      }),
-    [selectedTools, toolSuggestionMap]
+      selectedTools.map((toolName) => ({
+        value: toolName,
+        label: toolLabels.get(toolName) ?? toolName,
+        icon: getIcon(toolName, {
+          className: "size-5 shrink-0",
+        }),
+      })),
+    [selectedTools, toolLabels]
   )
 
+  const baseMessages = useMemo(
+    () => transformMessages(markLiveDenials(messages, sentDecisions)),
+    [messages, sentDecisions]
+  )
+  // Keeps the same array when nothing is hidden, so downstream memos hold.
   const transformedMessages = useMemo(
-    () => transformMessages(messages),
+    () => withoutStreamedError(baseMessages, displayedError),
+    [baseMessages, displayedError]
+  )
+
+  // Reads the merged thread so a continuation folded into an earlier card
+  // still keeps its working line.
+  const runningLineLabel = useMemo(
+    () => getRunningLineLabel(status, transformedMessages, verbosityPolicy),
+    [status, transformedMessages, verbosityPolicy]
+  )
+  const threadBlocks = useMemo(
+    () => groupThread(transformedMessages),
+    [transformedMessages]
+  )
+  // The latest turn's undecided calls, answered from the prompt box.
+  const composerApprovals = useMemo(() => {
+    const lastBlock = threadBlocks.at(-1)
+    if (isReadonly || lastBlock?.kind !== "turn") return []
+    return lastBlock.messages
+      .flatMap((message) => message.parts)
+      .flatMap((part) =>
+        part.type === "data-approval-request" && isApprovalCardArray(part.data)
+          ? part.data
+          : []
+      )
+      .filter(
+        (approval) =>
+          (!approval.status || approval.status === "pending") &&
+          !sentApprovalIds.has(approval.tool_call_id)
+      )
+  }, [isReadonly, sentApprovalIds, threadBlocks])
+  const approvalComposerContext = useMemo(
+    () =>
+      isReadonly
+        ? null
+        : {
+            composerIds: new Set(
+              composerApprovals.map(({ tool_call_id }) => tool_call_id)
+            ),
+            sentIds: sentApprovalIds,
+            deniedIds: deniedApprovalIds,
+          },
+    [composerApprovals, deniedApprovalIds, isReadonly, sentApprovalIds]
+  )
+  const lastMessageId = messages.at(-1)?.id
+
+  // Response actions go on the latest message on screen when it is the
+  // assistant's. That need not be the transcript's last message: a
+  // continuation whose results render in the cards that opened them shows
+  // nothing of its own.
+  const latestResponseIndex = useMemo(() => {
+    for (let index = transformedMessages.length - 1; index >= 0; index--) {
+      const { role, parts } = transformedMessages[index]
+      if (parts.some(isShownPart)) {
+        return role === "assistant" ? index : -1
+      }
+    }
+    return -1
+  }, [transformedMessages])
+
+  // Retry resends the request that started the latest turn, whichever message
+  // shows the action: the user's prompt, or the approval submission whose
+  // continuation failed. Regenerating from a later record would submit the
+  // record before it instead, and reloaded history splits one turn into
+  // several assistant records, some with only tool calls, followed by system
+  // records such as a compaction boundary.
+  const retryMessageId = useMemo(
+    () => messages.findLast(isTurnRequest)?.id,
     [messages]
+  )
+  // Retry starts a run, so it follows the composer's gate.
+  const canRetry =
+    !isWaitingForResponse &&
+    !isReadonly &&
+    !cannotExecuteAgents &&
+    !inputDisabled
+  const retryingRef = useRef(false)
+  const handleRetry = useCallback(async () => {
+    if (retryingRef.current) return
+    retryingRef.current = true
+    try {
+      await retryTurn(retryMessageId)
+    } catch {
+      toast({
+        title: "Couldn't reach Tracecat",
+        description: "Retry once the connection is back.",
+      })
+    } finally {
+      retryingRef.current = false
+    }
+  }, [retryTurn, retryMessageId])
+
+  const { cancelledTurnMessageIds, interruptedToolCallIds } = useMemo(
+    () => collectCancelledTurns(transformedMessages),
+    [transformedMessages]
   )
 
   const invalidateEntityQueries = useCallback(
@@ -1017,20 +1209,152 @@ export function ChatSessionPane({
   }, [messages, invalidateEntityQueries])
 
   const handleSubmit = async (message: PromptInputMessage) => {
+    if (steerComposer) {
+      await submitToRunningTurn(steerComposer, message)
+      return
+    }
     const hasText = Boolean(message.text?.trim())
 
-    if (!hasText) {
+    if (!hasText || isReadonly || !modelInfo) {
       return
     }
 
+    // A submit awaits the preset write before it sends, and the composer stays
+    // enabled meanwhile. Without this a second Enter would see the optimistic
+    // `selectedPresetId`, skip the write it is still waiting on, and send under
+    // the preset the server has -- then the first submit would resume and send
+    // again. A ref rather than state because two keystrokes in the same tick
+    // would both read a stale `false`.
+    if (submitInFlightRef.current) {
+      // Reject rather than return: a resolved duplicate makes `submitPrompt`
+      // clear attachments and blank the textarea, and the submit still running
+      // reads that live value to tell the sent message from a newer draft.
+      throw new SubmitAbandonedError("A submit is already in flight")
+    }
+    submitInFlightRef.current = true
+    try {
+      await submitMessage(message)
+    } finally {
+      submitInFlightRef.current = false
+    }
+  }
+
+  /** Hand the text to the running turn; the composer keeps it unless taken. */
+  const submitToRunningTurn = async (
+    composer: RunningComposer,
+    message: PromptInputMessage
+  ) => {
+    const messageText = message.text ?? ""
+    if (message.files.length > 0) {
+      // The running turn takes text only; keep the draft and its files.
+      toast({
+        title: "Attachments wait for the next message",
+        description: "Send them once the agent has finished.",
+      })
+      throw new SubmitAbandonedError("A running turn takes text only")
+    }
+    if (!messageText.trim()) return
+    if (submitInFlightRef.current) {
+      throw new SubmitAbandonedError("A submit is already in flight")
+    }
+    submitInFlightRef.current = true
+    try {
+      if (!(await composer.submit(messageText.trim()))) {
+        throw new SubmitAbandonedError("The running turn did not take it")
+      }
+    } finally {
+      submitInFlightRef.current = false
+    }
+    // Keep whatever was typed while the submit was in flight.
+    const live = promptTextareaRef.current?.value ?? ""
+    const remaining = live.startsWith(messageText)
+      ? live.slice(messageText.length)
+      : live
+    setInput(remaining)
+    dropMentionPrefix(live.length - remaining.length)
+  }
+
+  const submitMessage = async (message: PromptInputMessage) => {
     const messageText = message.text || ""
+
+    // An `@Agent` mention sets the session preset for the whole conversation.
+    // Awaited first so the write lands before the turn is sent, and before the
+    // tool and MCP persistence chains below.
+    const agentMention = findAgentMention(mentions.ranges)
+    if (agentMention) {
+      // The mention names the agent that should answer, so nothing below may
+      // fall through and run the turn under the previous one.
+      if (!presetSelector) {
+        // `ChatInterface` drops the selector as soon as agent add-ons stop
+        // resolving -- revoked, or a refetch that failed -- while the bound
+        // range survives in the composer. Nothing here can apply the mention,
+        // and nothing else would tell the user, so say so before abandoning.
+        toast({
+          title: "Could not route to the mentioned agent",
+          description:
+            "Agent presets are unavailable right now. Reload and try again.",
+        })
+        throw new SubmitAbandonedError("Preset selector is unavailable")
+      }
+      if (agentMention.targetId !== presetSelector.selectedPresetId) {
+        // The draft is left intact -- `handlePresetChange` has already toasted
+        // the error -- so the user can retry.
+        const applied = await presetSelector.onSelect(agentMention.targetId)
+        if (!applied) {
+          // Reject rather than return: `submitPrompt` treats a resolved submit
+          // as sent and runs its cleanup, which drops any attached files even
+          // though nothing left the composer. It swallows a rejection instead.
+          throw new SubmitAbandonedError(
+            "Failed to persist the mentioned agent preset"
+          )
+        }
+      }
+    }
+
+    // Enter does not empty the box until the awaits here resolve, so the user
+    // carries on typing onto the end of the message being sent. Only what
+    // follows it is a new draft: keeping the whole value would strand the sent
+    // text in the composer for the next submit to send again. `input` is this
+    // closure's snapshot, so only the ref knows the live value.
+    const remainingDraft = () => {
+      const live = promptTextareaRef.current?.value ?? ""
+      return live.startsWith(messageText)
+        ? live.slice(messageText.length)
+        : live
+    }
+    // Ranges follow the text they describe: the ones inside the prefix go with
+    // it, the rest keep their bindings at their new offsets. Clearing them all
+    // would unbind a mention picked while this submit was in flight, leaving
+    // the surviving draft naming an agent that its own submit would not route
+    // to. `dropPrefix` re-reads the ranges, since this closure's copy predates
+    // any such pick.
+    const clearSubmittedDraft = () => {
+      const live = promptTextareaRef.current?.value ?? ""
+      const remaining = remainingDraft()
+      setInput(remaining)
+      dropMentionPrefix(live.length - remaining.length)
+    }
+
+    // The optimistic branch blanks the composer before `onBeforeSend` resolves,
+    // so the submitted text's bindings have to come off at the same moment.
+    // Held here so a cancelled submit can put them back with the text.
+    let submittedMentions: MentionRange[] = []
 
     if (onBeforeSend) {
       if (optimisticBeforeSend) {
         optimisticMessageKnownTextPartKeysRef.current =
           matchingUserTextPartKeys(messages, messageText)
         setOptimisticMessageText(messageText)
-        setInput("")
+        // Cut the prefix now, while the live value still carries it. Leaving it
+        // to the `clearSubmittedDraft` below would measure a zero cut against a
+        // composer this branch has already blanked, and the submitted mention
+        // would outlive its text as a range nothing renders -- which the next
+        // send reads back, re-applying a preset the user has since cleared.
+        // Cutting here rather than after the await is also what keeps a mention
+        // picked while the await runs: its offsets are already relative to the
+        // blanked composer, so a deferred cut would filter it out instead.
+        submittedMentions = mentions.ranges
+        clearSubmittedDraft()
       }
 
       const result = await onBeforeSend(
@@ -1041,11 +1365,20 @@ export function ChatSessionPane({
       // Only clear input if onBeforeSend succeeded (non-null)
       // If null, the action was cancelled and user keeps their draft
       if (result !== null) {
-        setInput("")
+        clearSubmittedDraft()
       } else if (optimisticBeforeSend) {
         optimisticMessageKnownTextPartKeysRef.current = new Set()
         setOptimisticMessageText(null)
-        setInput(messageText)
+        // Restoring the cancelled message would clobber a newer draft.
+        if (!remainingDraft()) {
+          // The bindings go back with the text: a restored draft that still
+          // reads `@Agent` has to route there when the user retries it.
+          mentions.commitEdit({
+            text: messageText,
+            mentions: submittedMentions,
+            caret: messageText.length,
+          })
+        }
       }
       // Parent will handle switching sessions and sending via pendingMessage
       return
@@ -1056,7 +1389,7 @@ export function ChatSessionPane({
     }
 
     // Clear input for normal message sending
-    setInput("")
+    clearSubmittedDraft()
 
     try {
       await persistToolsChainRef.current.catch(() => undefined)
@@ -1071,162 +1404,155 @@ export function ChatSessionPane({
     }
   }
 
-  const promptComposer = (
-    <div ref={promptInputContainerRef} className={promptCenterClass}>
-      {mentionEnabled && toolMention && (
-        <div className="absolute inset-x-0 bottom-full z-30 mb-2">
-          <div className="overflow-hidden rounded-md border bg-popover shadow-md">
-            {registryActionsIsLoading ? (
-              <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
-                <Loader2 className="size-3 animate-spin" />
-                Loading tools...
-              </div>
-            ) : null}
-            {!registryActionsIsLoading &&
-              filteredToolSuggestions.length === 0 && (
-                <div className="px-3 py-2 text-xs text-muted-foreground">
-                  No tools found for
-                  {` "${toolMention.query}"`}.
-                </div>
-              )}
-            {!registryActionsIsLoading &&
-              filteredToolSuggestions.length > 0 && (
-                <div className="max-h-64 overflow-y-auto p-1">
-                  {filteredToolSuggestions.map((tool, index) => {
-                    const isActive = toolMention.activeIndex === index
-                    const isSelected = selectedTools.includes(tool.value)
+  // The badge stands in for the hint once a preset owns the session. Unlike the
+  // hint it is state rather than a discoverability cue, so focus does not gate
+  // it.
+  const activePresetLabel =
+    presetSelector && !isReadonly && presetSelector.selectedPresetId
+      ? presetSelector.label
+      : null
 
-                    return (
-                      <button
-                        key={tool.value}
-                        type="button"
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => handleSelectMentionTool(tool.value)}
-                        className={cn(
-                          "flex w-full items-start justify-between gap-2 rounded-sm px-2 py-2 text-left",
-                          isActive && "bg-accent"
-                        )}
-                      >
-                        <div className="flex min-w-0 items-start gap-2">
-                          {getIcon(tool.value, {
-                            className: "mt-0.5 size-6 shrink-0",
-                          })}
-                          <div className="min-w-0">
-                            <p className="truncate text-xs font-medium text-foreground">
-                              {tool.label}
-                            </p>
-                            <p className="truncate text-[11px] text-muted-foreground">
-                              {tool.value}
-                            </p>
-                          </div>
-                        </div>
-                        {isSelected ? (
-                          <CheckIcon className="mt-0.5 size-3.5 text-muted-foreground" />
-                        ) : null}
-                      </button>
-                    )
-                  })}
-                </div>
-              )}
-          </div>
+  const promptBox = (
+    <div ref={promptInputContainerRef} className={promptCenterClass}>
+      {runningComposer?.panel}
+      {isReadonly ? (
+        <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+          <Badge variant="outline" className="px-1.5 py-0 font-normal">
+            Read only
+          </Badge>
+          {readonlyDescription}
         </div>
-      )}
-      <PromptInput onSubmit={handleSubmit} className={promptInputClassName}>
-        {/* Workspace chat surfaces attached tools via the Tools popover, so the
-            header chip row is reserved for the other chat surfaces. */}
-        {toolsEnabled && !isWorkspaceChat && selectedToolBadges.length > 0 && (
-          <PromptInputHeader className="gap-1.5 px-3 pt-3">
-            {selectedToolBadges.map((tool) => (
-              <Badge
-                key={tool.value}
-                variant="secondary"
-                className="h-7 gap-1.5 px-2.5 text-xs"
-              >
-                <span className="inline-flex items-center justify-center text-foreground">
-                  {tool.icon}
-                </span>
-                <span className="truncate">{tool.label}</span>
-                <button
-                  type="button"
-                  className="inline-flex items-center text-muted-foreground hover:text-foreground"
-                  aria-label={`Remove ${tool.label}`}
-                  onClick={() => removeSelectedTool(tool.value)}
+      ) : null}
+      <MentionPopover
+        open={mentions.isOpen}
+        kind={mentions.kind}
+        caret={mentions.caret}
+        sections={mentions.sections}
+        itemCount={mentions.itemCount}
+        activeIndex={mentions.activeIndex}
+        isLoading={mentions.isLoading}
+        locked={mentions.locked}
+        hasError={mentions.hasError}
+        onSelect={mentions.selectSuggestion}
+      >
+        <PromptInput onSubmit={handleSubmit} className={promptInputClassName}>
+          {/* Workspace chat surfaces attached tools via the Tools popover, so
+              the header chip row is reserved for the other chat surfaces. */}
+          {toolsEnabled &&
+            !isWorkspaceChat &&
+            selectedToolBadges.length > 0 && (
+              <SelectedToolsHeader
+                badges={selectedToolBadges}
+                onRemove={removeSelectedTool}
+                removeDisabled={
+                  isUpdatingTools ||
+                  isReadonly ||
+                  cannotExecuteAgents ||
+                  inputDisabled ||
+                  !toolsEnabled
+                }
+              />
+            )}
+          <PromptInputBody>
+            <PromptInputTextarea
+              ref={promptTextareaRef}
+              onChange={handleInputChange}
+              // The mention layer owns popover keys and atomic mention
+              // backspace. It calls preventDefault when it consumes a key,
+              // which is what stops the prompt input from submitting on Enter
+              // while the popover is open.
+              onKeyDown={handlePromptKeyDown}
+              onFocus={handleInputFocus}
+              onBlur={handleInputBlur}
+              onSelect={mentions.handleSelectionChange}
+              placeholder={composerPlaceholder}
+              value={input}
+              autoFocus={autoFocusInput && !isReadonly && !inputDisabled}
+              disabled={isInputDisabled}
+            />
+          </PromptInputBody>
+          <PromptInputFooter>
+            <PromptInputTools>
+              {toolsEnabled && !isReadonly && (
+                <ChatToolsPicker
+                  registryActions={registryActions ?? []}
+                  selectedTools={selectedTools}
+                  onToolsChange={commitSelectedTools}
+                  mcpIntegrations={mcpIntegrations ?? []}
+                  selectedMcpIntegrations={selectedMcpIntegrations}
+                  onMcpChange={commitSelectedMcpIntegrations}
+                  mcpEnabled={sessionMcpEnabled}
                   disabled={
-                    isUpdatingTools ||
-                    isReadonly ||
-                    inputDisabled ||
-                    !toolsEnabled
+                    inputDisabled || isUpdatingTools || cannotExecuteAgents
                   }
-                >
-                  <XIcon className="size-3.5" />
-                </button>
-              </Badge>
-            ))}
-          </PromptInputHeader>
-        )}
-        <PromptInputBody>
-          <PromptInputTextarea
-            onChange={handleInputChange}
-            onKeyDown={handleInputKeyDown}
-            onFocus={handleInputFocus}
-            onBlur={handleInputBlur}
-            placeholder={
-              isReadonly
-                ? "This is a legacy session (read-only)"
-                : (inputDisabled || isOptimisticBeforeSendPending) &&
-                    inputDisabledPlaceholder
-                  ? inputDisabledPlaceholder
-                  : placeholder
-            }
-            value={input}
-            autoFocus={autoFocusInput && !isReadonly && !inputDisabled}
-            disabled={isInputDisabled}
-          />
-        </PromptInputBody>
-        <PromptInputFooter>
-          <PromptInputTools>
-            {presetSelector && !isReadonly && (
-              <PromptPresetSelector
-                selector={presetSelector}
-                disabled={inputDisabled || !canSubmit}
+                  surface={surface}
+                  formsEnabled={formsAccess === "enabled"}
+                  mcpIntegrationsHref={`/workspaces/${workspaceId}/mcp-servers`}
+                />
+              )}
+              {!isReadonly && modelInfo ? (
+                <PromptModelIndicator modelInfo={modelInfo} />
+              ) : null}
+            </PromptInputTools>
+            <div className="flex items-center gap-2">
+              {activePresetLabel ? (
+                <ActivePresetBadge
+                  label={activePresetLabel}
+                  showSpinner={presetSelector?.showSpinner}
+                  disabled={
+                    presetSelector?.disabled ||
+                    inputDisabled ||
+                    cannotExecuteAgents ||
+                    !canSubmit
+                  }
+                  onClear={() => void presetSelector?.onSelect(null)}
+                />
+              ) : (
+                <MentionHint
+                  show={isInputFocused && !input.trim()}
+                  agents={mentions.agents}
+                  workflows={mentions.workflows}
+                />
+              )}
+              <PromptInputSubmit
+                disabled={
+                  isReadonly ||
+                  cannotExecuteAgents ||
+                  (isGeneratingTurn
+                    ? isCancellingChatTurn || cancelRequested
+                    : isInputDisabled || !input.trim())
+                }
+                onStop={() => void handleStop()}
+                status={status}
+                className="size-7 text-muted-foreground/80"
               />
-            )}
-            {toolsEnabled && !isReadonly && (
-              <ChatToolsPicker
-                registryActions={registryActions ?? []}
-                selectedTools={selectedTools}
-                onToolsChange={commitSelectedTools}
-                mcpIntegrations={mcpIntegrations ?? []}
-                selectedMcpIntegrations={selectedMcpIntegrations}
-                onMcpChange={commitSelectedMcpIntegrations}
-                agentAddonsEnabled={agentAddonsEnabled}
-                mcpEnabled={sessionMcpEnabled}
-                disabled={inputDisabled || isUpdatingTools}
-                surface={surface}
-                mcpIntegrationsHref={`/workspaces/${workspaceId}/mcp-servers`}
-              />
-            )}
-            {!isReadonly ? (
-              <PromptModelIndicator modelInfo={modelInfo} />
-            ) : null}
-          </PromptInputTools>
-          <PromptInputSubmit
-            disabled={isInputDisabled || !input.trim()}
-            status={status}
-            className="text-muted-foreground/80"
-          />
-        </PromptInputFooter>
-      </PromptInput>
+            </div>
+          </PromptInputFooter>
+        </PromptInput>
+      </MentionPopover>
     </div>
   )
 
-  const showEmptyHero =
-    isWorkspaceChat &&
-    !isReadonly &&
-    !lastError &&
+  const promptComposer =
+    composerApprovals.length > 0 && !isGeneratingTurn ? (
+      <div ref={promptInputContainerRef} className={promptCenterClass}>
+        <ApprovalRequestPart
+          key={composerApprovals.map((a) => a.tool_call_id).join(":")}
+          variant="composer"
+          approvals={composerApprovals}
+          onSubmit={handleSubmitComposerApprovals}
+        />
+      </div>
+    ) : (
+      promptBox
+    )
+
+  const isEmptyConversation =
+    !displayedError &&
     !optimisticMessageText &&
     !isWaitingForResponse &&
     !transformedMessages.some(messageHasVisibleParts)
+  const showEmptyHero = isWorkspaceChat && !isReadonly && isEmptyConversation
 
   if (showEmptyHero) {
     return (
@@ -1241,7 +1567,7 @@ export function ChatSessionPane({
     )
   }
 
-  return (
+  const conversationView = (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div className="flex min-h-0 flex-1 flex-col">
@@ -1250,106 +1576,95 @@ export function ChatSessionPane({
             resize={status === "streaming" ? "instant" : "smooth"}
           >
             <ConversationContent className={chatContentCenterClass}>
-              {lastError && (
-                <Alert variant="destructive" className="mb-4">
-                  <AlertTitle>Unable to continue with this model</AlertTitle>
-                  <AlertDescription>{lastError}</AlertDescription>
-                </Alert>
-              )}
               {optimisticMessageText ? (
                 <OptimisticPendingMessage text={optimisticMessageText} />
               ) : null}
-              {transformedMessages.map(({ id, role, parts }) => {
-                const visibleParts = parts?.filter(
-                  (part) => part.type !== ARTIFACT_DATA_PART_TYPE
-                )
-                if (!visibleParts?.length) {
-                  return null
+              {emptyState && isEmptyConversation ? (
+                <div className="flex min-h-[50vh] items-center justify-center">
+                  {emptyState}
+                </div>
+              ) : null}
+              {threadBlocks.map((block, blockIndex) => {
+                if (block.kind === "prompt") {
+                  const { message } = block
+                  if (!messageHasVisibleParts(message)) {
+                    return null
+                  }
+                  return (
+                    <div key={message.id} className="group relative">
+                      <MessageParts
+                        message={message}
+                        status={status}
+                        isLastMessage={message.id === lastMessageId}
+                        turnCancelled={cancelledTurnMessageIds.has(message.id)}
+                        interruptedToolCallIds={interruptedToolCallIds}
+                      />
+                    </div>
+                  )
                 }
-
-                // Track whether this message is the latest entry so we can keep its actions visible.
-                const isLastMessage = id === messages[messages.length - 1].id
-                const sourceUrlParts = visibleParts.filter(
-                  (part) => part.type === "source-url"
-                )
-                // Index of this message's "StructuredOutput" tool call, if
-                // any -- any text part after it is redundant (see
-                // MessagePart's isAfterStructuredOutput prop).
-                const structuredOutputIdx = visibleParts.findIndex(
-                  (part) =>
-                    isToolUIPart(part) &&
-                    getToolName(part).toLowerCase() === "structuredoutput"
+                // Keep the latest response's actions visible.
+                const holdsLatestResponse =
+                  latestResponseIndex >= block.startIndex &&
+                  latestResponseIndex <= block.endIndex
+                const sourceUrlParts = block.messages.flatMap((message) =>
+                  message.parts.filter((part) => part.type === "source-url")
                 )
                 return (
-                  <div key={id} className="group relative">
-                    {role === "assistant" && sourceUrlParts.length > 0 && (
-                      <Sources>
-                        <SourcesTrigger count={sourceUrlParts.length} />
-                        {sourceUrlParts.map((part, partIdx) => (
-                          <SourcesContent key={`${id}-${part.type}-${partIdx}`}>
-                            <Source
-                              href={"url" in part ? part.url : "#"}
-                              title={"url" in part ? part.url : "Source"}
-                            />
+                  <div
+                    key={`turn-${block.startIndex}`}
+                    className="group relative"
+                  >
+                    {verbosityPolicy.showSources &&
+                      sourceUrlParts.length > 0 && (
+                        <Sources className="py-1">
+                          <SourcesTrigger count={sourceUrlParts.length} />
+                          <SourcesContent>
+                            {sourceUrlParts.map((part) => (
+                              <Source
+                                key={part.sourceId}
+                                href={part.url}
+                                title={part.title ?? part.url}
+                              />
+                            ))}
                           </SourcesContent>
-                        ))}
-                      </Sources>
-                    )}
-
-                    {visibleParts.map((part, partIdx) => (
-                      <MemoizedMessagePart
-                        key={`${id}-${part.type}-${partIdx}`}
-                        part={part}
-                        partIdx={partIdx}
-                        id={id}
-                        role={role}
-                        status={status}
-                        isLastMessage={isLastMessage}
-                        onSubmitApprovals={handleSubmitApprovals}
-                        isAfterStructuredOutput={
-                          structuredOutputIdx !== -1 &&
-                          partIdx > structuredOutputIdx
-                        }
-                      />
-                    ))}
-                    {role === "assistant" && !isWaitingForResponse && (
-                      // Render response actions for assistant messages and reveal them on hover for older messages.
-                      <Actions
-                        className={cn(
-                          "mt-4",
-                          // Apply a smooth transition so the actions fade in and out gracefully.
-                          "transition-opacity duration-200 ease-out",
-                          // Hide actions by default for non-last messages and reveal them when the message group is hovered.
-                          !isLastMessage &&
-                            "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100"
-                        )}
-                      >
-                        {isLastMessage && (
-                          <Action
-                            size="sm"
-                            onClick={() => regenerate()}
-                            label="Retry"
-                            tooltip="Retry"
-                          >
-                            <RefreshCcwIcon className="size-3" />
-                          </Action>
-                        )}
-                      </Actions>
+                        </Sources>
+                      )}
+                    <AgentTurn
+                      messages={block.messages}
+                      startedAt={block.startedAt}
+                      status={status}
+                      isLive={
+                        blockIndex === threadBlocks.length - 1 &&
+                        isGeneratingTurn
+                      }
+                      isSuperseded={blockIndex < threadBlocks.length - 1}
+                      lastMessageId={lastMessageId}
+                      cancelledMessageIds={cancelledTurnMessageIds}
+                      interruptedToolCallIds={interruptedToolCallIds}
+                      onSubmitApprovals={
+                        isReadonly ? undefined : handleSubmitApprovals
+                      }
+                    />
+                    {/* A failed turn's Retry sits with its error below. */}
+                    {holdsLatestResponse && canRetry && !displayedError && (
+                      <RetryAction onRetry={handleRetry} />
                     )}
                   </div>
                 )
               })}
-              {isWaitingForResponse && (
-                <motion.div
-                  className="mt-5"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.3, ease: "easeInOut" }}
-                >
-                  <Dots />
-                </motion.div>
+              {displayedError && (
+                <TurnErrorLine
+                  error={displayedError}
+                  dropped={lastErrorDisconnected}
+                  // A drop reconnects, so it needs no message to resend.
+                  onRetry={
+                    canRetry && (lastErrorDisconnected || messages.length > 0)
+                      ? handleRetry
+                      : undefined
+                  }
+                />
               )}
+              {runningLineLabel && <ThinkingLine label={runningLineLabel} />}
             </ConversationContent>
             <ConversationScrollButton />
           </Conversation>
@@ -1363,6 +1678,131 @@ export function ChatSessionPane({
       </div>
     </div>
   )
+
+  return (
+    <ChatVerbosityContext.Provider value={verbosity}>
+      <SubagentStreamContext.Provider value={subagentStreamContext}>
+        <ApprovalComposerContext.Provider value={approvalComposerContext}>
+          {conversationView}
+        </ApprovalComposerContext.Provider>
+      </SubagentStreamContext.Provider>
+    </ChatVerbosityContext.Provider>
+  )
+}
+
+type SelectedToolBadge = {
+  value: string
+  label: string
+  icon: ReactNode
+}
+
+/** Single selected-tool chip. Renders the remove button only when interactive
+ * so the hidden measurement layer stays out of the tab order. */
+function SelectedToolChip({
+  tool,
+  onRemove,
+  removeDisabled,
+  interactive,
+}: {
+  tool: SelectedToolBadge
+  onRemove?: (value: string) => void
+  removeDisabled?: boolean
+  interactive: boolean
+}) {
+  return (
+    <Badge variant="secondary" className="h-7 shrink-0 gap-1.5 px-2.5 text-xs">
+      <span className="inline-flex items-center justify-center text-foreground">
+        {tool.icon}
+      </span>
+      <span className="truncate">{tool.label}</span>
+      {interactive ? (
+        <button
+          type="button"
+          className="inline-flex items-center text-muted-foreground hover:text-foreground"
+          aria-label={`Remove ${tool.label}`}
+          onClick={() => onRemove?.(tool.value)}
+          disabled={removeDisabled}
+        >
+          <XIcon className="size-3.5" />
+        </button>
+      ) : (
+        <span className="inline-flex items-center text-muted-foreground">
+          <XIcon className="size-3.5" />
+        </span>
+      )}
+    </Badge>
+  )
+}
+
+/**
+ * Chip strip of tools attached to the chat session, rendered above the
+ * composer textarea. Keeps the chips on a single line, showing only those that
+ * fit plus a "+N" indicator for the rest, so a large tool set never grows the
+ * composer past one row.
+ *
+ * Overflow measurement is shared with MultiSelectBadges (case custom fields)
+ * via the useOverflowBadges hook: a hidden measurement layer renders every chip
+ * so the visible set can be recomputed when the panel resizes.
+ */
+function SelectedToolsHeader({
+  badges,
+  onRemove,
+  removeDisabled,
+}: {
+  badges: SelectedToolBadge[]
+  onRemove: (value: string) => void
+  removeDisabled: boolean
+}) {
+  // gap-1.5 = 0.375rem = 6px between chips.
+  const { measureRef, visibleCount } = useOverflowBadges(badges, { gap: 6 })
+
+  const hiddenTools = badges.slice(visibleCount)
+  const hiddenCount = hiddenTools.length
+
+  return (
+    <PromptInputHeader className="gap-1.5 px-3 pt-3">
+      <div className="relative w-full min-w-0 overflow-hidden">
+        {/* Hidden measurement layer — every chip plus a +N placeholder so the
+            ResizeObserver can recompute the visible set as the panel resizes. */}
+        <div
+          ref={measureRef}
+          aria-hidden
+          className="pointer-events-none absolute inset-x-0 top-0 flex items-center gap-1.5"
+          style={{ visibility: "hidden" }}
+        >
+          {badges.map((tool) => (
+            <SelectedToolChip
+              key={tool.value}
+              tool={tool}
+              interactive={false}
+            />
+          ))}
+          <span className="shrink-0 text-xs">+{badges.length}</span>
+        </div>
+        {/* Visible layer — only the chips that fit plus a +N indicator. */}
+        <div className="flex items-center gap-1.5">
+          {badges.slice(0, visibleCount).map((tool) => (
+            <SelectedToolChip
+              key={tool.value}
+              tool={tool}
+              onRemove={onRemove}
+              removeDisabled={removeDisabled}
+              interactive
+            />
+          ))}
+          {hiddenCount > 0 && (
+            <Badge
+              variant="secondary"
+              className="h-7 shrink-0 px-2.5 text-xs text-muted-foreground"
+              title={hiddenTools.map((tool) => tool.label).join(", ")}
+            >
+              +{hiddenCount}
+            </Badge>
+          )}
+        </div>
+      </div>
+    </PromptInputHeader>
+  )
 }
 
 function OptimisticPendingMessage({ text }: { text: string }) {
@@ -1373,167 +1813,63 @@ function OptimisticPendingMessage({ text }: { text: string }) {
           <Response>{text}</Response>
         </MessageContent>
       </Message>
-      <motion.div
-        className="mt-5"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        transition={{ duration: 0.3, ease: "easeInOut" }}
-      >
-        <Dots />
-      </motion.div>
+      <ThinkingLine label="Thinking..." />
     </>
   )
 }
 
-function PromptPresetSelector({
-  selector,
-  disabled = false,
-}: {
-  selector: ChatPresetSelector
-  disabled?: boolean
-}) {
-  const [open, setOpen] = useState(false)
-
-  const effectiveDisabled = Boolean(disabled || selector.disabled)
-
-  useEffect(() => {
-    if (effectiveDisabled) {
-      setOpen(false)
-    }
-  }, [effectiveDisabled])
-
-  const errorMessage = useMemo(() => {
-    if (typeof selector.presetsError === "string") {
-      return selector.presetsError
-    }
-    if (
-      selector.presetsError &&
-      typeof selector.presetsError === "object" &&
-      "body" in selector.presetsError &&
-      typeof (selector.presetsError as { body?: { detail?: unknown } }).body
-        ?.detail === "string"
-    ) {
-      return (selector.presetsError as { body?: { detail?: string } }).body
-        ?.detail
-    }
-    if (
-      selector.presetsError &&
-      typeof selector.presetsError === "object" &&
-      "message" in selector.presetsError &&
-      typeof (selector.presetsError as { message?: unknown }).message ===
-        "string"
-    ) {
-      return (selector.presetsError as { message: string }).message
-    }
-    return "Failed to load presets"
-  }, [selector.presetsError])
-
-  const noPresetValue = "__workspace_default_preset__"
-
-  const handleSelect = (value: string) => {
-    setOpen(false)
-    void selector.onSelect(value === noPresetValue ? null : value)
-  }
-  const PresetIcon =
-    selector.selectedPresetId === null
-      ? MousePointer2OffIcon
-      : MousePointerClickIcon
-
+/** The running line below the thread, faded in. */
+function ThinkingLine({ label }: { label: string }) {
   return (
-    <ModelSelector
-      open={open}
-      onOpenChange={(nextOpen) => {
-        if (effectiveDisabled) {
-          return
-        }
-        setOpen(nextOpen)
-      }}
+    <motion.div
+      className="mt-1"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.3, ease: "easeInOut" }}
     >
-      <ModelSelectorTrigger asChild>
-        <PromptInputButton
-          size="sm"
-          variant="ghost"
-          disabled={effectiveDisabled}
-          className="h-7 max-w-[16rem] justify-start gap-1.5 px-2 text-xs"
-          aria-label="Select preset agent"
+      <Trace>
+        <RunningLine label={label} />
+      </Trace>
+    </motion.div>
+  )
+}
+
+/**
+ * The session's active agent preset, shown where the mention hint otherwise
+ * sits. Clearing it is the only way back to a tools-only session.
+ */
+function ActivePresetBadge({
+  label,
+  disabled = false,
+  showSpinner = false,
+  onClear,
+}: {
+  label: string
+  disabled?: boolean
+  showSpinner?: boolean
+  onClear: () => void
+}) {
+  return (
+    <span className="flex h-7 min-w-0 max-w-[14rem] items-center gap-1.5 rounded-md border border-border/70 px-2 text-xs text-muted-foreground">
+      <MousePointerClickIcon className="size-3 shrink-0" />
+      <span className="truncate" title={label}>
+        {label}
+      </span>
+      {showSpinner ? (
+        <Loader2 className="size-3 shrink-0 animate-spin" />
+      ) : (
+        <button
+          type="button"
+          onClick={onClear}
+          disabled={disabled}
+          aria-label="Clear agent"
+          className="shrink-0 text-muted-foreground/70 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
         >
-          <span className="flex min-w-0 items-center gap-1.5">
-            <PresetIcon className="size-3 text-muted-foreground" />
-            <span className="truncate" title={selector.label}>
-              {selector.label}
-            </span>
-          </span>
-          {selector.showSpinner ? (
-            <span className="ml-auto inline-flex items-center">
-              <Loader2 className="size-3 animate-spin text-muted-foreground" />
-            </span>
-          ) : null}
-        </PromptInputButton>
-      </ModelSelectorTrigger>
-      <ModelSelectorContent title="Select preset agent" className="sm:max-w-lg">
-        {selector.presetsIsLoading ? (
-          <div className="flex items-center gap-2 p-3 text-xs text-muted-foreground">
-            <Loader2 className="size-3 animate-spin" />
-            Loading presets...
-          </div>
-        ) : selector.presetsError ? (
-          <div className="p-3 text-xs text-red-600">{errorMessage}</div>
-        ) : (
-          <>
-            <ModelSelectorInput
-              placeholder="Search presets..."
-              className="text-xs"
-            />
-            <ModelSelectorList className="max-h-64 overflow-y-auto">
-              <ModelSelectorEmpty className="py-4 text-xs text-muted-foreground">
-                No presets found.
-              </ModelSelectorEmpty>
-              <ModelSelectorGroup>
-                <ModelSelectorItem
-                  value="no preset"
-                  onSelect={() => handleSelect(noPresetValue)}
-                  className="flex items-start justify-between gap-2 py-2 text-xs"
-                >
-                  <div className="flex flex-col">
-                    <span className="font-medium">No preset</span>
-                    <span className="text-muted-foreground">
-                      {selector.noPresetDescription ??
-                        "Use workspace default agent instructions."}
-                    </span>
-                  </div>
-                  {selector.selectedPresetId === null ? (
-                    <CheckIcon className="mt-0.5 size-3.5" />
-                  ) : null}
-                </ModelSelectorItem>
-                {(selector.presets ?? []).map((preset) => (
-                  <ModelSelectorItem
-                    key={preset.id}
-                    value={`${preset.name} ${preset.description ?? ""}`}
-                    onSelect={() => handleSelect(preset.id)}
-                    className="flex items-start justify-between gap-2 py-2 text-xs"
-                  >
-                    <div className="flex min-w-0 flex-col">
-                      <span className="truncate font-medium">
-                        {preset.name}
-                      </span>
-                      {preset.description ? (
-                        <span className="text-muted-foreground">
-                          {preset.description}
-                        </span>
-                      ) : null}
-                    </div>
-                    {selector.selectedPresetId === preset.id ? (
-                      <CheckIcon className="mt-0.5 size-3.5" />
-                    ) : null}
-                  </ModelSelectorItem>
-                ))}
-              </ModelSelectorGroup>
-            </ModelSelectorList>
-          </>
-        )}
-      </ModelSelectorContent>
-    </ModelSelector>
+          <XIcon className="size-3" />
+        </button>
+      )}
+    </span>
   )
 }
 
@@ -1553,6 +1889,8 @@ function getProviderIconId(provider: string): string {
     case "gemini":
     case "vertex_ai":
       return "google"
+    case "mistral":
+      return "mistral"
     case "openai":
       return "openai"
     default:
@@ -1564,7 +1902,7 @@ function PromptModelIndicator({ modelInfo }: { modelInfo: ModelInfo }) {
   return (
     <Badge
       variant="outline"
-      className="h-7 max-w-[18rem] gap-1.5 px-2.5 text-xs font-normal"
+      className="h-7 min-w-0 max-w-[26rem] gap-1.5 px-2.5 text-xs font-normal"
     >
       <ProviderIcon
         className="size-4 rounded-none bg-transparent p-0"
@@ -1583,997 +1921,19 @@ function PromptModelIndicator({ modelInfo }: { modelInfo: ModelInfo }) {
   )
 }
 
-export function MessagePart({
-  part,
-  partIdx,
-  id,
-  role,
-  status,
-  isLastMessage,
-  onSubmitApprovals,
-  isAfterStructuredOutput,
-}: {
-  part: UIMessagePart<UIDataTypes, UITools>
-  partIdx: number
-  id: string
-  role: UIMessage["role"]
-  status?: ChatStatus
-  isLastMessage: boolean
-  onSubmitApprovals?: (decisions: ApprovalDecision[]) => Promise<void>
-  /**
-   * True when an earlier part in this same message was the Claude Code
-   * CLI's synthetic "StructuredOutput" tool call. Per our system prompt,
-   * that call is supposed to be the very last thing an output_type agent
-   * sends -- but not every model reliably stays silent afterward. A text
-   * part in that position is always redundant noise (a trivial "{}", a
-   * full re-typed copy of the same JSON, or a prose summary), regardless
-   * of its actual content, so it's never worth rendering.
-   */
-  isAfterStructuredOutput?: boolean
-}) {
-  if (part.type === "data-approval-request") {
-    const payload = (part as { data?: unknown }).data
-    const approvals: ApprovalCard[] = Array.isArray(payload)
-      ? (payload.filter(Boolean) as ApprovalCard[])
-      : []
-    return (
-      <ApprovalRequestPart
-        key={`${id}-${partIdx}`}
-        approvals={approvals}
-        onSubmit={onSubmitApprovals}
-      />
-    )
-  }
-
-  if (part.type === "text") {
-    // Some models, even when told an output_type tool call ends their turn,
-    // still emit a trailing text part afterward instead of staying silent
-    // -- a trivial "{}", a full re-typed copy of the same JSON, or a prose
-    // summary. Whatever it is, it's redundant noise once StructuredOutput
-    // has already answered, so skip it entirely. Otherwise, still catch
-    // the empty/"{}" case on its own (e.g. a lone trailing part with no
-    // preceding tool call). Skip only once the part has settled (not
-    // mid-stream), since a real reply can legitimately start empty/short
-    // before more text arrives.
-    const isStreamingPart = status === "streaming" && isLastMessage
-    const trimmedText = part.text.trim()
-    const isTrivialPlaceholder =
-      trimmedText === "" || trimmedText === "{}" || isJsonLikeText(trimmedText)
-    if (!isStreamingPart && (isAfterStructuredOutput || isTrivialPlaceholder)) {
-      return null
-    }
-    return (
-      <Message key={`${id}-${partIdx}`} from={role}>
-        <MessageContent variant="flat">
-          <SmoothResponse text={part.text} animate={isStreamingPart} />
-        </MessageContent>
-      </Message>
-    )
-  }
-
-  if (part.type === "reasoning") {
-    return (
-      <Reasoning
-        key={`${id}-${partIdx}`}
-        className="w-full"
-        defaultOpen={status === "streaming" && isLastMessage}
-        isStreaming={status === "streaming" && isLastMessage}
-      >
-        <ReasoningTrigger />
-        <ReasoningContent>{part.text}</ReasoningContent>
-      </Reasoning>
-    )
-  }
-
-  if (isToolUIPart(part)) {
-    const toolName = getToolName(part).replaceAll("__", ".")
-    // The Claude Code CLI enforces an agent's output_type schema by having
-    // the model call a synthetic "StructuredOutput" tool instead of
-    // replying with plain text -- the model's actual answer is the tool's
-    // *input*, not its output (the CLI just acks it with an empty {}).
-    // The Tool card below still shows that call happened (unchanged), but
-    // its answer is easy to miss behind a collapsed chevron with a blank
-    // "RESULT" -- so also render it as a normal, readable reply right
-    // after the card. Works generically across every agent preset's own
-    // output schema; it doesn't assume specific field names.
-    const isStructuredOutput = toolName.toLowerCase() === "structuredoutput"
-    const toolTitle = getToolTitle(toolName, part.input)
-    // Derive an error state for streaming when servers send
-    // a tool output that encodes validation feedback in `output`
-    // rather than `errorText`.
-    const outputAsAny = part.output as unknown
-    const partErrorText =
-      typeof part === "object" && part !== null && "errorText" in part
-        ? (part as { errorText?: string }).errorText
-        : undefined
-    const outputErrorText =
-      outputAsAny &&
-      typeof outputAsAny === "object" &&
-      "errorText" in outputAsAny
-        ? (outputAsAny as { errorText?: string }).errorText
-        : undefined
-    const derivedErrorText = partErrorText ?? outputErrorText
-    // A denied tool call is surfaced by the runtime as a generic error
-    // (is_error / errorText), but the reason text distinguishes three very
-    // different situations that should not all render as a red "Error":
-    // still awaiting a human decision, rejected by a human reviewer (both
-    // expected, not failures), versus an actual execution failure. Check
-    // both the error text and the raw output, since the pending-approval
-    // reason arrives as errorText while the post-decision reconciliation
-    // text arrives as the tool's output.
-    const outputAsText =
-      typeof outputAsAny === "string" ? outputAsAny : undefined
-    const denialText = derivedErrorText ?? outputAsText ?? ""
-    const derivedState = denialText.includes(
-      "requires approval. Request sent for review"
-    )
-      ? ("approval-requested" as const)
-      : denialText.includes("REJECTED by human reviewer")
-        ? ("approval-rejected" as const)
-        : derivedErrorText
-          ? ("output-error" as const)
-          : part.state
-    return (
-      <Fragment key={`${id}-${partIdx}`}>
-        <Tool>
-          <ToolHeader
-            title={toolTitle}
-            type={part.type}
-            state={derivedState}
-            icon={getIcon(toolName, TOOL_ICON_PROPS)}
-          />
-          <ToolContent>
-            <ToolInput input={part.input} />
-            <ToolOutput
-              output={part.output}
-              errorText={derivedErrorText}
-              variant={
-                derivedState === "approval-requested" ||
-                derivedState === "approval-rejected"
-                  ? derivedState
-                  : "error"
-              }
-            />
-          </ToolContent>
-        </Tool>
-        {isStructuredOutput && <StructuredOutputAnswer input={part.input} />}
-      </Fragment>
-    )
-  }
-
-  return null
-}
-
 /**
- * Renders an agent's `output_type` answer -- delivered as the *input* of
- * the Claude Code CLI's synthetic "StructuredOutput" tool call -- as a
- * plain, readable reply instead of raw JSON hidden inside a collapsed tool
- * card. Generic across every agent preset's own output schema: each field
- * is shown as "Field Name: value" without assuming specific keys.
+ * Whether a part counts as response content when placing response actions.
+ * The cancelled marker and approval cards count. Other data parts don't: a
+ * compaction badge is a status line rather than a response, and the rest,
+ * such as an approval submission, render nothing.
  */
-function StructuredOutputAnswer({ input }: { input: unknown }) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return null
-  }
-  const entries = Object.entries(input as Record<string, unknown>)
-  if (entries.length === 0) {
-    return null
-  }
-  // A model doesn't reliably emit JSON keys in the schema's declared order,
-  // so a verdict-style boolean field (e.g. "verdict", "malicious") can end
-  // up buried at the bottom one run and at the top the next. Always sort
-  // fields with a recognized risk polarity to the front, regardless of
-  // where the model happened to put them -- Array.sort is stable, so
-  // relative order within each group (priority vs. the rest) is preserved.
-  const ordered = [...entries].sort((a, b) => {
-    const aPriority = isPriorityVerdictField(a[0], a[1]) ? 0 : 1
-    const bPriority = isPriorityVerdictField(b[0], b[1]) ? 0 : 1
-    return aPriority - bPriority
-  })
-  // Group threat-intel's malware_family/attribution_confidence/tlp into one
-  // compact stat strip instead of three separate plain rows. Only kicks in
-  // when at least one of these fields is actually present, so it has no
-  // effect on other agents' (triage/investigator/reporter) answers.
-  const attributionKeys = new Set([
-    "malware_family",
-    "attribution_confidence",
-    "tlp",
-  ])
-  const attributionEntries = ordered.filter(([key]) =>
-    attributionKeys.has(key.toLowerCase())
-  )
-  const restEntries = ordered.filter(
-    ([key]) => !attributionKeys.has(key.toLowerCase())
-  )
-  return (
-    <Message from="assistant">
-      <MessageContent variant="flat">
-        <div className="space-y-2">
-          {attributionEntries.length > 0 && (
-            <AttributionStatStrip entries={attributionEntries} />
-          )}
-          {restEntries.map(([key, value]) => (
-            <StructuredOutputField key={key} fieldKey={key} value={value} />
-          ))}
-        </div>
-      </MessageContent>
-    </Message>
-  )
-}
-
-function AttributionStatStrip({ entries }: { entries: [string, unknown][] }) {
-  return (
-    <div className="flex flex-wrap gap-2">
-      {entries.map(([key, value]) => {
-        const isTlp = key.toLowerCase() === "tlp"
-        const isConfidence = key.toLowerCase() === "attribution_confidence"
-        const display =
-          value === null || value === undefined || value === ""
-            ? "—"
-            : isConfidence && typeof value === "number"
-              ? `${Math.round(value * 100)}%`
-              : String(value)
-        return (
-          <div
-            key={key}
-            className="min-w-[110px] flex-1 rounded-md border bg-muted/30 px-3 py-2"
-          >
-            <div className="text-[0.65rem] text-muted-foreground uppercase tracking-wide">
-              {humanizeFieldName(key)}
-            </div>
-            <div
-              className={cn(
-                "font-semibold text-sm",
-                isTlp && value === "RED" && "text-red-500",
-                isTlp && value === "AMBER" && "text-amber-500",
-                isTlp && value === "GREEN" && "text-green-600"
-              )}
-            >
-              {display}
-            </div>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
-function isPriorityVerdictField(key: string, value: unknown): boolean {
-  return typeof value === "boolean" && getBooleanRisk(key, value) !== null
-}
-
-function humanizeFieldName(key: string): string {
-  return key.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase())
-}
-
-/** Field name fragments that make a `true` boolean a risk signal (shown in red). */
-const RISK_TRUE_KEYWORDS = [
-  "malicious",
-  "malware",
-  "is_tor",
-  "ransomware",
-  "c2_communication",
-  "data_exfiltration",
-  "lateral_movement",
-  "multiple_correlated_alerts",
-  "off_hours_activity",
-]
-
-/**
- * Field name fragments where `true` is reassuring instead -- the inverse of
- * RISK_TRUE_KEYWORDS (e.g. an IP being whitelisted, or a case being a
- * confirmed false positive, is good news, so it renders green at `true`).
- */
-const RISK_FALSE_KEYWORDS = [
-  "whitelisted",
-  "false_positive",
-  "benign",
-  "verdict",
-]
-
-/** Decides whether a boolean field should render as a colored risk badge, and which color. Returns `null` for fields with no recognized risk polarity, so callers fall back to plain "Yes"/"No" text rather than guessing. */
-function getBooleanRisk(
-  fieldKey: string,
-  value: boolean
-): "danger" | "safe" | null {
-  const key = fieldKey.toLowerCase()
-  if (RISK_TRUE_KEYWORDS.some((keyword) => key.includes(keyword))) {
-    return value ? "danger" : "safe"
-  }
-  if (RISK_FALSE_KEYWORDS.some((keyword) => key.includes(keyword))) {
-    return value ? "safe" : "danger"
-  }
-  return null
-}
-
-/**
- * A field name like "is_false_positive" already contains a negation, so
- * pairing it with a literal "No" reads as a confusing double negative
- * ("Is False Positive: No" means it's a real threat, not obvious on a first
- * read). For these fields, show a plain verdict phrase instead of Yes/No.
- * Returns `null` for fields where Yes/No already reads fine, so the caller
- * falls back to that.
- */
-function getVerdictLabel(fieldKey: string, value: boolean): string | null {
-  const key = fieldKey.toLowerCase()
-  if (key.includes("false_positive") || key === "verdict") {
-    return value ? "False Positive" : "Confirmed Threat"
-  }
-  return null
-}
-
-function BooleanIndicator({
-  fieldKey,
-  value,
-}: {
-  fieldKey: string
-  value: boolean
-}) {
-  const risk = getBooleanRisk(fieldKey, value)
-  if (risk === null) {
-    return <span>{value ? "Yes" : "No"}</span>
-  }
-  const isDanger = risk === "danger"
-  const label = getVerdictLabel(fieldKey, value) ?? (value ? "Yes" : "No")
-  return (
-    <Badge
-      variant="outline"
-      className={cn(
-        "gap-1 font-medium",
-        isDanger
-          ? "border-red-500/50 bg-red-500/15 text-red-500"
-          : "border-green-600/50 bg-green-600/15 text-green-600"
-      )}
-    >
-      {isDanger ? (
-        <TriangleAlertIcon className="size-3" />
-      ) : (
-        <CheckIcon className="size-3" />
-      )}
-      {label}
-    </Badge>
-  )
-}
-
-/**
- * Renders one top-level field of a StructuredOutput answer. Non-empty
- * arrays of objects (e.g. a list of {value, type, malicious} IOCs) get a
- * dedicated card per element instead of collapsing into one dense line, so
- * risk badges inside them stay legible.
- */
-function StructuredOutputField({
-  fieldKey,
-  value,
-}: {
-  fieldKey: string
-  value: unknown
-}) {
-  if (Array.isArray(value) && value.length > 0 && value.every(isPlainRecord)) {
-    return (
-      <div className="space-y-1">
-        <p className="text-sm font-medium">{humanizeFieldName(fieldKey)}:</p>
-        <div className="space-y-1.5">
-          {value.map((item, index) => (
-            <StructuredOutputCard key={index} item={item} />
-          ))}
-        </div>
-      </div>
-    )
-  }
-  if (
-    fieldKey.toLowerCase() === "recommendations" &&
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every((item) => typeof item === "string")
-  ) {
-    return (
-      <div className="space-y-1">
-        <p className="text-sm font-medium">{humanizeFieldName(fieldKey)}:</p>
-        <ul className="space-y-1 text-sm">
-          {value.map((item, index) => (
-            <li key={index} className="flex gap-2">
-              <span className="text-muted-foreground">→</span>
-              <span>{item}</span>
-            </li>
-          ))}
-        </ul>
-      </div>
-    )
-  }
-  return (
-    <p className="text-sm">
-      <span className="font-medium">{humanizeFieldName(fieldKey)}:</span>{" "}
-      {formatStructuredOutputValue(fieldKey, value)}
-    </p>
-  )
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-}
-
-/**
- * True when a text part's entire (trimmed) content is a parseable JSON
- * object/array -- e.g. a model describing its StructuredOutput answer as
- * raw JSON text instead of (or in addition to) actually calling the tool.
- * Real prose never parses as JSON on its own, so this is safe to hide as
- * redundant noise regardless of whether it appears before or after the
- * StructuredOutput tool call in the message.
- */
-function isJsonLikeText(text: string): boolean {
-  if (!text.startsWith("{") && !text.startsWith("[")) {
+function isShownPart(part: UIMessage["parts"][number]): boolean {
+  if (part.type === "step-start") {
     return false
   }
-  try {
-    JSON.parse(text)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Renders one array-item card. When the item has a recognized risk boolean
- * (e.g. `malicious`), that field becomes a bold verdict line up top --
- * "⚠ Malicious — hash" -- with the item's `value`/`context` fields (when
- * present) below it, so the risk reads before the details. Items with no
- * risk field (e.g. investigator's endpoint_lookups) fall back to a plain
- * key: value list.
- */
-function StructuredOutputCard({ item }: { item: Record<string, unknown> }) {
-  const entries = Object.entries(item)
-  const riskEntry = entries.find(
-    (entry): entry is [string, boolean] =>
-      typeof entry[1] === "boolean" &&
-      getBooleanRisk(entry[0], entry[1]) !== null
-  )
-
-  if (!riskEntry) {
-    return (
-      <div className="space-y-0.5 rounded-md border bg-muted/30 px-2.5 py-1.5 text-sm">
-        {entries.map(([key, value]) => (
-          <div key={key} className="flex flex-wrap items-center gap-1">
-            <span className="font-medium">{humanizeFieldName(key)}:</span>
-            {formatStructuredOutputValue(key, value)}
-          </div>
-        ))}
-      </div>
-    )
-  }
-
-  const [riskKey, riskValue] = riskEntry
-  const isDanger = getBooleanRisk(riskKey, riskValue) === "danger"
-  const typeEntry = entries.find(
-    ([key, value]) => key.toLowerCase() === "type" && typeof value === "string"
-  )
-  const valueEntry = entries.find(([key]) => key.toLowerCase() === "value")
-  const contextEntry = entries.find(([key]) => key.toLowerCase() === "context")
-  const sourcesEntry = entries.find(
-    ([key, value]) => key.toLowerCase() === "sources" && isPlainRecord(value)
-  )
-  const consumedKeys = new Set(
-    [
-      riskKey,
-      typeEntry?.[0],
-      valueEntry?.[0],
-      contextEntry?.[0],
-      sourcesEntry?.[0],
-    ].filter((key): key is string => key !== undefined)
-  )
-  const remaining = entries.filter(([key]) => !consumedKeys.has(key))
-  const verdictLabel = riskValue
-    ? humanizeFieldName(riskKey)
-    : `Not ${humanizeFieldName(riskKey)}`
-
   return (
-    <div className="space-y-1 rounded-md border bg-muted/30 px-3 py-2 text-sm">
-      <div
-        className={cn(
-          "flex items-center gap-1.5 font-semibold",
-          isDanger ? "text-red-500" : "text-green-600"
-        )}
-      >
-        {isDanger ? (
-          <TriangleAlertIcon className="size-3.5" />
-        ) : (
-          <CheckIcon className="size-3.5" />
-        )}
-        {verdictLabel}
-        {typeEntry && (
-          <span className="font-normal text-muted-foreground">
-            — {String(typeEntry[1])}
-          </span>
-        )}
-      </div>
-      {valueEntry && (
-        <div className="break-all font-medium font-mono text-sm">
-          {String(valueEntry[1])}
-        </div>
-      )}
-      {contextEntry && (
-        <div className="text-muted-foreground text-sm">
-          {String(contextEntry[1])}
-        </div>
-      )}
-      {sourcesEntry && (
-        <SourceBreakdown sources={sourcesEntry[1] as Record<string, unknown>} />
-      )}
-      {remaining.map(([key, value]) => (
-        <div
-          key={key}
-          className="flex flex-wrap items-center gap-1 text-muted-foreground"
-        >
-          <span className="font-medium text-foreground">
-            {humanizeFieldName(key)}:
-          </span>
-          {formatStructuredOutputValue(key, value)}
-        </div>
-      ))}
-    </div>
+    !part.type.startsWith("data-") ||
+    part.type === CANCELLED_DATA_PART_TYPE ||
+    part.type === "data-approval-request"
   )
-}
-
-/**
- * Renders a per-source CTI breakdown (e.g. hash_lookup_all_sources' own
- * "sources" object, copied verbatim into the model's answer) as a compact
- * dot list -- one row per source, so each platform's result is visible on
- * its own line instead of buried inside one dense "context" sentence.
- */
-function SourceBreakdown({ sources }: { sources: Record<string, unknown> }) {
-  const rows = Object.entries(sources).filter(([, value]) =>
-    isPlainRecord(value)
-  )
-  if (rows.length === 0) {
-    return null
-  }
-  return (
-    <div className="space-y-1 border-t pt-1.5">
-      {rows.map(([name, value]) => {
-        const record = value as Record<string, unknown>
-        const status = typeof record.status === "string" ? record.status : ""
-        const isHit = status === "malicious"
-        const detail =
-          typeof record.detail === "string" ? record.detail : status || "—"
-        return (
-          <div key={name} className="flex items-start gap-2 text-xs">
-            <span
-              className={cn(
-                "mt-1 size-1.5 flex-shrink-0 rounded-full",
-                isHit ? "bg-red-500" : "bg-muted-foreground/40"
-              )}
-            />
-            <span
-              className={cn(
-                "w-24 flex-shrink-0 font-semibold",
-                isHit ? "text-red-500" : "text-muted-foreground"
-              )}
-            >
-              {humanizeFieldName(name)}
-            </span>
-            <span className="text-muted-foreground">{detail}</span>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
-function formatStructuredOutputValue(
-  fieldKey: string,
-  value: unknown
-): ReactNode {
-  if (typeof value === "boolean") {
-    return <BooleanIndicator fieldKey={fieldKey} value={value} />
-  }
-  if (value === null || value === undefined || value === "") {
-    return "—"
-  }
-  if (Array.isArray(value)) {
-    return value.length > 0
-      ? value
-          .map((item) => formatStructuredOutputArrayItemText(item))
-          .join("; ")
-      : "—"
-  }
-  if (typeof value === "object") {
-    return JSON.stringify(value)
-  }
-  return String(value)
-}
-
-/**
- * Plain-text fallback for a nested array inside a single card field (rare --
- * e.g. a list-of-lists value). Object elements expand as "key: value" text;
- * this path doesn't render risk badges since it isn't the primary IOC-card
- * rendering above.
- */
-function formatStructuredOutputArrayItemText(item: unknown): string {
-  if (isPlainRecord(item)) {
-    return Object.entries(item)
-      .map(
-        ([key, value]) =>
-          `${key}: ${typeof value === "boolean" ? (value ? "Yes" : "No") : String(value)}`
-      )
-      .join(", ")
-  }
-  return String(item)
-}
-
-function getToolTitle(toolName: string, input: unknown): string {
-  if (!AGENT_TOOL_NAMES.has(toolName)) {
-    return toolName
-  }
-
-  const agentTarget = getAgentToolTarget(input)
-  return agentTarget ? `${toolName}: ${agentTarget}` : toolName
-}
-
-function getAgentToolTarget(input: unknown, depth = 0): string | null {
-  if (depth > 2) {
-    return null
-  }
-
-  const inputRecord = asInputRecord(input)
-  if (!inputRecord) {
-    return null
-  }
-
-  for (const key of AGENT_TOOL_TARGET_KEYS) {
-    const value = inputRecord[key]
-    if (typeof value === "string" && value.trim()) {
-      return value.trim()
-    }
-  }
-
-  for (const key of AGENT_TOOL_NESTED_INPUT_KEYS) {
-    const nestedTarget = getAgentToolTarget(inputRecord[key], depth + 1)
-    if (nestedTarget) {
-      return nestedTarget
-    }
-  }
-
-  return null
-}
-
-function asInputRecord(input: unknown): Record<string, unknown> | null {
-  if (typeof input === "string") {
-    const trimmed = input.trim()
-    if (!trimmed) {
-      return null
-    }
-    try {
-      const parsed: unknown = JSON.parse(trimmed)
-      return asInputRecord(parsed)
-    } catch {
-      return null
-    }
-  }
-
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return null
-  }
-
-  return input as Record<string, unknown>
-}
-
-const MemoizedMessagePart = memo(MessagePart, (prev, next) => {
-  if (
-    prev.partIdx !== next.partIdx ||
-    prev.id !== next.id ||
-    prev.role !== next.role ||
-    prev.status !== next.status ||
-    prev.isLastMessage !== next.isLastMessage ||
-    prev.onSubmitApprovals !== next.onSubmitApprovals ||
-    prev.isAfterStructuredOutput !== next.isAfterStructuredOutput
-  ) {
-    return false
-  }
-
-  const prevPart = prev.part
-  const nextPart = next.part
-
-  if (prevPart.type !== nextPart.type) {
-    return false
-  }
-
-  if (prevPart.type === "text" || prevPart.type === "reasoning") {
-    return prevPart.text === (nextPart as typeof prevPart).text
-  }
-
-  if (isToolUIPart(prevPart) && isToolUIPart(nextPart)) {
-    return (
-      prevPart.toolCallId === nextPart.toolCallId &&
-      prevPart.state === nextPart.state &&
-      prevPart.input === nextPart.input &&
-      prevPart.output === nextPart.output &&
-      ("errorText" in prevPart
-        ? (prevPart as { errorText?: string }).errorText
-        : undefined) ===
-        ("errorText" in nextPart
-          ? (nextPart as { errorText?: string }).errorText
-          : undefined)
-    )
-  }
-
-  return prevPart === nextPart
-})
-MemoizedMessagePart.displayName = "MessagePart"
-
-type DecisionState = {
-  action: ApprovalDecision["action"] | undefined
-  reason?: string
-  overrideArgs?: string
-}
-
-function ApprovalRequestPart({
-  approvals,
-  onSubmit,
-}: {
-  approvals: ApprovalCard[]
-  onSubmit?: (decisions: ApprovalDecision[]) => Promise<void>
-}) {
-  const [decisions, setDecisions] = useState<Record<string, DecisionState>>({})
-  const [submitting, setSubmitting] = useState(false)
-
-  const approvalsKey = useMemo(
-    () => approvals.map((a) => a.tool_call_id).join(":"),
-    [approvals]
-  )
-
-  useEffect(() => {
-    setDecisions({})
-  }, [approvalsKey])
-
-  const readyToSubmit =
-    approvals.length > 0 &&
-    approvals.every((approval) => decisions[approval.tool_call_id]?.action)
-
-  const setDecision = useCallback(
-    (toolCallId: string, update: Partial<DecisionState>) => {
-      setDecisions((prev) => ({
-        ...prev,
-        [toolCallId]: {
-          ...prev[toolCallId],
-          ...update,
-        },
-      }))
-    },
-    []
-  )
-
-  const handleSubmit = useCallback(async () => {
-    if (!onSubmit || !readyToSubmit) {
-      toast({
-        title: "Pending decisions",
-        description: "Choose an action for each tool before continuing.",
-      })
-      return
-    }
-
-    const payload: ApprovalDecision[] = []
-    for (const approval of approvals) {
-      const decision = decisions[approval.tool_call_id]
-      if (!decision?.action) {
-        toast({
-          title: "Missing decision",
-          description: `Select an action for ${approval.tool_name}.`,
-        })
-        return
-      }
-      if (decision.action === "approve") {
-        payload.push({ tool_call_id: approval.tool_call_id, action: "approve" })
-      } else if (decision.action === "override") {
-        try {
-          const parsed = decision.overrideArgs
-            ? JSON.parse(decision.overrideArgs)
-            : {}
-          payload.push({
-            tool_call_id: approval.tool_call_id,
-            action: "override",
-            override_args: parsed,
-          })
-        } catch {
-          toast({
-            variant: "destructive",
-            title: "Invalid JSON",
-            description: `Fix override args for ${approval.tool_name} and try again.`,
-          })
-          return
-        }
-      } else if (decision.action === "deny") {
-        payload.push({
-          tool_call_id: approval.tool_call_id,
-          action: "deny",
-          reason: decision.reason ?? "",
-        })
-      }
-    }
-
-    try {
-      setSubmitting(true)
-      await onSubmit(payload)
-      setDecisions({})
-    } catch (error) {
-      console.error(error)
-    } finally {
-      setSubmitting(false)
-    }
-  }, [approvals, decisions, onSubmit, readyToSubmit])
-
-  const disabled = !onSubmit
-
-  if (!approvals.length) {
-    return null
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="space-y-3">
-        {approvals.map((approval, index) => {
-          const actionId = approval.tool_name.replaceAll("__", ".")
-          const decision = decisions[approval.tool_call_id]
-          const initialOverrideArgs = formatArgs(approval.args)
-          const isLastApproval = index === approvals.length - 1
-          return (
-            <div
-              key={approval.tool_call_id}
-              className="space-y-3 rounded-md border border-border/60 bg-background p-3"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="flex items-center gap-2.5">
-                    {getIcon(actionId, TOOL_ICON_PROPS)}
-                    <p className="font-medium text-sm">{actionId}</p>
-                    {getStatusBadge("approval-requested")}
-                  </div>
-                </div>
-                <JsonViewWithControls
-                  src={approval.args}
-                  className="max-h-64"
-                  showControls={false}
-                  defaultExpanded
-                />
-                <div className="flex w-full flex-wrap justify-start gap-1 sm:w-auto [&>button]:h-6 [&>button]:rounded-lg">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={disabled || submitting}
-                    onClick={() =>
-                      setDecision(approval.tool_call_id, {
-                        action: "approve",
-                        reason: undefined,
-                        overrideArgs: undefined,
-                      })
-                    }
-                    className={cn(
-                      decision?.action === "approve" &&
-                        "border-success bg-background text-success hover:bg-success/10 hover:text-success"
-                    )}
-                  >
-                    <CheckIcon className="mr-1 size-3" />
-                    Approve
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={disabled || submitting}
-                    onClick={() =>
-                      setDecision(approval.tool_call_id, {
-                        action: "override",
-                        reason: undefined,
-                        overrideArgs:
-                          decision?.overrideArgs ?? initialOverrideArgs,
-                      })
-                    }
-                    className={cn(
-                      decision?.action === "override" &&
-                        "border-success bg-background text-success hover:bg-success/10 hover:text-success"
-                    )}
-                  >
-                    <PencilIcon className="mr-1 size-3" />
-                    Edit + approve
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={disabled || submitting}
-                    onClick={() =>
-                      setDecision(approval.tool_call_id, {
-                        action: "deny",
-                        overrideArgs: undefined,
-                      })
-                    }
-                    className={cn(
-                      decision?.action === "deny" &&
-                        "border-destructive bg-background text-destructive hover:bg-destructive/10 hover:text-destructive"
-                    )}
-                  >
-                    <XIcon className="mr-1 size-3" />
-                    Deny
-                  </Button>
-                </div>
-              </div>
-              {decision?.action === "override" && (
-                <div
-                  data-testid={`approval-override-editor-${approval.tool_call_id}`}
-                >
-                  <CodeEditor
-                    value={decision.overrideArgs ?? initialOverrideArgs}
-                    language="json"
-                    onChange={(value) =>
-                      setDecision(approval.tool_call_id, {
-                        ...decision,
-                        overrideArgs: value,
-                      })
-                    }
-                    className={cn(
-                      "text-xs",
-                      "[&_.cm-editor]:!border [&_.cm-editor]:!border-input [&_.cm-editor]:!bg-background [&_.cm-editor]:rounded-md",
-                      "[&_.cm-scroller]:h-auto [&_.cm-scroller]:min-h-24 [&_.cm-scroller]:max-h-80 [&_.cm-scroller]:overflow-auto"
-                    )}
-                  />
-                </div>
-              )}
-              {decision?.action === "deny" && (
-                <Textarea
-                  className="text-xs"
-                  rows={3}
-                  value={decision.reason ?? ""}
-                  onChange={(event) =>
-                    setDecision(approval.tool_call_id, {
-                      ...decision,
-                      reason: event.target.value,
-                    })
-                  }
-                  placeholder="Share a short reason"
-                  disabled={disabled || submitting}
-                />
-              )}
-              {isLastApproval && (
-                <div className="flex flex-wrap justify-end gap-2 pt-1">
-                  <Button
-                    type="button"
-                    onClick={handleSubmit}
-                    disabled={disabled || submitting || !readyToSubmit}
-                    className="h-6 gap-1 px-2 text-xs"
-                  >
-                    {submitting ? (
-                      <Loader2 className="size-3 animate-spin" />
-                    ) : (
-                      <CheckIcon className="size-3" />
-                    )}
-                    {submitting ? "Submitting..." : "Submit"}
-                  </Button>
-                </div>
-              )}
-            </div>
-          )
-        })}
-      </div>
-      {disabled && (
-        <p className="text-xs text-muted-foreground">
-          Approval submission is not available in this context.
-        </p>
-      )}
-    </div>
-  )
-}
-
-function formatArgs(args: unknown): string {
-  if (args == null) return "{}"
-  if (typeof args === "string") {
-    try {
-      return JSON.stringify(JSON.parse(args), null, 2)
-    } catch {
-      return args
-    }
-  }
-  try {
-    return JSON.stringify(args, null, 2)
-  } catch {
-    return String(args)
-  }
 }

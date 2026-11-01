@@ -33,7 +33,7 @@ import { v4 as uuid4 } from "uuid"
 
 import "@xyflow/react/dist/style.css"
 
-import { MoveHorizontalIcon, MoveVerticalIcon, PlusIcon } from "lucide-react"
+import { MoveVerticalIcon, PlusIcon } from "lucide-react"
 import type {
   GraphOperation,
   GraphResponse,
@@ -43,7 +43,10 @@ import actionNode, {
   type ActionNodeData,
   type ActionNodeType,
 } from "@/components/builder/canvas/action-node"
-import { CanvasToolbar } from "@/components/builder/canvas/canvas-toolbar"
+import {
+  CanvasToolbar,
+  ToggleConditionsButton,
+} from "@/components/builder/canvas/canvas-toolbar"
 import { DeleteActionNodeDialog } from "@/components/builder/canvas/delete-node-dialog"
 import selectorNode, {
   type SelectorNodeData,
@@ -59,14 +62,12 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { useToast } from "@/components/ui/use-toast"
 import { useGraph, useGraphOperations } from "@/lib/hooks"
-import { pruneGraphObject } from "@/lib/workflow"
 import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
-import {
-  getLayoutedElements,
-  mergeHydratedEdges,
-  mergeHydratedNodes,
-} from "./graph-layout"
+import { mergeHydratedEdges, mergeHydratedNodes } from "./graph-layout"
+
+/** Vertical gap between nodes added together from the toolbar, in flow units. */
+const NODE_STACK_OFFSET = 120
 
 const defaultNodeWidth = 172
 const defaultNodeHeight = 36
@@ -805,27 +806,39 @@ export const WorkflowCanvas = React.forwardRef<
     [graphVersion, applyGraphOperations, refetchGraph]
   )
 
-  const onLayout = useCallback(
-    (direction: "TB" | "LR") => {
-      const prunedGraph = pruneGraphObject({
-        nodes,
-        edges,
+  const onLayout = useCallback(async () => {
+    if (!workflowId) return
+    const operations: GraphOperation[] = [{ type: "auto_layout", payload: {} }]
+    try {
+      const result = await applyGraphOperations({
+        baseVersion: graphVersion,
+        operations,
       })
-      const { nodes: newNodes, edges: newEdges } = getLayoutedElements(
-        prunedGraph.nodes,
-        prunedGraph.edges,
-        direction
-      )
-      setNodes(newNodes)
-      setEdges(newEdges)
-
-      // Save positions after layout
-      if (workflowId) {
-        saveNodePositions(newNodes)
+      updateStateFromGraph(result)
+    } catch (error) {
+      const apiError = error as { status?: number }
+      if (apiError.status !== 409) {
+        console.error("Failed to auto-layout workflow:", error)
+        return
       }
-    },
-    [nodes, edges, workflowId, setNodes, setEdges, saveNodePositions]
-  )
+      try {
+        const latestGraph = await refetchGraph()
+        const retryResult = await applyGraphOperations({
+          baseVersion: latestGraph.version,
+          operations,
+        })
+        updateStateFromGraph(retryResult)
+      } catch (retryError) {
+        console.error("Failed to auto-layout workflow after retry:", retryError)
+      }
+    }
+  }, [
+    workflowId,
+    graphVersion,
+    applyGraphOperations,
+    refetchGraph,
+    updateStateFromGraph,
+  ])
 
   // Batch update positions when nodes are dragged
   const onNodesDragStop = useCallback(() => {
@@ -922,9 +935,9 @@ export const WorkflowCanvas = React.forwardRef<
   )
 
   // Handle adding action from toolbar
-  const handleToolbarAddAction = useCallback(
-    async (action: RegistryActionReadMinimal) => {
-      if (!workflowId || !reactFlowInstance) return
+  const handleToolbarAddActions = useCallback(
+    async (actions: RegistryActionReadMinimal[]) => {
+      if (!workflowId || !reactFlowInstance || actions.length === 0) return
 
       // Get the center of the current viewport in screen coordinates
       const containerBounds = containerRef.current?.getBoundingClientRect()
@@ -941,44 +954,39 @@ export const WorkflowCanvas = React.forwardRef<
         y: screenCenterY,
       })
 
-      try {
-        const addNodeOp: GraphOperation = {
-          type: "add_node",
-          payload: {
-            type: action.action,
-            title: action.default_title ?? action.action,
-            position_x: position.x,
-            position_y: position.y,
-          },
-        }
+      // Stack several nodes vertically so they don't overlap.
+      const addNodeOps: GraphOperation[] = actions.map((action, i) => ({
+        type: "add_node",
+        payload: {
+          type: action.action,
+          title: action.default_title ?? action.action,
+          position_x: position.x,
+          position_y: position.y + i * NODE_STACK_OFFSET,
+        },
+      }))
 
+      try {
         const result = await applyGraphOperations({
           baseVersion: graphVersion,
-          operations: [addNodeOp],
+          operations: addNodeOps,
         })
 
         updateStateFromGraph(result)
         toast({
-          title: "Action added",
-          description: `Added "${action.default_title ?? action.action}" to the workflow.`,
+          title: actions.length === 1 ? "Action added" : "Actions added",
+          description:
+            actions.length === 1
+              ? `Added "${actions[0].default_title ?? actions[0].action}" to the workflow.`
+              : `Added ${actions.length} actions to the workflow.`,
         })
       } catch (error) {
         const apiError = error as { status?: number }
         if (apiError.status === 409) {
           try {
             const latestGraph = await refetchGraph()
-            const addNodeOp: GraphOperation = {
-              type: "add_node",
-              payload: {
-                type: action.action,
-                title: action.default_title ?? action.action,
-                position_x: position.x,
-                position_y: position.y,
-              },
-            }
             const result = await applyGraphOperations({
               baseVersion: latestGraph.version,
-              operations: [addNodeOp],
+              operations: addNodeOps,
             })
             updateStateFromGraph(result)
           } catch (retryError) {
@@ -1007,6 +1015,11 @@ export const WorkflowCanvas = React.forwardRef<
       refetchGraph,
       toast,
     ]
+  )
+
+  const handleToolbarAddAction = useCallback(
+    (action: RegistryActionReadMinimal) => handleToolbarAddActions([action]),
+    [handleToolbarAddActions]
   )
 
   return (
@@ -1056,23 +1069,17 @@ export const WorkflowCanvas = React.forwardRef<
           <Button
             variant="outline"
             className="m-0 size-6 p-0 text-xs"
-            onClick={() => onLayout("TB")}
+            onClick={onLayout}
           >
             <MoveVerticalIcon className="size-3" strokeWidth={2} />
-          </Button>
-          <Button
-            variant="outline"
-            className="m-0 hidden size-6 p-0 text-xs"
-            onClick={() => onLayout("LR")}
-            disabled
-          >
-            <MoveHorizontalIcon className="size-3" strokeWidth={2} />
           </Button>
         </Panel>
         <Panel position="bottom-center" className="mb-4">
           <CanvasToolbar
             onAddAction={handleToolbarAddAction}
+            onAddActions={handleToolbarAddActions}
             embedded={embedded}
+            trailing={<ToggleConditionsButton />}
           />
         </Panel>
         <NodeSilhouette

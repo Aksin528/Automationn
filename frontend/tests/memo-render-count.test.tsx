@@ -4,11 +4,12 @@
  * Verifies the React.memo wrappers on MessagePart, ToolInput, and ToolOutput
  * by counting renders via a spy on the mocked CodeBlock component.
  */
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+
 import { render } from "@testing-library/react"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { useUpdateChat, useVercelChat } from "@/hooks/use-chat"
 import { useBuilderRegistryActions, useListMcpIntegrations } from "@/lib/hooks"
+import { QueryClient, QueryClientProvider } from "@/lib/query"
 
 // Track how many times the CodeBlock mock renders
 let codeBlockRenderCount = 0
@@ -56,8 +57,20 @@ jest.mock("@/components/editor/codemirror/code-editor", () => ({
 }))
 jest.mock("@/hooks/use-chat", () => ({
   useVercelChat: jest.fn(),
+  useAdoptServerTranscript: jest.fn(),
   useGetChat: jest.fn(() => ({ chat: null })),
+  useGetChatVercel: jest.fn(() => ({ chat: undefined })),
   useUpdateChat: jest.fn(() => ({ updateChat: jest.fn(), isUpdating: false })),
+  useCancelChatTurn: jest.fn(() => ({
+    cancelChatTurn: jest.fn(),
+    isCancellingChatTurn: false,
+  })),
+  // One object for every render, like the real hook's stable empty list.
+  usePendingMessages: jest.fn().mockReturnValue({
+    pending: [],
+    refreshPending: jest.fn(),
+    withdraw: jest.fn(),
+  }),
   parseChatError: (error: unknown) =>
     error instanceof Error ? error.message : "Chat error",
   makeContinueMessage: jest.fn(),
@@ -75,6 +88,24 @@ jest.mock("@/lib/hooks", () => ({
 }))
 jest.mock("@/providers/workspace-id", () => ({
   useWorkspaceId: () => "workspace-1",
+}))
+jest.mock("@/components/auth/scope-guard", () => ({
+  useScopeCheck: jest.fn(() => true),
+}))
+jest.mock("@/hooks/use-entitlements", () => ({
+  useEntitlements: jest.fn(() => ({
+    hasEntitlement: () => false,
+    isLoading: false,
+    hasEntitlementData: true,
+  })),
+}))
+jest.mock("@/hooks/use-agent-presets", () => ({
+  useAgentPresets: jest.fn(() => ({
+    presets: [],
+    presetsIsLoading: false,
+    presetsError: null,
+    refetchPresets: jest.fn(),
+  })),
 }))
 
 import { ToolInput, ToolOutput } from "@/components/ai-elements/tool"
@@ -187,13 +218,14 @@ describe("MessagePart memoization", () => {
 
   it("does not re-render completed tool calls when messages array ref changes", () => {
     // Stable objects representing the tool call's input and output.
-    const toolInput = { url: "https://example.com", method: "GET" }
+    const toolInput = { url: "https://example.com", headers: { method: "GET" } }
     const toolOutput = { status: 200, body: "OK" }
 
     const messages1 = makeCompletedToolMessages(toolInput, toolOutput)
 
     mockUseVercelChat.mockReturnValue({
       sendMessage: jest.fn(),
+      setMessages: jest.fn(),
       regenerate: jest.fn(),
       messages: messages1,
       status: "ready",
@@ -224,6 +256,7 @@ describe("MessagePart memoization", () => {
 
     mockUseVercelChat.mockReturnValue({
       sendMessage: jest.fn(),
+      setMessages: jest.fn(),
       regenerate: jest.fn(),
       messages: messages2,
       status: "ready",
@@ -250,7 +283,7 @@ describe("MessagePart memoization", () => {
   })
 
   it("re-renders when tool state transitions from input-available to output-available", () => {
-    const toolInput = { url: "https://example.com", method: "GET" }
+    const toolInput = { url: "https://example.com", headers: { method: "GET" } }
 
     // Start with only an input-available tool part
     const pendingMessages = [
@@ -270,6 +303,7 @@ describe("MessagePart memoization", () => {
 
     mockUseVercelChat.mockReturnValue({
       sendMessage: jest.fn(),
+      setMessages: jest.fn(),
       regenerate: jest.fn(),
       messages: pendingMessages,
       status: "streaming",
@@ -300,6 +334,7 @@ describe("MessagePart memoization", () => {
 
     mockUseVercelChat.mockReturnValue({
       sendMessage: jest.fn(),
+      setMessages: jest.fn(),
       regenerate: jest.fn(),
       messages: completedMessages,
       status: "streaming",
@@ -332,7 +367,7 @@ describe("ToolInput memoization", () => {
   })
 
   it("does not re-render when parent re-renders with same input ref", () => {
-    const input = { url: "https://example.com", method: "GET" }
+    const input = { url: "https://example.com", headers: { method: "GET" } }
 
     const { rerender } = render(
       <Wrapper>
@@ -356,7 +391,7 @@ describe("ToolInput memoization", () => {
   it("re-renders when input reference changes", () => {
     const { rerender } = render(
       <Wrapper>
-        <ToolInput input={{ url: "https://example.com" }} />
+        <ToolInput input={{ url: "https://example.com", headers: {} }} />
       </Wrapper>
     )
 
@@ -367,7 +402,7 @@ describe("ToolInput memoization", () => {
     // because memo uses referential equality
     rerender(
       <Wrapper>
-        <ToolInput input={{ url: "https://example.com" }} />
+        <ToolInput input={{ url: "https://example.com", headers: {} }} />
       </Wrapper>
     )
 

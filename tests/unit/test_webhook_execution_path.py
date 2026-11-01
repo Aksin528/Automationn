@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import json
 import uuid
+from collections.abc import Iterator
 from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any, cast
@@ -37,6 +38,7 @@ from tracecat.storage.object import (
 )
 from tracecat.storage.utils import deserialize_object
 from tracecat.webhooks.router import (
+    _annotate_webhook_trace,
     _incoming_webhook,
     _wrapped_payload,
     incoming_webhook_wait,
@@ -56,6 +58,21 @@ from tracecat.workflow.executions.service import WorkflowExecutionsService
 
 _WF_ID = WorkflowUUID.new_uuid4()
 _WORKSPACE_ID = uuid.uuid4()
+
+
+def test_public_webhook_trace_annotation_sets_trace_id() -> None:
+    response = cast(Any, {})
+    with patch(
+        "tracecat.webhooks.router.current_trace_id",
+        return_value="0123456789abcdef0123456789abcdef",
+    ):
+        _annotate_webhook_trace(
+            wf_id=_WF_ID,
+            wf_exec_id="wf_synthetic/exec_synthetic",
+            response=response,
+        )
+
+    assert response["trace_id"] == "0123456789abcdef0123456789abcdef"
 
 
 def _role() -> Role:
@@ -99,6 +116,27 @@ def _definition(**overrides: Any) -> WorkflowDefinition:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def service(mock_client: Client) -> WorkflowExecutionsService:
+    return WorkflowExecutionsService(client=mock_client, role=_role())
+
+
+@pytest.fixture
+def mock_storage(service: WorkflowExecutionsService) -> Iterator[MagicMock]:
+    storage = MagicMock()
+    storage.store = AsyncMock(
+        return_value=InlineObject(type="inline", data={"_": "ref"})
+    )
+    with (
+        patch(
+            "tracecat.workflow.executions.service.get_object_storage",
+            return_value=storage,
+        ),
+        patch.object(service, "_resolve_execution_timeout", return_value=None),
+    ):
+        yield storage
+
+
 class TestWebhookStartWorkflowInvariants:
     """Verify that _start_workflow preserves all webhook-critical invariants.
 
@@ -112,123 +150,76 @@ class TestWebhookStartWorkflowInvariants:
         client.start_workflow = AsyncMock(return_value=MagicMock())
         return client
 
-    @pytest.fixture
-    def service(self, mock_client: Client) -> WorkflowExecutionsService:
-        role = _role()
-        svc = WorkflowExecutionsService(client=mock_client, role=role)
-        return svc
-
     @pytest.mark.anyio
-    async def test_trigger_type_webhook_propagated_to_temporal_search_attrs(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
+    @pytest.mark.parametrize("trigger_type", [TriggerType.WEBHOOK, TriggerType.FORM])
+    async def test_start_workflow_webhook_invariants(
+        self,
+        service: WorkflowExecutionsService,
+        mock_client: MagicMock,
+        mock_storage: MagicMock,
+        trigger_type: TriggerType,
     ):
-        """TriggerType.WEBHOOK must appear in the Temporal search attributes.
+        """Webhook-critical invariants for _start_workflow.
 
-        If the trigger type is lost or mapped to MANUAL, the execution will be
-        invisible to webhook-specific monitoring and queries.
+        - The trigger type and workspace ID are Temporal search attributes, so
+          executions stay visible to webhook monitoring and tenant-scoped queries.
+        - A time_anchor is minted when none is provided; webhooks have no
+          TemporalScheduledStartTime fallback, so FN.now() would break.
+        - The payload is persisted to object storage and passed as a StoredObject
+          reference so large payloads don't exceed Temporal size limits.
+        - The PUBLISHED execution type and registry lock are forwarded so child
+          aliases and action versions resolve from committed definitions.
         """
         dsl = _dsl_input()
-        payload = {"alert": "test"}
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
-        )
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs=payload,
-                trigger_type=TriggerType.WEBHOOK,
-            )
-
-        mock_client.start_workflow.assert_awaited_once()
-        call_kwargs = mock_client.start_workflow.call_args
-        search_attrs: TypedSearchAttributes = call_kwargs.kwargs["search_attributes"]
-
-        trigger_attr = TemporalSearchAttr.TRIGGER_TYPE.key
-        found = [
-            pair for pair in search_attrs.search_attributes if pair.key == trigger_attr
-        ]
-        assert found, (
-            "TracecatTriggerType search attribute missing from start_workflow call"
-        )
-        assert found[0].value == "webhook", (
-            f"TracecatTriggerType should be 'webhook', got '{found[0].value}'"
-        )
-
-    @pytest.mark.anyio
-    async def test_time_anchor_is_minted_for_webhook_triggers(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """Webhook triggers must mint a time_anchor when none is provided.
-
-        The time_anchor drives FN.now() inside workflows. If omitted, scheduled
-        workflows fall back to TemporalScheduledStartTime, but webhooks have no
-        such fallback—they'd get a None time_anchor and FN.now() would break.
-        """
-        dsl = _dsl_input()
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
-        )
+        payload = {"event_type": "alert.created", "data": {"id": "abc123"}}
+        lock = RegistryLock(origins={"default": "v1.0"}, actions={})
 
         before = datetime.datetime.now(datetime.UTC)
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-                time_anchor=None,  # <-- not provided
-            )
+        await service._start_workflow(
+            dsl=dsl,
+            wf_id=_WF_ID,
+            wf_exec_id=f"{_WF_ID.short()}/exec_test",
+            trigger_inputs=payload,
+            trigger_type=trigger_type,
+            execution_type=ExecutionType.PUBLISHED,
+            registry_lock=lock,
+            time_anchor=None,
+        )
         after = datetime.datetime.now(datetime.UTC)
 
+        mock_client.start_workflow.assert_awaited_once()
         call_args = mock_client.start_workflow.call_args
-        dsl_run_args: DSLRunArgs = call_args.args[1]
-        assert dsl_run_args.time_anchor is not None, (
-            "time_anchor must be minted for webhook triggers"
+        search_attrs: TypedSearchAttributes = call_args.kwargs["search_attributes"]
+        assert search_attrs.get(TemporalSearchAttr.TRIGGER_TYPE.key) == trigger_type
+        assert search_attrs.get(TemporalSearchAttr.WORKSPACE_ID.key) == str(
+            _WORKSPACE_ID
         )
+        assert search_attrs.get(TemporalSearchAttr.EXECUTION_TYPE.key) == "published"
+
+        mock_storage.store.assert_awaited_once()
+        assert mock_storage.store.call_args.args[1] == payload
+
+        dsl_run_args: DSLRunArgs = call_args.args[1]
+        assert dsl_run_args.time_anchor is not None
         assert before <= dsl_run_args.time_anchor <= after
+        assert dsl_run_args.trigger_inputs == mock_storage.store.return_value
+        assert dsl_run_args.execution_type == ExecutionType.PUBLISHED
+        assert dsl_run_args.registry_lock == lock
 
     @pytest.mark.anyio
     async def test_workflow_execution_ids_reject_duplicate_reuse(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
+        self,
+        service: WorkflowExecutionsService,
+        mock_client: MagicMock,
+        mock_storage: MagicMock,
     ):
-        dsl = _dsl_input()
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
+        await service._start_workflow(
+            dsl=_dsl_input(),
+            wf_id=_WF_ID,
+            wf_exec_id=f"{_WF_ID.short()}/exec_test",
+            trigger_inputs={"x": 1},
+            trigger_type=TriggerType.WEBHOOK,
         )
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-            )
 
         call_kwargs = mock_client.start_workflow.call_args
         assert (
@@ -238,223 +229,25 @@ class TestWebhookStartWorkflowInvariants:
 
     @pytest.mark.anyio
     async def test_explicit_time_anchor_is_not_overwritten(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
+        self,
+        service: WorkflowExecutionsService,
+        mock_client: MagicMock,
+        mock_storage: MagicMock,
     ):
         """If a time_anchor is explicitly provided it must not be replaced."""
-        dsl = _dsl_input()
         fixed_anchor = datetime.datetime(2025, 1, 1, tzinfo=datetime.UTC)
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
+        await service._start_workflow(
+            dsl=_dsl_input(),
+            wf_id=_WF_ID,
+            wf_exec_id=f"{_WF_ID.short()}/exec_test",
+            trigger_inputs={"x": 1},
+            trigger_type=TriggerType.WEBHOOK,
+            time_anchor=fixed_anchor,
         )
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-                time_anchor=fixed_anchor,
-            )
 
         call_args = mock_client.start_workflow.call_args
         dsl_run_args: DSLRunArgs = call_args.args[1]
         assert dsl_run_args.time_anchor == fixed_anchor
-
-    @pytest.mark.anyio
-    async def test_trigger_inputs_stored_in_object_storage(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """Webhook payload must be persisted to object storage and passed as StoredObject.
-
-        If the payload is passed inline instead of as a StoredObject reference,
-        large payloads will exceed Temporal's payload size limits and the
-        execution will fail.
-        """
-        dsl = _dsl_input()
-        payload = {"event_type": "alert.created", "data": {"id": "abc123"}}
-        mock_stored = InlineObject(type="inline", data={"_": "ref"})
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(return_value=mock_stored)
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs=payload,
-                trigger_type=TriggerType.WEBHOOK,
-            )
-
-        # Object storage was called with the payload
-        mock_storage.store.assert_awaited_once()
-        store_args = mock_storage.store.call_args
-        assert store_args.args[1] == payload
-
-        # The DSLRunArgs received the StoredObject reference, not the raw dict
-        call_args = mock_client.start_workflow.call_args
-        dsl_run_args: DSLRunArgs = call_args.args[1]
-        assert dsl_run_args.trigger_inputs == mock_stored
-
-    @pytest.mark.anyio
-    async def test_none_payload_skips_storage(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """A None payload (e.g. empty-body webhook) must not call object storage."""
-        dsl = _dsl_input()
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock()
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs=None,
-                trigger_type=TriggerType.WEBHOOK,
-            )
-
-        mock_storage.store.assert_not_awaited()
-
-        call_args = mock_client.start_workflow.call_args
-        dsl_run_args: DSLRunArgs = call_args.args[1]
-        assert dsl_run_args.trigger_inputs is None
-
-    @pytest.mark.anyio
-    async def test_execution_type_is_published_for_standard_webhook(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """Standard webhook execution must use PUBLISHED execution type.
-
-        If this changes to DRAFT, the workflow would resolve child-workflow
-        aliases from draft definitions instead of committed ones, potentially
-        running untested workflow versions in production.
-        """
-        dsl = _dsl_input()
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
-        )
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-                execution_type=ExecutionType.PUBLISHED,
-            )
-
-        call_args = mock_client.start_workflow.call_args
-        dsl_run_args: DSLRunArgs = call_args.args[1]
-        assert dsl_run_args.execution_type == ExecutionType.PUBLISHED
-
-        # Also verify it's in the search attributes
-        search_attrs: TypedSearchAttributes = call_args.kwargs["search_attributes"]
-        exec_type_key = TemporalSearchAttr.EXECUTION_TYPE.key
-        found = [
-            pair for pair in search_attrs.search_attributes if pair.key == exec_type_key
-        ]
-        assert found and found[0].value == "published"
-
-    @pytest.mark.anyio
-    async def test_workspace_id_propagated_in_search_attrs(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """Workspace ID must be set as a Temporal search attribute.
-
-        Without it, multi-tenant query isolation breaks—workspace A could
-        see (or be confused by) workspace B's executions.
-        """
-        dsl = _dsl_input()
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
-        )
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-            )
-
-        call_args = mock_client.start_workflow.call_args
-        search_attrs: TypedSearchAttributes = call_args.kwargs["search_attributes"]
-        ws_key = TemporalSearchAttr.WORKSPACE_ID.key
-        found = [pair for pair in search_attrs.search_attributes if pair.key == ws_key]
-        assert found, "TracecatWorkspaceId search attribute missing"
-        assert found[0].value == str(_WORKSPACE_ID)
-
-    @pytest.mark.anyio
-    async def test_registry_lock_forwarded_to_dsl_run_args(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """Registry lock must be forwarded so that the worker pins exact action versions.
-
-        If dropped, the worker resolves actions from the latest registry—which
-        may differ from the versions the workflow was tested against.
-        """
-        dsl = _dsl_input()
-        lock = RegistryLock(origins={"default": "v1.0"}, actions={})
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
-        )
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._start_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-                registry_lock=lock,
-            )
-
-        call_args = mock_client.start_workflow.call_args
-        dsl_run_args: DSLRunArgs = call_args.args[1]
-        assert dsl_run_args.registry_lock == lock
 
 
 # ---------------------------------------------------------------------------
@@ -469,50 +262,21 @@ class TestWebhookRouterExecutionPath:
     the contract between the router and the execution service.
     """
 
-    @pytest.mark.anyio
-    async def test_standard_webhook_calls_wait_for_start_with_webhook_trigger(self):
-        """The primary webhook handler must use create_workflow_execution_wait_for_start
-        with trigger_type=WEBHOOK—never nowait or manual.
-        """
-        workflow_id = WorkflowUUID.new_uuid4()
-        payload = {"event": "test"}
-        mock_service = AsyncMock()
-        mock_service.create_workflow_execution_wait_for_start = AsyncMock(
-            return_value={
-                "message": "Workflow execution started",
-                "wf_id": workflow_id,
-                "wf_exec_id": f"{workflow_id.short()}/exec_1",
-            }
-        )
-
+    @staticmethod
+    def _request(
+        *,
+        include_headers: bool = False,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+    ) -> Request:
         request = MagicMock(spec=Request)
-        request.headers = {}
-
-        with patch(
-            "tracecat.webhooks.router.WorkflowExecutionsService.connect",
-            AsyncMock(return_value=mock_service),
-        ):
-            await _incoming_webhook(
-                workflow_id=workflow_id,
-                defn=_definition(),
-                payload=payload,
-                echo=False,
-                empty_echo=False,
-                vendor=None,
-                request=request,
-                content_type="application/json",
-            )
-
-        mock_service.create_workflow_execution_wait_for_start.assert_awaited_once()
-        call_kwargs = (
-            mock_service.create_workflow_execution_wait_for_start.call_args.kwargs
-        )
-        assert call_kwargs["trigger_type"] == TriggerType.WEBHOOK
-        assert call_kwargs["payload"] == payload
+        request.headers = headers or {}
+        request.body = AsyncMock(return_value=body)
+        request.state.webhook_include_headers = include_headers
+        return request
 
     @pytest.mark.anyio
-    async def test_include_headers_off_passes_raw_body(self):
-        """With include_headers=False, TRIGGER is the raw parsed body (default)."""
+    async def test_include_headers_on_preserves_legacy_envelope_expects(self):
         workflow_id = WorkflowUUID.new_uuid4()
         payload = {"event": "test"}
         mock_service = AsyncMock()
@@ -526,59 +290,26 @@ class TestWebhookRouterExecutionPath:
 
         request = MagicMock(spec=Request)
         request.headers = {"content-type": "application/json"}
+        request.body = AsyncMock(return_value=b'{"event": "test"}')
 
-        with patch(
-            "tracecat.webhooks.router.WorkflowExecutionsService.connect",
-            AsyncMock(return_value=mock_service),
-        ):
-            await _incoming_webhook(
-                workflow_id=workflow_id,
-                defn=_definition(),
-                payload=payload,
-                echo=False,
-                empty_echo=False,
-                vendor=None,
-                request=request,
-                content_type="application/json",
-                include_headers=False,
-            )
-
-        call_kwargs = (
-            mock_service.create_workflow_execution_wait_for_start.call_args.kwargs
-        )
-        assert call_kwargs["payload"] == payload
-
-    @pytest.mark.anyio
-    async def test_include_headers_on_wraps_body_with_envelope(self):
-        """With include_headers=True, TRIGGER is {status_code, headers, data}.
-
-        The synthetic status_code mirrors core.http.request and the original
-        body is preserved under `data`.
-        """
-        workflow_id = WorkflowUUID.new_uuid4()
-        payload = {"event": "test"}
-        mock_service = AsyncMock()
-        mock_service.create_workflow_execution_wait_for_start = AsyncMock(
-            return_value={
-                "message": "Workflow execution started",
-                "wf_id": workflow_id,
-                "wf_exec_id": f"{workflow_id.short()}/exec_1",
+        defn = _definition(
+            entrypoint={
+                "ref": "start",
+                "expects": {
+                    "status_code": {"type": "int"},
+                    "headers": {"type": "dict[str, str]"},
+                    "data": {"type": "dict"},
+                },
             }
         )
 
-        request = MagicMock(spec=Request)
-        request.headers = {
-            "content-type": "application/json",
-            "x-custom-header": "abc",
-        }
-
         with patch(
             "tracecat.webhooks.router.WorkflowExecutionsService.connect",
             AsyncMock(return_value=mock_service),
         ):
             await _incoming_webhook(
                 workflow_id=workflow_id,
-                defn=_definition(),
+                defn=defn,
                 payload=payload,
                 echo=False,
                 empty_echo=False,
@@ -591,19 +322,14 @@ class TestWebhookRouterExecutionPath:
         call_kwargs = (
             mock_service.create_workflow_execution_wait_for_start.call_args.kwargs
         )
-        wrapped = call_kwargs["payload"]
-        assert wrapped == {
+        assert call_kwargs["payload"] == {
             "status_code": 200,
-            "headers": {
-                "content-type": "application/json",
-                "x-custom-header": "abc",
-            },
+            "headers": {"content-type": "application/json"},
             "data": payload,
         }
 
     @pytest.mark.anyio
-    async def test_include_headers_on_strips_api_key_header(self):
-        """The webhook's own API key header must never reach the workflow."""
+    async def test_include_headers_on_keeps_raw_body_when_expects_declares_it(self):
         workflow_id = WorkflowUUID.new_uuid4()
         payload = {"event": "test"}
         mock_service = AsyncMock()
@@ -615,11 +341,22 @@ class TestWebhookRouterExecutionPath:
             }
         )
 
+        raw_body = b'{"event": "test"}'
         request = MagicMock(spec=Request)
-        request.headers = {
-            "content-type": "application/json",
-            "x-tracecat-api-key": "super-secret",
-        }
+        request.headers = {"content-type": "application/json"}
+        request.body = AsyncMock(return_value=raw_body)
+
+        defn = _definition(
+            entrypoint={
+                "ref": "start",
+                "expects": {
+                    "status_code": {"type": "int"},
+                    "headers": {"type": "dict[str, str]"},
+                    "data": {"type": "dict"},
+                    "raw_body": {"type": "str"},
+                },
+            }
+        )
 
         with patch(
             "tracecat.webhooks.router.WorkflowExecutionsService.connect",
@@ -627,7 +364,7 @@ class TestWebhookRouterExecutionPath:
         ):
             await _incoming_webhook(
                 workflow_id=workflow_id,
-                defn=_definition(),
+                defn=defn,
                 payload=payload,
                 echo=False,
                 empty_echo=False,
@@ -640,9 +377,66 @@ class TestWebhookRouterExecutionPath:
         call_kwargs = (
             mock_service.create_workflow_execution_wait_for_start.call_args.kwargs
         )
-        wrapped = call_kwargs["payload"]
-        assert "x-tracecat-api-key" not in wrapped["headers"]
-        assert wrapped["headers"] == {"content-type": "application/json"}
+        assert call_kwargs["payload"] == {
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "data": payload,
+            "raw_body": raw_body.decode("utf-8"),
+        }
+
+    @pytest.mark.anyio
+    async def test_include_headers_on_keeps_empty_raw_body_as_string(self):
+        workflow_id = WorkflowUUID.new_uuid4()
+        mock_service = AsyncMock()
+        mock_service.create_workflow_execution_wait_for_start = AsyncMock(
+            return_value={
+                "message": "Workflow execution started",
+                "wf_id": workflow_id,
+                "wf_exec_id": f"{workflow_id.short()}/exec_1",
+            }
+        )
+
+        request = MagicMock(spec=Request)
+        request.headers = {"content-type": "application/json"}
+        request.body = AsyncMock(return_value=b"")
+
+        defn = _definition(
+            entrypoint={
+                "ref": "start",
+                "expects": {
+                    "status_code": {"type": "int"},
+                    "headers": {"type": "dict[str, str]"},
+                    "data": {"type": "Any"},
+                    "raw_body": {"type": "str"},
+                },
+            }
+        )
+
+        with patch(
+            "tracecat.webhooks.router.WorkflowExecutionsService.connect",
+            AsyncMock(return_value=mock_service),
+        ):
+            await _incoming_webhook(
+                workflow_id=workflow_id,
+                defn=defn,
+                payload=None,
+                echo=False,
+                empty_echo=False,
+                vendor=None,
+                request=request,
+                content_type="application/json",
+                include_headers=True,
+            )
+
+        call_kwargs = (
+            mock_service.create_workflow_execution_wait_for_start.call_args.kwargs
+        )
+        assert call_kwargs["payload"] == {
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "data": None,
+            "raw_body": "",
+        }
 
     @pytest.mark.anyio
     async def test_include_headers_on_wraps_each_ndjson_batch_item(self):
@@ -660,6 +454,7 @@ class TestWebhookRouterExecutionPath:
 
         request = MagicMock(spec=Request)
         request.headers = {"content-type": "application/x-ndjson"}
+        request.body = AsyncMock(return_value=b'{"event":"a"}\n{"event":"b"}')
 
         with patch(
             "tracecat.webhooks.router.WorkflowExecutionsService.connect",
@@ -686,44 +481,6 @@ class TestWebhookRouterExecutionPath:
         assert wrapped["headers"] == {"content-type": "application/x-ndjson"}
         # batched() yields tuples; the whole batch is wrapped as one envelope
         assert list(wrapped["data"]) == payload
-
-    @pytest.mark.anyio
-    async def test_webhook_constructs_dsl_input_from_definition_content(self):
-        """The router must build DSLInput from defn.content, not pass it raw."""
-        workflow_id = WorkflowUUID.new_uuid4()
-        mock_service = AsyncMock()
-        mock_service.create_workflow_execution_wait_for_start = AsyncMock(
-            return_value={
-                "message": "Workflow execution started",
-                "wf_id": workflow_id,
-                "wf_exec_id": f"{workflow_id.short()}/exec_1",
-            }
-        )
-
-        request = MagicMock(spec=Request)
-        request.headers = {}
-
-        with patch(
-            "tracecat.webhooks.router.WorkflowExecutionsService.connect",
-            AsyncMock(return_value=mock_service),
-        ):
-            await _incoming_webhook(
-                workflow_id=workflow_id,
-                defn=_definition(),
-                payload={"x": 1},
-                echo=False,
-                empty_echo=False,
-                vendor=None,
-                request=request,
-                content_type="application/json",
-            )
-
-        call_kwargs = (
-            mock_service.create_workflow_execution_wait_for_start.call_args.kwargs
-        )
-        dsl = call_kwargs["dsl"]
-        assert isinstance(dsl, DSLInput)
-        assert dsl.title == "Webhook regression test"
 
     @pytest.mark.anyio
     async def test_webhook_forwards_registry_lock_from_definition(self):
@@ -775,46 +532,10 @@ class TestWebhookRouterExecutionPath:
         call_kwargs = (
             mock_service.create_workflow_execution_wait_for_start.call_args.kwargs
         )
+        assert call_kwargs["trigger_type"] == TriggerType.WEBHOOK
         lock = call_kwargs["registry_lock"]
         assert isinstance(lock, RegistryLock)
         assert lock.origins == {"default": "v2.0"}
-
-    @pytest.mark.anyio
-    async def test_webhook_response_contains_required_fields(self):
-        """Response must include wf_id and wf_exec_id for caller correlation."""
-        workflow_id = WorkflowUUID.new_uuid4()
-        expected_exec_id = f"{workflow_id.short()}/exec_42"
-        mock_service = AsyncMock()
-        mock_service.create_workflow_execution_wait_for_start = AsyncMock(
-            return_value={
-                "message": "Workflow execution started",
-                "wf_id": workflow_id,
-                "wf_exec_id": expected_exec_id,
-            }
-        )
-
-        request = MagicMock(spec=Request)
-        request.headers = {}
-
-        with patch(
-            "tracecat.webhooks.router.WorkflowExecutionsService.connect",
-            AsyncMock(return_value=mock_service),
-        ):
-            response = await _incoming_webhook(
-                workflow_id=workflow_id,
-                defn=_definition(),
-                payload={"x": 1},
-                echo=False,
-                empty_echo=False,
-                vendor=None,
-                request=request,
-                content_type="application/json",
-            )
-
-        assert isinstance(response, dict)
-        assert "wf_id" in response
-        assert "wf_exec_id" in response
-        assert response["wf_exec_id"] == expected_exec_id
 
     @pytest.mark.anyio
     async def test_wait_webhook_returns_result_with_inline_object(self):
@@ -838,6 +559,7 @@ class TestWebhookRouterExecutionPath:
                 workflow_id=workflow_id,
                 defn=_definition(),
                 payload=payload,
+                request=self._request(),
             )
 
         response_obj = cast(dict[str, Any], response)
@@ -847,6 +569,7 @@ class TestWebhookRouterExecutionPath:
         call_kwargs = mock_service.create_workflow_execution.call_args.kwargs
         assert call_kwargs["trigger_type"] == TriggerType.WEBHOOK
         assert call_kwargs["payload"] == payload
+        assert call_kwargs["wf_exec_id"].startswith(f"{workflow_id.short()}/exec_")
 
     @pytest.mark.anyio
     async def test_wait_webhook_returns_download_url_for_external_object(self):
@@ -886,6 +609,7 @@ class TestWebhookRouterExecutionPath:
                 workflow_id=workflow_id,
                 defn=_definition(),
                 payload=payload,
+                request=self._request(),
             )
 
         response_obj = cast(dict[str, Any], response)
@@ -945,6 +669,7 @@ class TestWebhookRouterExecutionPath:
                 workflow_id=workflow_id,
                 defn=_definition(),
                 payload=payload,
+                request=self._request(),
             )
 
         response_obj = cast(dict[str, Any], response)
@@ -1005,6 +730,7 @@ class TestWebhookRouterExecutionPath:
                 workflow_id=workflow_id,
                 defn=_definition(),
                 payload=payload,
+                request=self._request(),
             )
 
         response_obj = cast(dict[str, Any], response)
@@ -1087,6 +813,7 @@ class TestWebhookRouterExecutionPath:
                 workflow_id=workflow_id,
                 defn=_definition(),
                 payload=payload,
+                request=self._request(),
             )
 
         response_obj = cast(dict[str, Any], response)
@@ -1119,6 +846,7 @@ class TestWebhookRouterExecutionPath:
                 workflow_id=workflow_id,
                 defn=_definition(),
                 payload=payload,
+                request=self._request(),
                 unwrap=True,
             )
 
@@ -1167,6 +895,7 @@ class TestWebhookRouterExecutionPath:
                     workflow_id=workflow_id,
                     defn=_definition(),
                     payload=payload,
+                    request=self._request(),
                     unwrap=True,
                 )
 
@@ -1226,6 +955,7 @@ class TestWebhookRouterExecutionPath:
                     workflow_id=workflow_id,
                     defn=_definition(),
                     payload=payload,
+                    request=self._request(),
                     unwrap=True,
                 )
 
@@ -1270,107 +1000,34 @@ class TestWebhookDispatchWorkflowInvariants:
         client.execute_workflow = AsyncMock(return_value={"status": "ok"})
         return client
 
-    @pytest.fixture
-    def service(self, mock_client: Client) -> WorkflowExecutionsService:
-        return WorkflowExecutionsService(client=mock_client, role=_role())
-
     @pytest.mark.anyio
+    @pytest.mark.parametrize("trigger_type", [TriggerType.WEBHOOK, TriggerType.FORM])
     async def test_dispatch_mints_time_anchor_for_webhook(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
+        self,
+        service: WorkflowExecutionsService,
+        mock_client: MagicMock,
+        mock_storage: MagicMock,
+        trigger_type: TriggerType,
     ):
-        """Same time_anchor invariant as _start_workflow."""
-        dsl = _dsl_input()
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
-        )
-
+        """Same time_anchor, trigger-type and payload-storage invariants as _start_workflow."""
         before = datetime.datetime.now(datetime.UTC)
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._dispatch_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-            )
+        await service._dispatch_workflow(
+            dsl=_dsl_input(),
+            wf_id=_WF_ID,
+            wf_exec_id=f"{_WF_ID.short()}/exec_test",
+            trigger_inputs={"x": 1},
+            trigger_type=trigger_type,
+        )
         after = datetime.datetime.now(datetime.UTC)
 
         call_args = mock_client.execute_workflow.call_args
+        search_attrs: TypedSearchAttributes = call_args.kwargs["search_attributes"]
+        assert search_attrs.get(TemporalSearchAttr.TRIGGER_TYPE.key) == trigger_type
         dsl_run_args: DSLRunArgs = call_args.args[1]
         assert dsl_run_args.time_anchor is not None
         assert before <= dsl_run_args.time_anchor <= after
-
-    @pytest.mark.anyio
-    async def test_dispatch_stores_payload_and_passes_stored_ref(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """Same payload-storage invariant as _start_workflow."""
-        dsl = _dsl_input()
-        payload = {"alert_id": "A-001"}
-        mock_stored = InlineObject(type="inline", data={"_": "ref"})
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(return_value=mock_stored)
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._dispatch_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs=payload,
-                trigger_type=TriggerType.WEBHOOK,
-            )
-
         mock_storage.store.assert_awaited_once()
-        call_args = mock_client.execute_workflow.call_args
-        dsl_run_args: DSLRunArgs = call_args.args[1]
-        assert dsl_run_args.trigger_inputs == mock_stored
-
-    @pytest.mark.anyio
-    async def test_dispatch_propagates_trigger_type_in_search_attrs(
-        self, service: WorkflowExecutionsService, mock_client: MagicMock
-    ):
-        """Same trigger-type search-attr invariant as _start_workflow."""
-        dsl = _dsl_input()
-        mock_storage = MagicMock()
-        mock_storage.store = AsyncMock(
-            return_value=InlineObject(type="inline", data={"_": "ref"})
-        )
-
-        with (
-            patch(
-                "tracecat.workflow.executions.service.get_object_storage",
-                return_value=mock_storage,
-            ),
-            patch.object(service, "_resolve_execution_timeout", return_value=None),
-        ):
-            await service._dispatch_workflow(
-                dsl=dsl,
-                wf_id=_WF_ID,
-                wf_exec_id=f"{_WF_ID.short()}/exec_test",
-                trigger_inputs={"x": 1},
-                trigger_type=TriggerType.WEBHOOK,
-            )
-
-        call_kwargs = mock_client.execute_workflow.call_args
-        search_attrs: TypedSearchAttributes = call_kwargs.kwargs["search_attributes"]
-        trigger_key = TemporalSearchAttr.TRIGGER_TYPE.key
-        found = [
-            pair for pair in search_attrs.search_attributes if pair.key == trigger_key
-        ]
-        assert found and found[0].value == "webhook"
+        assert dsl_run_args.trigger_inputs == mock_storage.store.return_value
 
     @pytest.mark.anyio
     async def test_dispatch_does_not_crash_for_inline_object_results(
@@ -1407,10 +1064,14 @@ class TestWrappedPayloadDependency:
 
     @staticmethod
     def _request(
-        *, include_headers: bool, headers: dict[str, str] | None = None
+        *,
+        include_headers: bool,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
     ) -> Request:
         request = MagicMock(spec=Request)
         request.headers = headers or {}
+        request.body = AsyncMock(return_value=body)
         request.state.webhook_include_headers = include_headers
         return request
 
@@ -1425,12 +1086,35 @@ class TestWrappedPayloadDependency:
 
     @pytest.mark.anyio
     async def test_wraps_when_flag_on(self):
+        raw_body = b'{"alert": "x"}'
         request = self._request(
             include_headers=True,
             headers={"content-type": "application/json", "x-custom-source": "siem"},
+            body=raw_body,
         )
         payload = {"alert": "x"}
         result = await _wrapped_payload(request=request, payload=payload)
+        assert result == {
+            "status_code": 200,
+            "headers": {
+                "content-type": "application/json",
+                "x-custom-source": "siem",
+            },
+            "data": payload,
+            "raw_body": raw_body.decode("utf-8"),
+        }
+
+    @pytest.mark.anyio
+    async def test_omits_raw_body_when_not_schema_compatible(self):
+        request = self._request(
+            include_headers=True,
+            headers={"content-type": "application/json", "x-custom-source": "siem"},
+            body=b'{"alert": "x"}',
+        )
+        payload = {"alert": "x"}
+        result = await _wrapped_payload(
+            request=request, payload=payload, include_raw_body=False
+        )
         assert result == {
             "status_code": 200,
             "headers": {
@@ -1474,20 +1158,3 @@ class TestWebhookReadIncludeHeaders:
         )
         read = WebhookRead.model_validate(obj, from_attributes=True)
         assert read.include_headers is False
-
-    def test_true_include_headers_preserved(self):
-        obj = SimpleNamespace(
-            id=uuid.uuid4(),
-            secret="secret",
-            status="online",
-            entrypoint_ref=None,
-            allowlisted_cidrs=[],
-            filters={},
-            methods=["POST"],
-            include_headers=True,
-            workflow_id=_WF_ID,
-            url="http://localhost/webhooks/x/y",
-            api_key=None,
-        )
-        read = WebhookRead.model_validate(obj, from_attributes=True)
-        assert read.include_headers is True

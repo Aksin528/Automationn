@@ -6,8 +6,8 @@ Terminology:
 """
 
 import uuid
-from datetime import datetime
-from typing import Annotated, Any, Literal, Self, TypedDict
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal, NamedTuple, Self, TypedDict
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -17,13 +17,17 @@ from pydantic import (
     Field,
     SecretStr,
     Tag,
+    ValidationError,
     computed_field,
     field_validator,
+    model_validator,
 )
 
+from tracecat.expressions.patterns import STANDALONE_TEMPLATE
 from tracecat.identifiers import UserID, WorkspaceID
 from tracecat.integrations.enums import IntegrationStatus, MCPAuthType, OAuthGrantType
 from tracecat.integrations.types import MCPServerType
+from tracecat.logger import logger
 
 
 # Pydantic models for API responses
@@ -32,6 +36,7 @@ class IntegrationReadMinimal(BaseModel):
 
     id: UUID4
     provider_id: str
+    grant_type: OAuthGrantType
     status: IntegrationStatus
     is_expired: bool
 
@@ -254,6 +259,10 @@ class ProviderMetadata(BaseModel):
         default=True,
         description="Whether this provider is available for use",
     )
+    service_account_json: bool = Field(
+        default=False,
+        description="Whether the client secret is a service account JSON key instead of an OAuth client secret",
+    )
     api_docs_url: str | None = Field(
         default=None, description="URL to API documentation"
     )
@@ -353,6 +362,42 @@ class ProviderRead(BaseModel):
     redirect_uri: str | None = None
 
 
+# Credential/config-field value types the configure dialog can declare.
+# ``url`` opts a value into http(s)-scheme validation; ``string`` (the default)
+# means an opaque token with no extra format checks. A value is treated as a
+# URL only when the catalog row declares ``type: "url"`` by hand — there is no
+# name-based inference.
+MCPCredentialValueType = Literal["string", "url"]
+
+
+def validate_url_credential_values(values: dict[str, str], url_keys: set[str]) -> None:
+    """Require an http(s):// scheme for values whose key is declared ``type: url``.
+
+    ``url_keys`` comes from the catalog connection spec — only keys a catalog
+    row marks ``type: "url"`` are checked. Empty (not yet filled in) and
+    templated values are skipped because they are validated at run time. Keys
+    outside ``url_keys`` are left untouched.
+    """
+    for key in url_keys:
+        if key not in values:
+            continue
+        value = values.get(key)
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{key!r} must be a URL starting with 'http://' or 'https://'"
+            )
+        stripped = value.strip()
+        # Empty (not yet filled in) and templated values resolve to their real
+        # value only at run time, so skip format validation here.
+        if not stripped or STANDALONE_TEMPLATE.match(stripped):
+            continue
+        parsed = urlparse(stripped)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                f"{key!r} must be a URL starting with 'http://' or 'https://'"
+            )
+
+
 class _MCPIntegrationCreateBase(BaseModel):
     """Shared request fields for creating an MCP integration."""
 
@@ -388,13 +433,45 @@ class MCPHttpIntegrationCreate(_MCPIntegrationCreateBase):
     oauth_integration_id: uuid.UUID | None = Field(
         default=None, description="OAuth integration ID (required for oauth2 auth_type)"
     )
+    tunnel_id: uuid.UUID | None = Field(
+        default=None,
+        description="Workspace tunnel that every request to this server goes through",
+    )
     custom_credentials: SecretStr | None = Field(
         default=None,
         description=(
-            "Custom credentials as JSON headers. Required for custom auth type; "
+            "HTTP headers as a JSON object. Required for custom auth type; "
             "optional additional headers for OAuth2 auth type."
         ),
     )
+    oauth_client_credentials: SecretStr | None = Field(
+        default=None,
+        description=(
+            "OAuth client credentials as a JSON object (client_id / "
+            "client_secret) for catalog OAuth2 rows that declare an "
+            "'oauth_client' credential. Kept separate from custom_credentials "
+            "so one connect can carry both a user-created OAuth client and "
+            "extra HTTP headers."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_oauth_client_credentials(self) -> Self:
+        # Blank means "not supplied": the service branches on ``is None`` to
+        # decide whether custom_credentials is headers or a legacy client.
+        if (
+            self.oauth_client_credentials is not None
+            and not self.oauth_client_credentials.get_secret_value().strip()
+        ):
+            self.oauth_client_credentials = None
+        if (
+            self.oauth_client_credentials is not None
+            and self.auth_type != MCPAuthType.OAUTH2
+        ):
+            raise ValueError(
+                "oauth_client_credentials is only valid for OAuth 2.0 MCP servers"
+            )
+        return self
 
     @field_validator("server_uri", mode="before")
     @classmethod
@@ -483,6 +560,10 @@ class MCPIntegrationUpdate(BaseModel):
     server_uri: str | None = None
     auth_type: MCPAuthType | None = None
     oauth_integration_id: uuid.UUID | None = None
+    tunnel_id: uuid.UUID | None = Field(
+        default=None,
+        description="Workspace tunnel for this HTTP server. Send null to stop using one.",
+    )
     custom_credentials: SecretStr | None = Field(
         default=None,
         description=(
@@ -563,8 +644,33 @@ PlatformMCPCatalogState = Literal[
     "not_configured",
     "configured",
     "connected",
+    "reauth_required",
     "error",
 ]
+
+
+class OAuthTokenState(NamedTuple):
+    """Credential columns needed to derive connection state without the full row."""
+
+    encrypted_access_token: bytes | None
+    encrypted_refresh_token: bytes | None
+    expires_at: datetime | None
+
+
+def credential_reauth_required(
+    *, has_refresh_token: bool, expires_at: datetime | None
+) -> bool:
+    """Dead credential: expired with no refresh token to revive it."""
+    if has_refresh_token:
+        return False
+    return expires_at is not None and datetime.now(UTC) >= expires_at
+
+
+MCPCatalogConnectStatus = Literal["configured", "connected", "oauth_redirect"]
+MCPVerificationStatus = Literal[
+    "idle", "verifying", "succeeded", "failed", "superseded"
+]
+MCPToolStatus = Literal["available", "missing"]
 
 
 class MCPConnectionCredential(BaseModel):
@@ -575,6 +681,21 @@ class MCPConnectionCredential(BaseModel):
     description: str
     required: bool = True
     secret: bool = True
+    default_value: str | None = None
+    placeholder: str | None = Field(
+        default=None,
+        description=(
+            "Optional placeholder shown in the configure dialog to hint the "
+            "expected value format (e.g. 'https://your-console.example.net')."
+        ),
+    )
+    type: MCPCredentialValueType = Field(
+        default="string",
+        description=(
+            "Value type used for light client/server validation. 'url' requires "
+            "an http(s):// scheme."
+        ),
+    )
     target: MCPConnectionTarget
 
 
@@ -596,6 +717,8 @@ class MCPConfigField(BaseModel):
     target: MCPConnectionTarget
     required: bool = True
     secret: bool = False
+    placeholder: str | None = None
+    type: MCPCredentialValueType = "string"
 
 
 class _MCPConnectionSpecBase(BaseModel):
@@ -616,6 +739,8 @@ class _MCPConnectionSpecBase(BaseModel):
                 target=credential.target,
                 required=credential.required,
                 secret=credential.secret,
+                placeholder=credential.placeholder,
+                type=credential.type,
             )
             for credential in self.credentials
         ]
@@ -629,6 +754,12 @@ class MCPHTTPOAuth2ConnectionSpec(_MCPConnectionSpecBase):
     auth_type: Literal[MCPAuthType.OAUTH2] = MCPAuthType.OAUTH2
     server_uri: str
     scopes: list[str] = Field(default_factory=list)
+    oauth_resource: str | None = None
+    """OAuth resource indicator pinned by the repo-owned catalog row.
+
+    This may differ from ``server_uri`` when a provider protects every MCP
+    route under one origin-level audience.
+    """
     oauth_authorization_endpoint: str | None = None
     """Known OAuth authorization endpoint pinned by the repo-owned catalog row.
 
@@ -638,6 +769,14 @@ class MCPHTTPOAuth2ConnectionSpec(_MCPConnectionSpecBase):
     without relaxing same-host validation globally.
     """
     oauth_token_endpoint: str | None = None
+    oauth_authorize_params: dict[str, str] = Field(default_factory=dict)
+    """Extra authorization-request parameters pinned by the repo-owned catalog row.
+
+    Some providers only issue a refresh token when the authorize request
+    carries vendor parameters (e.g. Google's ``access_type=offline`` and
+    ``prompt=consent``). Reserved OAuth parameters (client_id, redirect_uri,
+    response_type, state, scope, resource, PKCE) are never overridable.
+    """
 
 
 class MCPHTTPCustomConnectionSpec(_MCPConnectionSpecBase):
@@ -692,6 +831,65 @@ type MCPConnectionSpec = Annotated[
 ]
 
 
+class MCPToolSummary(BaseModel):
+    """Summary of a tool discovered on a remote MCP server."""
+
+    name: str
+    description: str | None = None
+    enabled: bool = True
+    """Whether the tool is available to agents that use this MCP integration."""
+    requires_approval: bool = False
+    """Whether this tool requires HITL approval before execution."""
+    status: MCPToolStatus = "available"
+    """Whether the tool was present in the latest successful discovery."""
+    input_schema: dict[str, Any] | None = None
+    """JSON Schema for the tool's arguments, as the server advertised it.
+
+    Recorded for stdio servers, whose tools are listed from this saved copy
+    instead of rediscovered per turn. ``None`` for HTTP servers and for stdio
+    tools verified before the schema was recorded.
+    """
+
+    @classmethod
+    def validate_stored(
+        cls, tools: list[Any] | None, *, mcp_integration_id: object | None = None
+    ) -> list[Self] | None:
+        """Validate stored tool entries, skipping any malformed records.
+
+        Stored tool JSON is best-effort: a single corrupt entry (manual DB
+        edit, future schema drift) must not crash listing or read responses,
+        so invalid records are dropped with a warning instead of raising.
+        """
+        if tools is None:
+            return None
+        validated: list[Self] = []
+        for tool in tools:
+            try:
+                validated.append(cls.model_validate(tool))
+            except ValidationError:
+                logger.warning(
+                    "Skipping malformed MCP tool entry",
+                    mcp_integration_id=str(mcp_integration_id)
+                    if mcp_integration_id is not None
+                    else None,
+                )
+        return validated
+
+
+class MCPToolPolicyUpdate(BaseModel):
+    """Per-tool policy update for a stored MCP integration tool."""
+
+    name: str = Field(..., min_length=1)
+    enabled: bool | None = None
+    requires_approval: bool | None = None
+
+
+class MCPToolPolicyUpdateRequest(BaseModel):
+    """Request to update per-tool MCP integration policy."""
+
+    tools: list[MCPToolPolicyUpdate] = Field(..., min_length=1)
+
+
 class MCPConnectionOption(BaseModel):
     """A connectable transport/auth option for one catalog provider."""
 
@@ -716,13 +914,12 @@ class PlatformMCPCatalogRead(BaseModel):
     provider_id: str | None
     connection_spec: MCPConnectionSpec | None
     connection_options: list[MCPConnectionOption] = Field(default_factory=list)
-    locked: bool = Field(
-        description="Whether this platform MCP catalog row is locked by entitlement.",
-    )
     state: PlatformMCPCatalogState
     mcp_integration_id: UUID4 | None
     mcp_server_type: MCPServerType | None = None
     mcp_auth_type: MCPAuthType | None = None
+    tools: list[MCPToolSummary] | None = None
+    """Tools discovered at the last successful verification; null means unverified."""
     created_at: datetime
     updated_at: datetime
     last_refreshed_at: datetime | None
@@ -749,6 +946,7 @@ class MCPIntegrationRead(BaseModel):
     server_uri: str | None
     auth_type: MCPAuthType
     oauth_integration_id: UUID4 | None
+    tunnel_id: UUID4 | None = None
     state: PlatformMCPCatalogState
     # Stdio-type server fields
     stdio_command: str | None
@@ -758,14 +956,127 @@ class MCPIntegrationRead(BaseModel):
     """Whether stdio_env is configured (actual values are not exposed)."""
     # General fields
     timeout: int | None
+    tools: list[MCPToolSummary] | None = None
+    """Tools discovered at the last successful verification; null means unverified."""
     created_at: datetime
     updated_at: datetime
+
+
+class MCPVerificationStatusRead(BaseModel):
+    """Response model for saved MCP verification status."""
+
+    status: MCPVerificationStatus
+    error: str | None = None
+
+
+class _MCPIntegrationTestConnectionRequestBase(BaseModel):
+    """Common fields for testing an MCP configuration.
+
+    HTTP tests carry the possibly edited, not yet persisted form values. When
+    ``mcp_integration_id`` is set, stored secrets from that row are used as a
+    fallback for fields the caller leaves blank (e.g. unchanged credentials).
+    """
+
+    mcp_integration_id: UUID4 | None = None
+    timeout: int | None = Field(default=None, ge=1, le=300)
+
+
+class MCPHttpIntegrationTestConnectionRequest(_MCPIntegrationTestConnectionRequestBase):
+    """Request to test connectivity against an unsaved HTTP MCP configuration."""
+
+    server_type: Literal["http"] = Field(default="http")
+    server_uri: str = Field(..., min_length=1, max_length=2048)
+    auth_type: MCPAuthType = MCPAuthType.NONE
+    oauth_integration_id: UUID4 | None = None
+    tunnel_id: UUID4 | None = None
+    custom_credentials: SecretStr | None = Field(
+        default=None,
+        description="JSON object of custom headers; falls back to stored headers when omitted",
+    )
+
+    @field_validator("server_uri", mode="before")
+    @classmethod
+    def _validate_server_uri(cls, value: str | None) -> str:
+        """Validate and sanitize the MCP server URI.
+
+        Input-only validation that mirrors ``MCPHttpIntegrationCreate``. It does
+        NOT perform DNS resolution; the runtime SSRF block at probe time is the
+        real defense against private/loopback/link-local targets.
+        """
+        if value is None:
+            raise ValueError("server_uri is required")
+        if isinstance(value, str):
+            value = value.strip()
+        if not value:
+            raise ValueError("server_uri is required")
+
+        parsed = urlparse(value)
+        if not parsed.netloc:
+            raise ValueError("Server URI must include a hostname")
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise ValueError("Server URI must use HTTP or HTTPS")
+
+        return value
+
+
+class MCPStdioIntegrationTestConnectionRequest(BaseModel):
+    """Request to test connectivity against a saved stdio MCP integration."""
+
+    model_config = {"extra": "forbid"}
+
+    mcp_integration_id: UUID4
+    server_type: Literal["stdio"] = Field(default="stdio")
+
+
+def _discriminate_mcp_test_connection_server_type(value: Any) -> str:
+    """Infer MCP test server type, defaulting legacy payloads to HTTP."""
+    if isinstance(value, MCPHttpIntegrationTestConnectionRequest):
+        return "http"
+    if isinstance(value, MCPStdioIntegrationTestConnectionRequest):
+        return "stdio"
+    if isinstance(value, dict):
+        if "server_type" in value:
+            server_type = value.get("server_type")
+            if isinstance(server_type, str):
+                return server_type
+    return "http"
+
+
+type MCPIntegrationTestConnectionRequest = Annotated[
+    Annotated[MCPHttpIntegrationTestConnectionRequest, Tag("http")]
+    | Annotated[MCPStdioIntegrationTestConnectionRequest, Tag("stdio")],
+    Discriminator(_discriminate_mcp_test_connection_server_type),
+]
+
+
+class MCPIntegrationTestConnectionResponse(BaseModel):
+    """Response for testing connectivity to an MCP server."""
+
+    success: bool
+    mcp_integration_id: UUID4 | None = None
+    tools: list[MCPToolSummary] | None = None
+    message: str
+    error: str | None = None
+
+
+class MCPCatalogConnectRequest(BaseModel):
+    """Request for one-click connecting a platform MCP catalog entry.
+
+    Carries no connection fields, so the recipe cannot be inferred from the
+    payload; the caller names the connection option it offered.
+    """
+
+    connection_option_id: str | None = Field(
+        default=None,
+        max_length=80,
+        description="Platform MCP catalog connection option to connect",
+    )
 
 
 class MCPCatalogConnectResponse(BaseModel):
     """Response for connecting a platform MCP catalog entry."""
 
-    status: Literal["connected", "oauth_redirect"]
+    status: MCPCatalogConnectStatus
     mcp_integration: MCPIntegrationRead | None = None
     auth_url: str | None = None
     provider_id: str | None = None

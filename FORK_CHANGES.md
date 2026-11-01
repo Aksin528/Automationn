@@ -1,95 +1,173 @@
 # Fork changes register
 
-This fork (`Aksin528/Automationn`) is based on `TracecatHQ/tracecat` but does **not** share
-git history with it (`git merge-base` finds no common ancestor: the history starts with a small
-commit and the whole upstream tree arrives in the bulk commit `ec1b99aa2`), so
-`git merge upstream/main` cannot be used blindly. Upstream code is taken **selectively**
-(cherry-pick / copy a file).
+This fork (`Aksin528/Automationn`) is **upstream Tracecat `1.3.1` plus the changes listed here**
+(merged 2026-11-01 on branch `update/1.3.1`; before that 1.2.1 and 1.3.0-alpha.3).
 
-This file lists every place where the fork changed default (upstream) code, why, and what to
-check when taking a newer upstream version of the same file. Read it **before** merging or
-copying anything from upstream.
+History: the fork started from a bulk copy of upstream commit `bf617e37d` (2026-06-11, version
+`1.0.0b48`) and had no common ancestor with upstream in git. On 2026-10-21 the histories were joined
+(`git merge-base` now finds `bf617e37d`) and upstream `1.2.1` was merged. From now on updating is a
+normal merge:
 
-How it was built: from the fork's git history (44 commits after the import). Two commits are bulk
-imports and are not itemised: `ec1b99aa2` (2026-07-10, whole tree sync) and `0faffc8c4` (CA cert).
-`1c93f04a8` (2026-09-24) is one large mixed commit (MinIO TLS, report PDF, approvals, threat
-intel), so the per-file "why" below is grouped by feature and is approximate.
-Update this file in the same commit whenever default code is changed again.
+```
+git fetch upstream tag <new-version>
+git merge <new-version>
+```
 
-## 1. Approval system (EE package, agents, inbox)
+Read this file **before** merging. It lists where the fork differs from upstream, why, and what was
+deliberately dropped. Update it in the same commit whenever default (upstream) code changes. Per
+project rule, generic fixes go to upstream as PRs (separate worktree and branch from `upstream/main`).
 
-Why: tool calls of AI agents need a human approval; approvals pile up, and bots (Telegram) and
-workflows must decide them with an API key instead of a human session.
+How to see the live footprint at any time: `git diff <upstream-tag> --stat -- . ':!frontend' ':!tests'`.
 
-| File | What differs from upstream | When taking upstream |
-|---|---|---|
-| `packages/tracecat-ee/tracecat_ee/agent/approvals/router.py` | `GET /approvals` list (status, case, tool_call_id filters, `approved_by_email`); `submit_approvals` accepts API keys (`WorkspaceActorRouteRole`); 410 Gone for a dead session | Keep all three. Upstream added a 409 handler (`TracecatConflictError`) that we lack: take that too |
-| `.../approvals/service.py` | `case_id` on approvals, `list_approvals`, partial approval of multi-tool turns, per-card decision write (`apply_single_decision`) | Workflow-state code: merge by hand, never overwrite |
-| `.../agent/workflows/durable.py` | Execute approved MCP tools directly (not through registry lock), multi-approval handling | Same: merge by hand, replay-safety matters |
-| `tracecat/executor/activities.py`, `tracecat/executor/worker.py` | Activity for approved MCP tool execution; `beartype` passed through the sandbox | Keep |
-| `tracecat/agent/session/service.py`, `agent/runtime/claude_code/runtime.py`, `session_lines.py`, `executor/loopback.py`, `executor/activity.py` | Surface every tool in a multi-tool approval turn | Keep |
-| `packages/tracecat-ee/.../inbox/providers/approvals.py`, `tracecat/inbox/schemas.py`, `types.py` | Do not mark a session FAILED because a tool was rejected; show case short id and summary | Keep |
-| `.../interactions/service.py`, `decorators.py`, `tracecat/interactions/schemas.py`, `dsl/action.py`, `dsl/workflow.py`, `validation/service.py`, `workflow/executions/router.py`, `workflow/management/management.py` | Approval-gated actions (commit `1c93f04a8`; details not reviewed line by line) | Re-test an approval-gated action after any merge |
-| `tracecat/db/models.py`, `cases/enums.py`, `audit/types.py` | `approval.case_id`, approval vote table, approval case event types | Must match the 3 migrations below |
-| `alembic/versions/1b7b004b3c68_add_case_id_to_approval.py`, `89952e4e5c2d_add_approval_case_event_types.py`, `d1535b42ca96_add_approval_vote_table.py` | Our 3 migrations | After a merge run `alembic heads`: there must be **one** head; re-parent ours if upstream added migrations (`/reparent` skill) |
-| UI: `components/ai-elements/tool.tsx`, `chat/chat-session-pane.tsx`, `cases/case-pending-approvals-section.tsx`, `case-manual-approval-actions.tsx`, `hooks/use-chat.ts`, `lib/hooks.tsx`, `lib/agents.ts`, `hooks/use-inbox.ts` | Pending/rejected tool calls shown as such, approvals tab in a case | Keep |
+## 1. What the fork adds on top of upstream
 
+### 1.1 Incident report PDF
+| Files | Note |
+|---|---|
+| `tracecat/cases/incident_report_pdf.py`, `tracecat/cases/fonts/*`, `pyproject.toml` (`reportlab`), `uv.lock` | Server-side report PDF |
+| `tracecat/cases/report_redirect.py` | `GET /cases/{id}/report/pdf/redirect`: 307 to a short-lived presigned URL (Grafana link) |
+| `tracecat/cases/router.py` (+148), `schemas.py`, `config.py` | Upload/download routes; a `try/except ImportError` block named `fork-local` includes `report_redirect` |
+| UI: `cases/case-incident-report-*.tsx/ts`, `case-panels.ts` + `case-panel-content.tsx` (panel `report`) | Report dialog, print layout, section |
+After a merge: `grep -n fork-local tracecat/cases/router.py` must not be empty.
+
+### 1.2 Approvals of agent tool calls (case-linked, API-key friendly)
+Why: AI-agent tool calls need a human approval; bots (Telegram) and workflows decide them with an
+API key; approvals are linked to a case.
+| Files | Note |
+|---|---|
+| `packages/tracecat-ee/.../agent/approvals/router.py` (+141) | `GET /approvals` (status, case, tool_call_id filters, `approved_by_email`); `submit_approvals` accepts API keys; 410 Gone for a dead session |
+| `.../approvals/service.py` (+146) | `case_id` on approvals, `list_approvals`; helpers `apply_single_decision`, `get_expected_tool_call`, `_build_decision_payload` (currently unused, see 2.2) |
+| `tracecat/db/models.py` (+58) | `Approval.case_id`, `ApprovalVote` |
+| `alembic/versions/`: `a9c1d4e7f2b3` (orphan columns, harmless), `d1535b42ca96`, `89952e4e5c2d`, `1b7b004b3c68`, merge `261af2786dda` | Keep these as they are: production is already at `1b7b004b3c68`. Never re-parent them |
+| `tracecat/dsl/action.py` (+24: `_thread_trigger_case_id`), `dsl/workflow.py` (+15), EE `agent/schemas.py` (+10) | A workflow triggered with a `case_id` links its agent session to that case |
+| `agent/executor/activity.py`, `agent/runtime/claude_code/session_lines.py`, `audit/types.py`, `cases/enums.py`, `inbox/types.py`, `workflow/management/management.py`, `service_accounts/constants.py` | Small additions (1-8 lines each) |
+| UI: `case-pending-approvals-section.tsx`, `case-manual-approval-actions.tsx`, `lib/hooks.tsx` (`useCaseApprovals`, `useSubmitCaseApproval`, `useDismissCaseApproval`), `ai-elements/tool.tsx`, `case-panels.ts` (panel `approvals`) | Approvals tab in a case |
 Used by: Telegram approval workflows and the DB workflow `Auto-reject stale approvals`
 (rejects approvals older than N hours through the API; has `dry_run`).
 
-## 2. Incident report PDF
+### 1.3 LLM gateway / custom model provider (Qwen on vLLM, Ollama)
+`tracecat/agent/sandbox/llm_proxy.py`: `LLMRoute.enable_thinking`; for `custom-model-provider` routes with
+thinking off the proxy sends `thinking: disabled` and `chat_template_kwargs: {enable_thinking: false}` (vLLM
+ignores the Anthropic-shaped field; without this Qwen3 answers start with a `<think>` block), and caps
+`max_tokens` at 4096. Since 1.3.1 the routing plan is built in `llm_proxy.build_llm_routing_plan` /
+`_direct_passthrough_route(s)` (upstream moved it out of `executor/activity.py`); the fork passes
+`enable_thinking` there for the managed route and every root/subagent passthrough route. 1.3.1 has no own fix
+(no `chat_template_kwargs` anywhere): **upstream PR candidate** (tests: the three `test_custom_model_provider_*`
+tests and `test_build_llm_routing_plan_passes_enable_thinking_to_every_route`).
+`tracecat/agent/service.py` (+36: `resolve_catalog_id`), `agent/session/title_generator.py` (+25),
+`agent/litellm_config.yaml` (`ssl_verify: false` only), `agent/provider/service.py` (+2: 404 on `/models` means
+an empty list).
+Removed in the 1.3.1 merge: the Groq model entries, LiteLLM `master_key`, the `sk-tracecat-internal` bypass in
+`agent/gateway.py` (any caller with that fixed key was accepted as an internal LiteLLM user; nothing used it),
+and the proxy's `verify=False` (1.3.1 uses `_upstream_ssl_context()`, which honours `SSL_CERT_FILE`; the CA
+wrappers add the company CA). If a self-signed LLM endpoint now fails with a TLS error, add its CA to
+`certs/` instead of turning verification off.
+Check after a merge: upstream now has `catalog/service.py::resolve_catalog_id_by_model`; the fork's
+`resolve_catalog_id` may be redundant.
 
-| File | What / why | When taking upstream |
-|---|---|---|
-| `tracecat/cases/incident_report_pdf.py` (new), `cases/fonts/*` (new) | Server-side report PDF | Ours only |
-| `tracecat/cases/report_redirect.py` (new) | `GET /cases/{id}/report/pdf/redirect`: 307 to a short-lived presigned URL, used by the Grafana link | Ours only |
-| `tracecat/cases/router.py` | PDF upload/download routes and a `try/except ImportError` block named `fork-local` that includes `report_redirect` | After a merge: `grep -n fork-local tracecat/cases/router.py` must not be empty |
-| `tracecat/cases/schemas.py`, `service.py`, `config.py` | Report fields, MinIO presign settings | Keep |
-| UI: `cases/case-incident-report-dialog.tsx`, `-print.ts`, `-section.tsx`, `case-panel-view.tsx` | Report dialog, print layout, save uploads the PDF | Keep |
+`agent/runtime/claude_code/runtime.py::_sdk_env` (+5, added after the 1.2.1 merge): upstream 1.2.1 sets
+`ENABLE_TOOL_SEARCH=true` for every provider except Bedrock. With tool search the Claude CLI sends
+`tool_reference` blocks inside `tool_result`, and a vLLM `/v1/messages` endpoint (our Qwen) answers HTTP 400
+`Unexpected item type in content`. The fork also turns tool search off for `custom-model-provider`. Upstream
+comment in `llm_proxy.py` assumed gateways tolerate these blocks ("verified against LiteLLM and Ollama").
+**Upstream PR candidate** (generic fix, drop the fork copy once merged). Not covered: a subagent that uses
+`custom-model-provider` under a root with another provider still gets tool search (upstream only handles
+Bedrock subagents through `disallowed_tools`).
 
-## 3. Fixes that are generic (candidates for upstream PRs)
+### 1.4 Structured output of agents
+`tracecat/agent/runtime/claude_code/runtime.py` (+96: stop hook that requires `StructuredOutput`, post-tool
+hook that ends the turn after it) and `frontend/.../chat/chat-session-pane.tsx` (+543: readable
+`StructuredOutputAnswer` cards, risk badges, CTI source breakdown, hiding redundant trailing text).
 
-| Change | File | Status |
-|---|---|---|
-| Schedule overlap policy configurable (`TRACECAT__SCHEDULE_OVERLAP_POLICY`) | `tracecat/workflow/schedules/bridge.py` | **Upstream PR #3878 open** (2026-10-20). This tree still has the flat `SKIP` change, uncommitted |
-| Tag add/remove trigger filters match the specific tag | `tracecat/cases/triggers/consumer.py` | Not sent (check upstream first) |
-| Approval-related fixes of section 1 | see above | Not sent; would be several small PRs |
+### 1.5 Cases
+`tracecat/cases/triggers/consumer.py` (+19): tag add/remove trigger filters match the specific tag
+(generic fix, upstream PR candidate).
 
-## 4. LLM / agent gateway
+### 1.6 UI
+`components/sidebar/app-sidebar.tsx` (Grafana "Dashboard" link from `NEXT_PUBLIC_GRAFANA_URL`),
+`components/cases/dropdowns-view.tsx` (Enterprise-only gate removed), `lib/rbac.ts`,
+`app/workspaces/[workspaceId]/cases/page.tsx`, `components/editor/expression-input.tsx`, `frontend/Dockerfile`.
+The generated client (`frontend/src/client/*.gen.ts`) must be regenerated from the merged backend
+(`just gen-client-ci`), never merged by hand.
 
-| File | What | Note |
-|---|---|---|
-| `tracecat/agent/internal_router.py` (new, 267 lines) | Resolve `catalog_id` for the custom model provider in preset agents | Ours; check whether upstream has an equivalent |
-| `tracecat/agent/gateway.py` (new, 734 lines) | Translate the thinking parameter for a custom model provider (Ollama) | Ours |
-| `tracecat/agent/sandbox/llm_proxy.py`, `title_generator.py` | Small changes in `1c93f04a8` | Check on merge |
+### 1.7 Infrastructure (fork-owned in practice)
+`docker-compose.yml` (Grafana service, exposed ports, healthchecks from upstream), `docker-compose.override.yml`
+(local builds, MCP servers, MinIO TLS), `docker-compose.data.yml`, `docker-compose.approval-test.yml`,
+`Caddyfile` (upstream's hardened proxy headers plus: `skip_install_trust`, `:443` with own certificate,
+HTTPS to MinIO with the public `Host` header), `.github/workflows/build-push-images.yml`, `ca_wrapper*.sh`,
+`certs/`, `defaults.py`. Prod runs `git pull origin master` and builds from these.
+Upstream added `TRACECAT__TRUSTED_PROXY_CIDRS` (default `127.0.0.1/32`): set it if a proxy sits in front of Caddy.
 
-## 5. UI (not approval related)
+Files that exist only in the fork and are bind-mounted into containers by `docker-compose.override.yml`
+(none of them is in upstream, so they never conflict, but they depend on upstream internals):
+- `ca_wrapper.sh` (api, agent-executor, agent-worker, litellm) and `ca_wrapper_minio_only.sh` (worker,
+  background-worker, executor):
+  entrypoint that appends `certs/dgk_ca.pem` (company CA) and/or `caddy_certs/server.crt` (self-signed MinIO/Caddy
+  certificate) to the `certifi` bundle on every start, then runs the original command with `exec "$@"`.
+  Until 1.0.x the last line called `/app/entrypoint.sh`; upstream deleted that script (#3147), so 1.2.1 images
+  fail with `/app/entrypoint.sh: No such file or directory` (exit 127) unless the wrapper ends with `exec "$@"`.
+- `defaults.py` is mounted over `tracecat/tiers/defaults.py` (both `/app/tracecat/...` and the venv copy). It is
+  upstream's file with two changes: `service_accounts=True` and `watchtower=True` on both paths (re-copied from
+  1.3.1 on 2026-11-01; the 1.2.1 copy lacked `has_installed_agent_backend`). It is a full
+  copy, so it must be re-copied from upstream on every update (1.2.1 added `multi_workspace`, `agent_channels`,
+  `semantic_search`, `forms`, `tunnels`, `external_secret_stores`; the old copy did not know them).
+- `minio` is pinned to `minio/minio:RELEASE.2025-09-07T16-13-09Z` in the override: upstream 1.2.1 moved MinIO to
+  a Chainguard image that runs as UID 65532, while our TLS certificate is mounted at `/root/.minio/certs`.
+- Also mounted from the repo: `tracecat/agent/gateway.py`, `tracecat/agent/litellm_config.yaml`,
+  `tracecat/agent/sandbox/llm_proxy.py` (same files as in the image, kept for quick edits without a rebuild).
 
-| Change | Files | Note |
-|---|---|---|
-| Dark mode (cherry-picked from upstream #2963, #2982, #3127) | About 60 files under `frontend/src/components`, `app/layout.tsx`, `providers/theme.tsx`, `styles/globals.scss` | If upstream main is merged, take **upstream's** version and re-check the toggle |
-| Sidebar long values (equivalent of upstream #3238) | `components/ui/sidebar.tsx` | Upstream has it: take theirs |
-| Grafana link configurable by env | `components/sidebar/app-sidebar.tsx`, `controls-header.tsx` | Keep |
-| Removed unsupported workspace-sync / duplicate theme code | `workspace-sync/*`, `nav/controls-header.tsx` | Keep |
-| Generated API client | `frontend/src/client/*.gen.ts` | Never merge by hand: regenerate (`just gen-client-ci`) after the backend is merged |
+### 1.8 Fork-only code (no merge conflict possible)
+`soc-mcp/` (Cortex, Splunk, PMG, Check Point tools), `docker/minio/`, and everything stored in the Tracecat
+DB (workflows, `run_python` scripts, tables, presets), which is not in git.
 
-## 6. Infrastructure files (fork-owned in practice)
+## 2. Dropped or replaced when moving to 1.2.1 (decision log, 2026-10-21)
 
-`docker-compose.yml` (Grafana env), `docker-compose.override.yml` (local builds, MCP servers,
-MinIO TLS), `docker-compose.data.yml`, `docker-compose.approval-test.yml`, `Caddyfile` (TLS port,
-`/s3/*` to MinIO), `.github/workflows/build-push-images.yml`, `ca_wrapper*.sh`, `certs/`.
-Prod runs `git pull origin master` and builds from these, so keep them in sync with prod.
+### 2.1 Replaced by upstream's own implementation (nothing lost)
+- Several tool approvals in one turn: partial approval, `approved_by` per tool, registering approvals from the
+  assistant message stream, a single interrupt (`loopback.py`, `claude_code/runtime.py`, `session/service.py`,
+  `approvals/service.py`).
+- A rejected tool call is not a failed inbox item (new `inbox/providers/agent_runs.py`).
+- Dark mode, sidebar long-value fix, `executor/worker.py` beartype passthrough, custom-provider
+  discovery through `create_outbound_http_client`, workspace sync buttons (they are back).
 
-## 7. Fork-only code (no upstream counterpart, no merge conflict)
+### 2.2 Dropped on purpose (re-port later only if needed)
+- **Eager execution of approved MCP tools** (execute a tool the moment its own card is approved, without waiting
+  for sibling cards) and the per-card database write. Upstream rewrote `durable.py` (cancellation, stream
+  rotation, synchronous `set_approvals`), so this feature was removed with it. **Effect: an approved action now
+  runs only after every approval in the same batch is decided.** The helpers in `approvals/service.py` are
+  kept for a future re-port.
+- **Legacy workflow-interactions approval gate** (`ApprovalInteraction`, voting, `separation_of_duties`, case
+  timeline events for it, `GET /cases/{id}/pending-approvals`, hooks `usePendingApprovals` and
+  `useVoteOnInteraction`, 6 tests). Upstream removed legacy interactions (#3716). Unused in test and prod
+  (`action.interaction` is empty). DB table `interaction`, table `approval_vote` and the enum values stay.
+- Case title on inbox cards (`CaseSummary`), hardcoded soc-mcp tool suggestions in the agent preset builder
+  (check that the picker still lists the soc-mcp tools).
 
-`soc-mcp/` (Cortex, Splunk, PMG, Check Point tools), `docker/minio/`, and everything stored in
-the Tracecat DB (workflows, `run_python` scripts, tables, presets) which is not in git.
-
-## 8. Checklist after taking anything from upstream
-
+## 3. Checklist after taking anything from upstream
 1. `grep -n fork-local tracecat/cases/router.py` is not empty.
-2. `alembic heads` shows one head; our 3 approval migrations are in the chain.
-3. Regenerate the frontend client (`just gen-client-ci`).
-4. Rebuild and restart `api`, `executor`, `worker`, `agent-worker`, `agent-executor`, `ui`.
-5. Smoke test: an approval-gated agent tool (approve and reject), a case report PDF download
-   link, and the `Auto-reject stale approvals` workflow with `dry_run: true`.
+2. One alembic head (`alembic heads`); the fork chain above is intact. Merge revisions so far: `261af2786dda`
+   (1.2.1), `51e26899440a` (1.3.0-alpha.3), `9f37f23e2c32` (1.3.1).
+3. Regenerate the frontend client (`just gen-client-ci`) and run `pnpm -C frontend check`.
+4. `.env`: `TRACECAT__OUTBOUND_ALLOWED_PRIVATE_CIDRS` lists the private addresses Tracecat must reach (soc-mcp,
+   Ollama); upstream blocks private targets for MCP and custom LLM requests by default.
+5. Rebuild and restart `api`, `executor`, `worker`, `agent-worker`, `agent-executor`, `ui`.
+6. Smoke test: an approval-gated agent tool (approve and reject), the case Report tab and the PDF link, the
+   `Auto-reject stale approvals` workflow with `dry_run: true`, a Splunk and a Cortex sync run.
+7. `defaults.py`: `diff <(git show <tag>:tracecat/tiers/defaults.py) defaults.py` must show only the two
+   `# fork:` lines (and the header). Re-copy the upstream file and re-apply them if upstream changed it.
+8. `ca_wrapper*.sh`: check that the upstream `Dockerfile` still has no `ENTRYPOINT` (or that the wrapper still
+   hands over to it correctly); after `up -d` no container may be in `Restarting`.
+9. `docker-compose.override.yml`: compare the pinned MinIO image and the list of mounted files with upstream's
+   `docker-compose.yml` (a renamed service or a moved file breaks the mount silently). A new upstream service
+   arrives with upstream's `image:` line without a conflict (1.3.1 `background-worker`): `grep -n 'image:'
+   docker-compose.yml` must show `ghcr.io/aksin528/...` for every Tracecat service, and the service needs the
+   same override block as `worker`.
+10. Custom LLM source (Qwen/vLLM): 1.2.1 added a per-source `passthrough` flag (`agent_custom_provider.passthrough`,
+    default false). Sources created before 1.2.1 keep `false`, so agent requests go through the managed LiteLLM and
+    vLLM answers `System message must be at the beginning` (HTTP 400, `invalid_request_error`). After the update:
+    Organization settings > Agent > Configuration > Custom sources > Edit > enable **Passthrough mode**, Save, Refresh.
+11. Import the app after resolving conflicts (`uv run python -c "import tracecat.api.app, tracecat.dsl.worker"`):
+    a clean textual auto-merge can still be invalid Python (1.3.1: `verify=` passed twice to `httpx.AsyncClient`
+    in `llm_proxy.py`).
+12. `ruff check` has `fix = true` in `pyproject.toml`: running it over the tree rewrites fork-only files (for
+    example `soc-mcp/`). Check `git diff --name-only` afterwards and restore files that are not part of the change.

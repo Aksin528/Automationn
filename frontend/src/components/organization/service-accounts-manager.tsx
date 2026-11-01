@@ -1,6 +1,5 @@
 "use client"
 
-import { useQuery } from "@tanstack/react-query"
 import { format, formatDistanceToNow } from "date-fns"
 import {
   BotIcon,
@@ -26,6 +25,7 @@ import type {
   ServiceAccountUpdate,
 } from "@/client"
 import { CopyButton } from "@/components/copy-button"
+import { ListHeaderSearch } from "@/components/list-header-search"
 import { AlertNotification } from "@/components/notifications"
 import {
   getScopesForLevel,
@@ -45,6 +45,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -74,13 +75,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
+import { useResourceCategories } from "@/hooks/use-resource-categories"
 import { getDisplayName } from "@/lib/auth"
 import type { TracecatApiError } from "@/lib/errors"
-import {
-  getCategoryScopes,
-  type PermissionLevel,
-  RESOURCE_CATEGORIES,
-} from "@/lib/rbac"
+import { useQuery } from "@/lib/query"
+import { getCategoryScopes, type PermissionLevel } from "@/lib/rbac"
 import { cn } from "@/lib/utils"
 
 interface ServiceAccountApiKeysPage {
@@ -196,8 +195,6 @@ function getServiceAccountGroup(
   return "active"
 }
 
-const API_KEY_PREVIEW_LENGTH = 4
-
 const SERVICE_ACCOUNT_STATUS_FILTERS: Array<{
   value: ServiceAccountStatusFilter
   label: string
@@ -217,15 +214,6 @@ const SERVICE_ACCOUNT_CREATOR_COLUMN_CLASS =
   "w-[180px] shrink-0 truncate text-xs text-muted-foreground"
 const INLINE_NAME_HIGHLIGHT_CLASS =
   "mx-1 inline-flex rounded bg-secondary px-1.5 py-0.5 align-middle font-mono text-xs font-normal text-foreground"
-
-function deriveApiKeyPreview(rawKey: string): string {
-  const prefixMatch = rawKey.match(/^(tc_(?:org_|ws_)?sk_)/)
-  const prefix = prefixMatch?.[1]
-  if (!prefix || rawKey.length < prefix.length + API_KEY_PREVIEW_LENGTH) {
-    return rawKey
-  }
-  return `${prefix}...${rawKey.slice(-API_KEY_PREVIEW_LENGTH)}`
-}
 
 function formatUserIdLabel(userId: string): string {
   if (userId.length <= 12) {
@@ -636,6 +624,7 @@ export function ServiceAccountsManager({
   onRevokeApiKey,
   listApiKeys,
 }: ServiceAccountsManagerProps) {
+  const resourceCategories = useResourceCategories()
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingServiceAccount, setEditingServiceAccount] =
     useState<ServiceAccountRead | null>(null)
@@ -690,7 +679,7 @@ export function ServiceAccountsManager({
 
   const scopeCounts = useMemo(() => {
     let total = 0
-    for (const category of Object.values(RESOURCE_CATEGORIES)) {
+    for (const category of Object.values(resourceCategories)) {
       const categoryScopes = getCategoryScopes(
         category.resources,
         permissionScopes
@@ -700,7 +689,7 @@ export function ServiceAccountsManager({
       ).length
     }
     return total
-  }, [permissionScopes, selectedScopeIds])
+  }, [permissionScopes, resourceCategories, selectedScopeIds])
 
   const isSaving = createPending || updatePending
   const isActionPending =
@@ -906,21 +895,11 @@ export function ServiceAccountsManager({
     <div className="flex size-full flex-col">
       <div className="shrink-0">
         <header className="flex h-10 items-center gap-3 border-b pl-3 pr-4">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="flex size-7 shrink-0 items-center justify-center">
-              <SearchIcon className="size-4 text-muted-foreground" />
-            </div>
-            <Input
-              type="text"
-              placeholder={`Search ${kindLabel.toLowerCase()} service accounts...`}
-              value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
-              className={cn(
-                "h-7 w-64 border-none bg-transparent p-0 text-sm shadow-none outline-none",
-                "placeholder:text-muted-foreground focus-visible:ring-0 focus-visible:ring-offset-0"
-              )}
-            />
-          </div>
+          <ListHeaderSearch
+            placeholder={`Search ${kindLabel.toLowerCase()} service accounts...`}
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+          />
 
           <div className="ml-auto flex items-center gap-3">
             <span className="text-xs text-muted-foreground">
@@ -1110,7 +1089,7 @@ export function ServiceAccountsManager({
                         <SquarePenIcon className="size-3.5" />
                       </RowActionButton>
                       <RowActionButton
-                        label="Issue new API key"
+                        label="Create API key"
                         className="size-7"
                         disabled={
                           Boolean(serviceAccount.disabled_at) || !canUpdate
@@ -1175,7 +1154,7 @@ export function ServiceAccountsManager({
       </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="flex max-h-[85vh] max-w-3xl flex-col">
+        <DialogContent size="lg" className="max-w-3xl">
           <form
             onSubmit={async (event) => {
               event.preventDefault()
@@ -1195,104 +1174,97 @@ export function ServiceAccountsManager({
                   : `Create a ${kindLabel.toLowerCase()} service account with specific permissions.`}
               </DialogDescription>
             </DialogHeader>
+            <DialogBody>
+              <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="service-account-name">
+                      Service account name
+                    </Label>
+                    <Input
+                      id="service-account-name"
+                      name="service-account-name"
+                      value={draft.name}
+                      onChange={(event) =>
+                        setDraft((current) => ({
+                          ...current,
+                          name: event.target.value,
+                        }))
+                      }
+                      placeholder="e.g., CI deployer"
+                      required
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="service-account-description">
+                      Description
+                    </Label>
+                    <Input
+                      id="service-account-description"
+                      name="service-account-description"
+                      value={draft.description}
+                      onChange={(event) =>
+                        setDraft((current) => ({
+                          ...current,
+                          description: event.target.value,
+                        }))
+                      }
+                      placeholder="Optional description"
+                    />
+                  </div>
+                </div>
 
-            <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden py-4">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor="service-account-name">
-                    Service account name
-                  </Label>
-                  <Input
-                    id="service-account-name"
-                    name="service-account-name"
-                    value={draft.name}
-                    onChange={(event) =>
-                      setDraft((current) => ({
-                        ...current,
-                        name: event.target.value,
-                      }))
-                    }
-                    placeholder="e.g., CI deployer"
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="service-account-description">
-                    Description
-                  </Label>
-                  <Input
-                    id="service-account-description"
-                    name="service-account-description"
-                    value={draft.description}
-                    onChange={(event) =>
-                      setDraft((current) => ({
-                        ...current,
-                        description: event.target.value,
-                      }))
-                    }
-                    placeholder="Optional description"
-                  />
-                </div>
-              </div>
+                {!editingServiceAccount ? (
+                  <div className="space-y-2">
+                    <Label htmlFor="service-account-initial-key-name">
+                      Initial key label
+                    </Label>
+                    <Input
+                      id="service-account-initial-key-name"
+                      name="service-account-initial-key-name"
+                      value={draft.initialKeyName}
+                      onChange={(event) =>
+                        setDraft((current) => ({
+                          ...current,
+                          initialKeyName: event.target.value,
+                        }))
+                      }
+                      placeholder="Primary"
+                    />
+                  </div>
+                ) : null}
 
-              {!editingServiceAccount ? (
-                <div className="space-y-2">
-                  <Label htmlFor="service-account-initial-key-name">
-                    Initial key label
-                  </Label>
-                  <Input
-                    id="service-account-initial-key-name"
-                    name="service-account-initial-key-name"
-                    value={draft.initialKeyName}
-                    onChange={(event) =>
-                      setDraft((current) => ({
-                        ...current,
-                        initialKeyName: event.target.value,
-                      }))
-                    }
-                    placeholder="Primary"
-                  />
-                </div>
-              ) : null}
-
-              <div className="flex min-h-0 flex-1 flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <Label>Permissions ({scopeCounts} scopes selected)</Label>
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  Set permission levels by category, or expand to select
-                  individual scopes.
-                </div>
-                <div className="h-[400px] overflow-y-auto rounded-md border">
-                  <div className="divide-y divide-border/50">
-                    {Object.entries(RESOURCE_CATEGORIES).map(
-                      ([key, category]) => (
-                        <ScopeCategoryRow
-                          key={key}
-                          categoryKey={key}
-                          category={category}
-                          scopes={permissionScopes}
-                          selectedScopeIds={selectedScopeIds}
-                          onScopeToggle={toggleScope}
-                          onLevelChange={handleLevelChange}
-                        />
-                      )
-                    )}
+                <div className="flex min-h-0 flex-1 flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <Label>Permissions ({scopeCounts} scopes selected)</Label>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    Set permission levels by category, or expand to select
+                    individual scopes.
+                  </div>
+                  <div className="h-[400px] overflow-y-auto rounded-md border">
+                    <div className="divide-y divide-border/50">
+                      {Object.entries(resourceCategories).map(
+                        ([key, category]) => (
+                          <ScopeCategoryRow
+                            key={key}
+                            categoryKey={key}
+                            category={category}
+                            scopes={permissionScopes}
+                            selectedScopeIds={selectedScopeIds}
+                            onScopeToggle={toggleScope}
+                            onLevelChange={handleLevelChange}
+                          />
+                        )
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-
+            </DialogBody>
             <DialogFooter>
               <Button
-                type="button"
-                variant="outline"
-                onClick={() => setDialogOpen(false)}
-                disabled={isSaving}
-              >
-                Cancel
-              </Button>
-              <Button
+                size="sm"
                 type="submit"
                 disabled={
                   isSaving ||
@@ -1319,7 +1291,7 @@ export function ServiceAccountsManager({
           }
         }}
       >
-        <DialogContent className="max-w-md">
+        <DialogContent size="sm" className="max-w-md">
           <DialogHeader>
             <DialogTitle>Copy API key</DialogTitle>
             <DialogDescription>
@@ -1327,38 +1299,22 @@ export function ServiceAccountsManager({
               dialog.
             </DialogDescription>
           </DialogHeader>
-          {issuedCredential ? (
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <Label htmlFor="service-account-key-preview">Key preview</Label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    id="service-account-key-preview"
-                    name="service-account-key-preview"
-                    value={
-                      issuedCredential.issued_api_key.api_key.preview ??
-                      deriveApiKeyPreview(
-                        issuedCredential.issued_api_key.raw_key
-                      )
-                    }
-                    readOnly={true}
-                    disabled={true}
-                    className="select-none font-mono text-xs"
-                  />
-                  <CopyButton
-                    value={issuedCredential.issued_api_key.raw_key}
-                    toastMessage="API key copied"
-                    tooltipMessage="Copy raw key"
-                  />
-                </div>
+          <DialogBody>
+            {issuedCredential ? (
+              <div className="flex min-w-0 max-w-full items-center gap-3 rounded-lg bg-muted/60 px-4 py-3.5">
+                <code className="min-w-0 flex-1 truncate font-mono text-sm text-foreground/90 select-all">
+                  {issuedCredential.issued_api_key.raw_key}
+                </code>
+                <CopyButton
+                  value={issuedCredential.issued_api_key.raw_key}
+                  toastMessage="API key copied"
+                  tooltipMessage="Copy raw key"
+                  className="size-6 shrink-0"
+                  iconClassName="size-4 text-foreground/70"
+                />
               </div>
-            </div>
-          ) : null}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setIssuedCredential(null)}>
-              Close
-            </Button>
-          </DialogFooter>
+            ) : null}
+          </DialogBody>
         </DialogContent>
       </Dialog>
 
@@ -1366,9 +1322,9 @@ export function ServiceAccountsManager({
         open={Boolean(issueTarget)}
         onOpenChange={(open) => !open && setIssueTarget(null)}
       >
-        <DialogContent>
+        <DialogContent size="sm">
           <DialogHeader>
-            <DialogTitle>Issue new API key</DialogTitle>
+            <DialogTitle>Create API key</DialogTitle>
             <DialogDescription>
               {issueTarget?.active_api_key?.name ? (
                 <>
@@ -1383,25 +1339,24 @@ export function ServiceAccountsManager({
               )}
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor="issued-key-name">New key label</Label>
-            <Input
-              id="issued-key-name"
-              name="issued-key-name"
-              value={issueKeyName}
-              onChange={(event) => setIssueKeyName(event.target.value)}
-              placeholder="Primary"
-            />
-          </div>
+          <DialogBody>
+            <div className="space-y-2">
+              <Label htmlFor="issued-key-name">New key label</Label>
+              <Input
+                id="issued-key-name"
+                name="issued-key-name"
+                value={issueKeyName}
+                onChange={(event) => setIssueKeyName(event.target.value)}
+                placeholder="Primary"
+              />
+            </div>
+          </DialogBody>
           <DialogFooter>
             <Button
-              variant="outline"
-              onClick={() => setIssueTarget(null)}
+              size="sm"
+              onClick={handleIssueApiKey}
               disabled={issueApiKeyPending}
             >
-              Cancel
-            </Button>
-            <Button onClick={handleIssueApiKey} disabled={issueApiKeyPending}>
               {issueApiKeyPending ? "Issuing..." : "Issue key"}
             </Button>
           </DialogFooter>

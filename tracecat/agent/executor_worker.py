@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AsyncExitStack
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -12,16 +13,29 @@ import uvloop
 from temporalio.worker import Worker
 
 from tracecat import config
-from tracecat.agent.executor.activity import run_agent_activity
+from tracecat.agent.executor.activity import (
+    probe_stdio_mcp_connection_activity,
+    run_agent_activity,
+)
 from tracecat.agent.runtime_services import (
     start_claude_runtime_broker,
     start_mcp_server,
+    start_otel_delivery_pool,
     stop_claude_runtime_broker,
     stop_mcp_server,
+    stop_otel_delivery_pool,
 )
+from tracecat.agent.sandbox.cgroup import sandbox_cgroup
 from tracecat.agent.worker import new_sandbox_runner
 from tracecat.dsl.client import get_temporal_client
+from tracecat.executor.startup import executor_lifecycle
 from tracecat.logger import logger
+from tracecat.observability.otel import (
+    initialize_platform_tracing,
+    shutdown_platform_tracing,
+)
+from tracecat.observability.sentry import initialize_worker_sentry_from_environment
+from tracecat.storage.blob import close_storage_client_cache
 from tracecat.temporal.worker_lifecycle import run_worker_entrypoint
 
 if TYPE_CHECKING:
@@ -32,12 +46,16 @@ runtime_failure_reason: str | None = None
 
 def get_activities() -> list:
     """Load runtime activities registered by the agent-executor worker."""
-    return [run_agent_activity]
+    return [
+        run_agent_activity,
+        probe_stdio_mcp_connection_activity,
+    ]
 
 
 async def _start_runtime_services() -> Client:
     """Start shared runtime services needed by the agent executor worker."""
     logger.info("Starting runtime services")
+    start_otel_delivery_pool()
     _, _, client = await asyncio.gather(
         start_claude_runtime_broker(),
         start_mcp_server(),
@@ -52,10 +70,11 @@ async def _stop_runtime_services() -> None:
     results = await asyncio.gather(
         stop_claude_runtime_broker(),
         stop_mcp_server(),
+        stop_otel_delivery_pool(),
         return_exceptions=True,
     )
     for service_name, result in zip(
-        ("Claude runtime broker", "MCP server"),
+        ("Claude runtime broker", "MCP server", "OTel delivery pool"),
         results,
         strict=True,
     ):
@@ -70,45 +89,66 @@ async def _stop_runtime_services() -> None:
 async def main(shutdown_event: asyncio.Event | None = None) -> None:
     """Run the AgentExecutorWorker."""
     global runtime_failure_reason
-    if shutdown_event is None:
-        shutdown_event = asyncio.Event()
-    runtime_failure_reason = None
-    max_concurrent = int(
-        os.environ.get("TRACECAT__AGENT_EXECUTOR_MAX_CONCURRENT_ACTIVITIES") or 1
-    )
-    threadpool_max_workers = int(
-        os.environ.get("TEMPORAL__THREADPOOL_MAX_WORKERS") or 100
-    )
+    with executor_lifecycle() as readiness:
+        if shutdown_event is None:
+            shutdown_event = asyncio.Event()
+        runtime_failure_reason = None
+        if config.TRACECAT__EXECUTOR_BACKEND.uses_nsjail:
+            sandbox_cgroup()
+        max_concurrent = int(
+            os.environ.get("TRACECAT__AGENT_EXECUTOR_MAX_CONCURRENT_ACTIVITIES") or 1
+        )
+        threadpool_max_workers = int(
+            os.environ.get("TEMPORAL__THREADPOOL_MAX_WORKERS") or 100
+        )
 
-    logger.info(
-        "Starting AgentExecutorWorker",
-        task_queue=config.TRACECAT__AGENT_EXECUTOR_QUEUE,
-        max_concurrent_activities=max_concurrent,
-    )
+        logger.info(
+            "Starting AgentExecutorWorker",
+            task_queue=config.TRACECAT__AGENT_EXECUTOR_QUEUE,
+            max_concurrent_activities=max_concurrent,
+        )
+        initialize_platform_tracing("tracecat-agent-executor")
+        initialize_worker_sentry_from_environment()
 
-    try:
-        client = await _start_runtime_services()
-        with ThreadPoolExecutor(max_workers=threadpool_max_workers) as executor:
-            async with Worker(
-                client,
-                task_queue=config.TRACECAT__AGENT_EXECUTOR_QUEUE,
-                activities=get_activities(),
-                workflow_runner=new_sandbox_runner(),
-                max_concurrent_activities=max_concurrent,
-                disable_eager_activity_execution=config.TEMPORAL__DISABLE_EAGER_ACTIVITY_EXECUTION,
-                activity_executor=executor,
-                graceful_shutdown_timeout=timedelta(
-                    seconds=config.TRACECAT__AGENT_EXECUTOR_GRACEFUL_SHUTDOWN_TIMEOUT
-                ),
-            ):
-                logger.info("AgentExecutorWorker started, ctrl+c to exit")
-                await shutdown_event.wait()
-                logger.info("AgentExecutorWorker shutdown requested")
-            logger.info("Temporal Worker context exited")
-    finally:
-        await _stop_runtime_services()
-    if runtime_failure_reason is not None:
-        raise RuntimeError(runtime_failure_reason)
+        # LIFO teardown: storage cache, then runtime services, then tracing. The
+        # stack still runs later callbacks when an earlier one raises.
+        async with AsyncExitStack() as cleanup:
+            cleanup.callback(shutdown_platform_tracing)
+            cleanup.push_async_callback(_stop_runtime_services)
+            cleanup.push_async_callback(close_storage_client_cache)
+
+            client = await _start_runtime_services()
+            with ThreadPoolExecutor(max_workers=threadpool_max_workers) as executor:
+                async with (
+                    Worker(
+                        client,
+                        task_queue=config.TRACECAT__AGENT_EXECUTOR_QUEUE,
+                        activities=get_activities(),
+                        workflow_runner=new_sandbox_runner(),
+                        max_concurrent_activities=max_concurrent,
+                        disable_eager_activity_execution=config.TEMPORAL__DISABLE_EAGER_ACTIVITY_EXECUTION,
+                        activity_executor=executor,
+                        # Activity cancellation is only delivered to a running activity
+                        # via heartbeat RPC responses, and the SDK throttles those to
+                        # 80% of the heartbeat timeout (48s at our 60s timeout) by
+                        # default. Cap the throttle so Temporal-driven cancellation
+                        # reaches long agent turns promptly; the Redis cancel signal
+                        # (tracecat/agent/cancellation.py) remains the primary path.
+                        max_heartbeat_throttle_interval=timedelta(seconds=5),
+                        default_heartbeat_throttle_interval=timedelta(seconds=5),
+                        graceful_shutdown_timeout=timedelta(
+                            seconds=config.TRACECAT__AGENT_EXECUTOR_GRACEFUL_SHUTDOWN_TIMEOUT
+                        ),
+                    ),
+                    # LIFO exit removes readiness before Temporal drains activities.
+                    readiness,
+                ):
+                    logger.info("AgentExecutorWorker started, ctrl+c to exit")
+                    await shutdown_event.wait()
+                    logger.info("AgentExecutorWorker shutdown requested")
+                logger.info("Temporal Worker context exited")
+        if runtime_failure_reason is not None:
+            raise RuntimeError(runtime_failure_reason)
 
 
 if __name__ == "__main__":

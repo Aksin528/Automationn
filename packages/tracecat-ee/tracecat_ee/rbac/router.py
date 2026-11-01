@@ -5,12 +5,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 
-from tracecat.auth.dependencies import OrgUserRole
+from tracecat.auth.dependencies import OrgActorRole
 from tracecat.authz.controls import require_scope
 from tracecat.authz.enums import ScopeSource
 from tracecat.db.dependencies import AsyncDBSession
+from tracecat.db.errors import is_unique_violation
 from tracecat.exceptions import (
     TracecatAuthorizationError,
+    TracecatConflictError,
     TracecatNotFoundError,
     TracecatValidationError,
 )
@@ -38,7 +40,7 @@ from tracecat_ee.rbac.service import RBACService
 
 
 async def _require_rbac_entitlement(
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
 ) -> None:
     """Router-level dependency that gates all EE RBAC endpoints behind the RBAC entitlement."""
@@ -60,7 +62,7 @@ scopes_router = APIRouter(
 @require_scope("org:rbac:read")
 async def list_scopes(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     include_system: bool = Query(True, description="Include system/registry scopes"),
     source: ScopeSource | None = Query(None, description="Filter by scope source"),
@@ -81,7 +83,7 @@ async def list_scopes(
 @require_scope("org:rbac:read")
 async def get_scope(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     scope_id: UUID,
 ) -> ScopeRead:
@@ -97,11 +99,21 @@ async def get_scope(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
 
-@scopes_router.post("", response_model=ScopeRead, status_code=status.HTTP_201_CREATED)
+@scopes_router.post(
+    "",
+    response_model=ScopeRead,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_400_BAD_REQUEST: {"description": "Invalid or reserved scope name."},
+        status.HTTP_409_CONFLICT: {
+            "description": "A scope with this name already exists."
+        },
+    },
+)
 @require_scope("org:rbac:create")
 async def create_scope(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     params: ScopeCreate,
 ) -> ScopeRead:
@@ -121,17 +133,28 @@ async def create_scope(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         ) from e
     except IntegrityError as e:
+        if not is_unique_violation(e, "uq_scope_organization_id_name"):
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A scope with this name already exists",
         ) from e
 
 
-@scopes_router.delete("/{scope_id}", status_code=status.HTTP_204_NO_CONTENT)
+@scopes_router.delete(
+    "/{scope_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        status.HTTP_403_FORBIDDEN: {
+            "description": "Platform scope or scope from another organization."
+        },
+        status.HTTP_404_NOT_FOUND: {"description": "Scope not found."},
+    },
+)
 @require_scope("org:rbac:delete")
 async def delete_scope(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     scope_id: UUID,
 ) -> None:
@@ -165,7 +188,7 @@ roles_router = APIRouter(
 @require_scope("org:rbac:read")
 async def get_role(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     role_id: UUID,
 ) -> RoleReadWithScopes:
@@ -197,7 +220,7 @@ async def get_role(
 @require_scope("org:rbac:create")
 async def create_role(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     params: RoleCreate,
 ) -> RoleReadWithScopes:
@@ -228,17 +251,29 @@ async def create_role(
     except TracecatAuthorizationError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except IntegrityError as e:
+        if not is_unique_violation(e, "uq_role_organization_id_slug"):
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A role with this name already exists",
         ) from e
 
 
-@roles_router.patch("/{role_id}", response_model=RoleReadWithScopes)
+@roles_router.patch(
+    "/{role_id}",
+    response_model=RoleReadWithScopes,
+    responses={
+        status.HTTP_403_FORBIDDEN: {"description": "System role scopes cannot change."},
+        status.HTTP_404_NOT_FOUND: {"description": "Role not found."},
+        status.HTTP_409_CONFLICT: {
+            "description": "Duplicate name, or a level switch while the role is in use."
+        },
+    },
+)
 @require_scope("org:rbac:update")
 async def update_role(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     role_id: UUID,
     params: RoleUpdate,
@@ -270,7 +305,11 @@ async def update_role(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except TracecatAuthorizationError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
+    except TracecatConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except IntegrityError as e:
+        if not is_unique_violation(e, "uq_role_organization_id_slug"):
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A role with this name already exists",
@@ -281,7 +320,7 @@ async def update_role(
 @require_scope("org:rbac:delete")
 async def delete_role(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     role_id: UUID,
 ) -> None:
@@ -316,18 +355,20 @@ groups_router = APIRouter(
 
 
 @groups_router.get("", response_model=GroupList)
-@require_scope("org:rbac:read")
+@require_scope("org:rbac:read", "org:scim:manage", require_all=False)
 async def list_groups(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
 ) -> GroupList:
     """List groups for the organization.
 
-    Requires: org:rbac:read scope
+    Requires: org:rbac:read or org:scim:manage to select mapping targets.
     """
     service = RBACService(session, role=role)
     groups = await service.list_groups()
+    counts = await service.group_member_counts()
+    managed = await service.managed_group_ids()
     return GroupList(
         items=[
             GroupReadWithMembers(
@@ -339,7 +380,8 @@ async def list_groups(
                 updated_at=g.updated_at,
                 created_by=g.created_by,
                 members=[],  # Don't include full member list in list view
-                member_count=len(g.members),
+                member_count=counts.get(g.id, 0),
+                is_idp_managed=g.id in managed,
             )
             for g in groups
         ],
@@ -351,7 +393,7 @@ async def list_groups(
 @require_scope("org:rbac:read")
 async def get_group(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     group_id: UUID,
 ) -> GroupReadWithMembers:
@@ -382,6 +424,7 @@ async def get_group(
                 for user, gm in members
             ],
             member_count=len(members),
+            is_idp_managed=group_id in await service.managed_group_ids(),
         )
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
@@ -393,7 +436,7 @@ async def get_group(
 @require_scope("org:rbac:create")
 async def create_group(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     params: GroupCreate,
 ) -> GroupReadWithMembers:
@@ -419,6 +462,8 @@ async def create_group(
             member_count=0,
         )
     except IntegrityError as e:
+        if not is_unique_violation(e, "uq_group_organization_id_name"):
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A group with this name already exists",
@@ -429,7 +474,7 @@ async def create_group(
 @require_scope("org:rbac:update")
 async def update_group(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     group_id: UUID,
     params: GroupUpdate,
@@ -465,10 +510,13 @@ async def update_group(
                 for user, gm in members
             ],
             member_count=len(members),
+            is_idp_managed=group_id in await service.managed_group_ids(),
         )
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except IntegrityError as e:
+        if not is_unique_violation(e, "uq_group_organization_id_name"):
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A group with this name already exists",
@@ -479,7 +527,7 @@ async def update_group(
 @require_scope("org:rbac:delete")
 async def delete_group(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     group_id: UUID,
 ) -> None:
@@ -508,7 +556,7 @@ async def delete_group(
 @require_scope("org:rbac:update")
 async def add_group_member(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     group_id: UUID,
     params: GroupMemberAdd,
@@ -521,6 +569,8 @@ async def add_group_member(
     try:
         await service.add_group_member(group_id, params.user_id)
         return {"message": "Member added successfully"}
+    except TracecatConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
     except TracecatValidationError as e:
@@ -528,6 +578,8 @@ async def add_group_member(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         ) from e
     except IntegrityError as e:
+        if not is_unique_violation(e, "pk_group_member"):
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User is already a member of this group",
@@ -541,7 +593,7 @@ async def add_group_member(
 @require_scope("org:rbac:update")
 async def remove_group_member(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     group_id: UUID,
     user_id: UUID,
@@ -553,6 +605,8 @@ async def remove_group_member(
     service = RBACService(session, role=role)
     try:
         await service.remove_group_member(group_id, user_id)
+    except TracecatConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
 
@@ -572,9 +626,10 @@ assignments_router = APIRouter(
 @require_scope("org:rbac:read")
 async def list_assignments(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     group_id: UUID | None = Query(None, description="Filter by group ID"),
+    user_id: UUID | None = Query(None, description="Filter by group member user ID"),
     workspace_id: UUID | None = Query(None, description="Filter by workspace ID"),
 ) -> GroupRoleAssignmentList:
     """List group assignments for the organization.
@@ -584,6 +639,7 @@ async def list_assignments(
     service = RBACService(session, role=role)
     assignments = await service.list_group_role_assignments(
         group_id=group_id,
+        user_id=user_id,
         workspace_id=workspace_id,
     )
     return GroupRoleAssignmentList(
@@ -612,7 +668,7 @@ async def list_assignments(
 @require_scope("org:rbac:read")
 async def get_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     assignment_id: UUID,
 ) -> GroupRoleAssignmentReadWithDetails:
@@ -643,11 +699,22 @@ async def get_assignment(
     "",
     response_model=GroupRoleAssignmentReadWithDetails,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Organization role assigned on a workspace."
+        },
+        status.HTTP_404_NOT_FOUND: {
+            "description": "Group, role, or workspace not found."
+        },
+        status.HTTP_409_CONFLICT: {
+            "description": "Group already has an assignment for this workspace."
+        },
+    },
 )
 @require_scope("org:rbac:create")
 async def create_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     params: GroupRoleAssignmentCreate,
 ) -> GroupRoleAssignmentReadWithDetails:
@@ -680,7 +747,17 @@ async def create_assignment(
         )
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
     except IntegrityError as e:
+        if not is_unique_violation(
+            e,
+            "uq_group_role_assignment_group_id_workspace_id",
+            "ix_group_role_assignment_group_org_unique",
+        ):
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Group already has an assignment for this workspace",
@@ -688,12 +765,19 @@ async def create_assignment(
 
 
 @assignments_router.patch(
-    "/{assignment_id}", response_model=GroupRoleAssignmentReadWithDetails
+    "/{assignment_id}",
+    response_model=GroupRoleAssignmentReadWithDetails,
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "Organization role assigned on a workspace."
+        },
+        status.HTTP_404_NOT_FOUND: {"description": "Assignment or role not found."},
+    },
 )
 @require_scope("org:rbac:update")
 async def update_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     assignment_id: UUID,
     params: GroupRoleAssignmentUpdate,
@@ -721,13 +805,17 @@ async def update_assignment(
         )
     except TracecatNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
 
 
 @assignments_router.delete("/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT)
 @require_scope("org:rbac:delete")
 async def delete_assignment(
     *,
-    role: OrgUserRole,
+    role: OrgActorRole,
     session: AsyncDBSession,
     assignment_id: UUID,
 ) -> None:

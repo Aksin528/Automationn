@@ -1,9 +1,8 @@
 "use client"
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { ArrowRight, ExternalLink, Loader2, Lock, Sparkles } from "lucide-react"
+import { ArrowRight, ExternalLink, Loader2, Sparkles } from "lucide-react"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
-import { useEffect, useMemo, useState } from "react"
+import { type ReactNode, useEffect, useMemo, useState } from "react"
 import {
   mcpIntegrationsConnectPlatformMcpCatalog,
   mcpIntegrationsDeleteMcpIntegration,
@@ -13,6 +12,7 @@ import {
 import type {
   MCPConnectionSpec,
   MCPIntegrationRead,
+  MCPVerificationStatusRead,
   PlatformMCPCatalogListResponse,
   PlatformMCPCatalogRead,
 } from "@/client/types.gen"
@@ -21,22 +21,50 @@ import { CatalogHeader } from "@/components/catalog/catalog-header"
 import { getMcpProviderIconId, ProviderIcon } from "@/components/icons"
 import { MCPIntegrationDialog } from "@/components/integrations/mcp-integration-dialog"
 import { OAuthIntegrationDialog } from "@/components/integrations/oauth-integration-dialog"
-import { LockedFeatureModal } from "@/components/locked-feature-modal"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
-import { useEntitlements } from "@/hooks/use-entitlements"
+import {
+  markStdioMcpVerificationStarted,
+  useStdioMcpVerificationStatus,
+} from "@/hooks/use-stdio-mcp-verification-status"
 import {
   getMcpOAuthConnectErrorDetail,
   type TracecatApiError,
 } from "@/lib/errors"
+import {
+  getPendingStdioMcpCatalogVerificationIds,
+  getPendingStdioMcpVerificationIds,
+} from "@/lib/integrations"
+import { useMutation, useQuery, useQueryClient } from "@/lib/query"
 import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 const CREATE_MCP_SERVER_PARAM = "createMcpServer"
+const MCP_VERIFY_ERROR_PARAM = "mcp_verify_error"
 const ALL_CATEGORY = "All"
+const ALL_STATUSES = "all"
+const CONNECTED_STATUS = "connected"
+const NOT_CONNECTED_STATUS = "not_connected"
+type McpStatusFilter =
+  | typeof ALL_STATUSES
+  | typeof CONNECTED_STATUS
+  | typeof NOT_CONNECTED_STATUS
+const MCP_STATUS_FILTER_OPTIONS: Array<{
+  value: McpStatusFilter
+  label: string
+}> = [
+  { value: ALL_STATUSES, label: "All statuses" },
+  { value: CONNECTED_STATUS, label: "Connected" },
+  { value: NOT_CONNECTED_STATUS, label: "Not connected" },
+]
 const CUSTOM_CATEGORY = "Custom"
 const MCP_CATEGORIES = [
   "SIEM / Datalake",
@@ -57,6 +85,17 @@ const MCP_CATEGORIES = [
   "Productivity",
   CUSTOM_CATEGORY,
 ]
+
+type McpStatusTone = "neutral" | "info" | "success" | "warning" | "danger"
+
+/** Dot and text colors for the catalog status pill, keyed by tone. */
+const STATUS_TONES: Record<McpStatusTone, { dot: string; text: string }> = {
+  neutral: { dot: "bg-muted-foreground/40", text: "text-muted-foreground" },
+  info: { dot: "bg-blue-500", text: "text-foreground" },
+  success: { dot: "bg-emerald-500", text: "text-foreground" },
+  warning: { dot: "bg-amber-500", text: "text-foreground" },
+  danger: { dot: "bg-red-500", text: "text-foreground" },
+}
 
 interface CatalogItem {
   kind: "catalog" | "workspace"
@@ -135,11 +174,11 @@ function workspaceIntegrationToCatalogEntry(
     provider_id: "custom",
     connection_spec: connectionSpecFromIntegration(integration),
     connection_options: [],
-    locked: false,
     state: integration.state,
     mcp_integration_id: integration.id,
     mcp_server_type: integration.server_type,
     mcp_auth_type: integration.auth_type,
+    tools: integration.tools ?? null,
     created_at: integration.created_at,
     updated_at: integration.updated_at,
     last_refreshed_at: null,
@@ -191,6 +230,33 @@ function requiresCatalogConfig(entry: PlatformMCPCatalogRead) {
   return catalogConnectionSpecs(entry).some((spec) => spec.requires_config)
 }
 
+/**
+ * Connection option one-click Connect uses for a catalog entry.
+ *
+ * The request carries no connection fields, so the backend cannot infer the
+ * recipe; naming the option the card offered avoids falling back to a catalog
+ * default that may not be the one shown. Undefined for bare-spec rows, where
+ * the default is unambiguous.
+ */
+function catalogConnectOptionId(entry: PlatformMCPCatalogRead) {
+  const options = entry.connection_options ?? []
+  if (options.length < 2) {
+    return undefined
+  }
+  const connectable = options.filter(
+    (option) => !option.connection_spec.requires_config
+  )
+  return connectable.length === 1 ? connectable[0].id : undefined
+}
+
+/**
+ * A row with no tool listing hasn't been verified yet, so it counts as
+ * configured, not connected. Keep in sync with McpCatalogCard.
+ */
+function isCatalogEntryConnected(entry: PlatformMCPCatalogRead) {
+  return entry.state === "connected" && entry.tools != null
+}
+
 function isCatalogEntryConnectable(entry: PlatformMCPCatalogRead) {
   return Boolean(
     entry.connection_spec ||
@@ -208,17 +274,15 @@ export default function McpServersPage() {
   const canCreateMcp = canCreate === true
   const canUpdateIntegrations = canUpdate === true
   const canDeleteMcp = canDelete === true
-  const { hasEntitlement } = useEntitlements()
-  const agentAddonsEnabled = hasEntitlement("agent_addons")
 
   const [searchQuery, setSearchQuery] = useState("")
   const [activeCategory, setActiveCategory] = useState<string>(ALL_CATEGORY)
+  const [statusFilter, setStatusFilter] =
+    useState<McpStatusFilter>(ALL_STATUSES)
   const [createOpen, setCreateOpen] = useState(false)
   const [configEntry, setConfigEntry] = useState<PlatformMCPCatalogRead | null>(
     null
   )
-  const [lockedCatalogEntry, setLockedCatalogEntry] =
-    useState<PlatformMCPCatalogRead | null>(null)
   const [providerConfigEntry, setProviderConfigEntry] =
     useState<PlatformMCPCatalogRead | null>(null)
   const [editingItem, setEditingItem] = useState<CatalogItem | null>(null)
@@ -277,11 +341,25 @@ export default function McpServersPage() {
     staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
   })
+  const pendingStdioMcpIntegrationIds = useMemo(
+    () => [
+      ...getPendingStdioMcpCatalogVerificationIds(catalogData?.items),
+      ...getPendingStdioMcpVerificationIds(workspaceMcpIntegrations),
+    ],
+    [catalogData?.items, workspaceMcpIntegrations]
+  )
+  const stdioMcpVerificationStatuses = useStdioMcpVerificationStatus({
+    workspaceId,
+    pendingIntegrationIds: pendingStdioMcpIntegrationIds,
+  })
   const catalogConnectMutation = useMutation({
     mutationFn: async (entry: PlatformMCPCatalogRead) =>
       await mcpIntegrationsConnectPlatformMcpCatalog({
         workspaceId,
         catalogSlug: entry.slug,
+        requestBody: {
+          connection_option_id: catalogConnectOptionId(entry),
+        },
       }),
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: catalogQueryKey })
@@ -296,9 +374,21 @@ export default function McpServersPage() {
       if (!result.mcp_integration) {
         return
       }
+      const verifying = result.mcp_integration.state !== "connected"
+      if (verifying && result.mcp_integration.server_type === "stdio") {
+        markStdioMcpVerificationStarted(
+          queryClient,
+          workspaceId,
+          result.mcp_integration.id
+        )
+      }
       toast({
-        title: "MCP server connected",
-        description: `Added ${result.mcp_integration.name}`,
+        title: verifying
+          ? "MCP server verification started"
+          : "MCP server connected",
+        description: verifying
+          ? `Added ${result.mcp_integration.name}; tools will appear after verification succeeds.`
+          : `Added ${result.mcp_integration.name}`,
       })
     },
     onError: (error) => {
@@ -359,6 +449,26 @@ export default function McpServersPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canCreate, createSignal, pathname, router])
 
+  // Surface a connection verification failure carried back from the MCP
+  // OAuth callback redirect, then strip the param from the URL.
+  const verifyErrorSignal = searchParams?.get(MCP_VERIFY_ERROR_PARAM) ?? null
+  useEffect(() => {
+    if (!verifyErrorSignal || !pathname) {
+      return
+    }
+    // Not `destructive`: a verification failure is a remote/config issue
+    // (unreachable server, bad credentials), not a platform fault.
+    toast({
+      title: "Connection failed",
+      description: verifyErrorSignal,
+    })
+    const params = new URLSearchParams(searchParams?.toString() ?? "")
+    params.delete(MCP_VERIFY_ERROR_PARAM)
+    const next = params.toString()
+    router.replace(next ? `${pathname}?${next}` : pathname, { scroll: false })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verifyErrorSignal, pathname, router])
+
   const items = useMemo<CatalogItem[]>(() => {
     const catalogMcpIntegrationIds = new Set(
       (catalogData?.items ?? [])
@@ -388,10 +498,28 @@ export default function McpServersPage() {
             }))
         : []
     return [...catalogItems, ...workspaceItems]
+      .filter((item) => {
+        if (statusFilter === ALL_STATUSES) {
+          return true
+        }
+        const connected = isCatalogEntryConnected(item.entry)
+        return statusFilter === CONNECTED_STATUS ? connected : !connected
+      })
+      .sort((a, b) => {
+        const aConnected = isCatalogEntryConnected(a.entry)
+        const bConnected = isCatalogEntryConnected(b.entry)
+        if (aConnected !== bConnected) {
+          return aConnected ? -1 : 1
+        }
+        return a.entry.name.localeCompare(b.entry.name, undefined, {
+          sensitivity: "base",
+        })
+      })
   }, [
     activeCategory,
     catalogData?.items,
     searchQuery,
+    statusFilter,
     workspaceMcpIntegrations,
   ])
 
@@ -420,11 +548,11 @@ export default function McpServersPage() {
 
   function handleConnect(item: CatalogItem) {
     const { entry } = item
-    if (entry.locked) {
-      setLockedCatalogEntry(entry)
-      return
-    }
-    const connected = entry.state === "connected"
+    // Mirror McpCatalogCard's derivation: a row with no tool listing hasn't
+    // been verified yet, so it is "configured"/reconnect, not a connected
+    // disconnect. Keeping this in sync avoids showing "Reconnect" while
+    // routing through the disconnect/no-op path.
+    const connected = isCatalogEntryConnected(entry)
     const connectable = isCatalogEntryConnectable(entry)
 
     if (entry.mcp_integration_id && connected) {
@@ -436,13 +564,6 @@ export default function McpServersPage() {
 
     if (item.kind === "workspace" && entry.mcp_integration_id) {
       setEditingItem(item)
-      return
-    }
-
-    // Migrated catalog rows can be disconnected without the entitlement, but
-    // reconnecting through the platform catalog requires the upgrade.
-    if (entry.mcp_integration_id && !agentAddonsEnabled) {
-      setLockedCatalogEntry(entry)
       return
     }
 
@@ -476,10 +597,6 @@ export default function McpServersPage() {
 
   function handleConfigure(item: CatalogItem) {
     const { entry } = item
-    if (entry.locked) {
-      setLockedCatalogEntry(entry)
-      return
-    }
     if (entry.mcp_integration_id) {
       setEditingItem(item)
       return
@@ -530,6 +647,17 @@ export default function McpServersPage() {
         }))}
         activePillFilters={[activeCategory]}
         onPillFilterToggle={(category) => setActiveCategory(category)}
+        selectFilters={[
+          {
+            key: "status",
+            value: statusFilter,
+            onValueChange: (value) => setStatusFilter(value as McpStatusFilter),
+            options: MCP_STATUS_FILTER_OPTIONS,
+            placeholder: "Status",
+            allValue: ALL_STATUSES,
+            widthClassName: "w-[140px]",
+          },
+        ]}
         displayCount={totalCount}
         countLabel={`server${totalCount === 1 ? "" : "s"}`}
       />
@@ -559,15 +687,15 @@ export default function McpServersPage() {
             <Loader2 className="size-5 animate-spin text-muted-foreground" />
           </div>
         ) : totalCount === 0 ? (
-          <Card className="flex flex-col items-center gap-3 p-8 text-center">
+          <div className="flex flex-col items-center gap-3 py-16 text-center">
             <Sparkles className="size-8 text-muted-foreground" />
             <div>
               <h2 className="text-sm font-semibold">No MCP servers found</h2>
               <p className="mt-1 text-xs text-muted-foreground">
-                Try a different search or category.
+                Try a different search, category, or status.
               </p>
             </div>
-          </Card>
+          </div>
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {items.map((item) => (
@@ -579,12 +707,12 @@ export default function McpServersPage() {
                 canDelete={canDeleteMcp}
                 isActionPending={isActionPending(item)}
                 isDisconnecting={isDisconnectPending(item)}
-                reconnectLocked={
-                  item.kind === "catalog" &&
-                  !item.entry.locked &&
-                  Boolean(item.entry.mcp_integration_id) &&
-                  item.entry.state !== "connected" &&
-                  !agentAddonsEnabled
+                verification={
+                  item.entry.mcp_integration_id
+                    ? stdioMcpVerificationStatuses.get(
+                        item.entry.mcp_integration_id
+                      )
+                    : undefined
                 }
                 onConnect={() => handleConnect(item)}
                 onConfigure={() => handleConfigure(item)}
@@ -607,19 +735,6 @@ export default function McpServersPage() {
           hideTrigger
         />
       ) : null}
-
-      <LockedFeatureModal
-        open={lockedCatalogEntry !== null}
-        onOpenChange={(next) => {
-          if (!next) {
-            setLockedCatalogEntry(null)
-          }
-        }}
-        title="Upgrade to unlock this feature"
-        description="Tracecat-managed MCP catalog connectors are included with Enterprise. To use your own setup, create a custom MCP server."
-        bullets={[]}
-        hideFooter
-      />
 
       {configEntry ? (
         <MCPIntegrationDialog
@@ -679,7 +794,7 @@ interface McpCatalogCardProps {
   canDelete: boolean
   isActionPending: boolean
   isDisconnecting: boolean
-  reconnectLocked: boolean
+  verification?: MCPVerificationStatusRead
   onConnect: () => void
   onConfigure: () => void
 }
@@ -691,21 +806,18 @@ function McpCatalogCard({
   canDelete,
   isActionPending,
   isDisconnecting,
-  reconnectLocked,
+  verification,
   onConnect,
   onConfigure,
 }: McpCatalogCardProps) {
   const { entry } = item
-  const locked = entry.locked === true
   const hasMcpRow = Boolean(entry.mcp_integration_id)
-  const connected = entry.state === "connected"
+  const connected = isCatalogEntryConnected(entry)
   const configured = !connected && (entry.state === "configured" || hasMcpRow)
   const hasWorkspaceConfig = configured || connected
   const connectable = isCatalogEntryConnectable(entry)
-  // Rows with a workspace integration stay actionable even when the catalog
-  // response hides connection specs (e.g. unentitled with a migrated row).
   const comingSoon =
-    !locked && !hasMcpRow && (entry.status === "coming_soon" || !connectable)
+    !hasMcpRow && (entry.status === "coming_soon" || !connectable)
   const specTransports = catalogTransports(entry)
   const transports =
     specTransports.length > 0
@@ -713,7 +825,7 @@ function McpCatalogCard({
       : entry.mcp_server_type
         ? [entry.mcp_server_type]
         : []
-  const docsUrl = locked ? null : entry.docs_url
+  const docsUrl = entry.docs_url
   const disconnectable = connected && hasMcpRow
   let actionLabel = "Connect"
   if (disconnectable) {
@@ -723,9 +835,7 @@ function McpCatalogCard({
   }
   const canManage = entry.mcp_integration_id ? canUpdate : false
   let canAct = false
-  if (locked || reconnectLocked) {
-    canAct = true
-  } else if (disconnectable) {
+  if (disconnectable) {
     canAct = canDelete
   } else if (item.kind === "workspace" && configured) {
     canAct = canManage
@@ -733,73 +843,99 @@ function McpCatalogCard({
     canAct = canCreate
   }
   let canConfigure = false
-  if (locked) {
-    canConfigure = true
-  } else if (hasWorkspaceConfig) {
+  if (hasWorkspaceConfig) {
     canConfigure = canManage
   } else if (isCatalogEntryConnectable(entry)) {
     canConfigure = canCreate
   }
   const configureLabel = "Configure"
+  const totalToolCount = entry.tools?.length ?? null
+  const activeToolCount =
+    entry.tools?.filter(
+      (tool) => tool.status !== "missing" && tool.enabled !== false
+    ).length ?? null
+  const verificationStatus = verification?.status
+  const verificationError =
+    verification?.status === "failed" ? verification.error : null
   let statusLabel = "Not connected"
-  let statusClassName = "border-muted bg-muted/30 text-muted-foreground"
+  let statusTone: McpStatusTone = "neutral"
   if (isActionPending) {
     statusLabel = isDisconnecting ? "Disconnecting" : "Connecting"
-    statusClassName = "border-blue-200 bg-blue-50 text-blue-700"
-  } else if (locked) {
-    statusLabel = "Locked"
-    statusClassName = "border-muted bg-muted/30 text-muted-foreground"
+    statusTone = "info"
+  } else if (verificationStatus === "verifying") {
+    statusLabel = "Verifying"
+    statusTone = "info"
+  } else if (verificationStatus === "failed") {
+    statusLabel = "Verification failed"
+    statusTone = "danger"
+  } else if (entry.state === "reauth_required") {
+    // OAuth token expired with no refresh token: only re-auth revives it.
+    statusLabel = "Reconnect required"
+    statusTone = "warning"
   } else if (connected) {
-    statusLabel = "Connected"
-    statusClassName = "border-emerald-200 bg-emerald-50 text-emerald-700"
+    if (activeToolCount !== null && totalToolCount !== null) {
+      const toolCountLabel =
+        activeToolCount === totalToolCount
+          ? `${activeToolCount}`
+          : `${activeToolCount}/${totalToolCount}`
+      statusLabel = `Connected · ${toolCountLabel} ${activeToolCount === 1 ? "tool" : "tools"}`
+    } else {
+      statusLabel = "Connected"
+    }
+    statusTone = "success"
   } else if (configured) {
     statusLabel = "Configured"
-    statusClassName = "border-blue-200 bg-blue-50 text-blue-700"
+    statusTone = "info"
   } else if (comingSoon) {
     statusLabel = "Coming soon"
-    statusClassName = "border-muted bg-muted/30 text-muted-foreground"
+    statusTone = "neutral"
   }
   let buttonLabel = actionLabel
   if (comingSoon) {
     buttonLabel = "Coming soon"
-  } else if (locked) {
-    buttonLabel = "Connect"
   }
   if (isActionPending) {
     buttonLabel = statusLabel
   }
-  const actionLocked = locked || reconnectLocked
   let actionClassName = "text-blue-600 hover:text-blue-700"
-  if (actionLocked) {
-    actionClassName = "text-muted-foreground hover:text-foreground"
-  } else if (disconnectable) {
+  if (disconnectable) {
     actionClassName = "text-destructive hover:text-destructive"
   }
-
-  return (
-    <Card
-      role={locked ? "button" : undefined}
-      tabIndex={locked ? 0 : undefined}
-      onClick={locked ? onConnect : undefined}
-      onKeyDown={
-        locked
-          ? (event) => {
-              if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault()
-                onConnect()
-              }
-            }
-          : undefined
+  const tone = STATUS_TONES[statusTone]
+  let statusIndicator: ReactNode
+  if (isActionPending) {
+    statusIndicator = <Loader2 className="size-3 animate-spin" />
+  } else {
+    statusIndicator = (
+      <span
+        aria-hidden="true"
+        className={cn("size-1.5 shrink-0 rounded-full", tone.dot)}
+      />
+    )
+  }
+  const statusBadge = (
+    <Badge
+      variant="outline"
+      tabIndex={verificationError ? 0 : undefined}
+      aria-label={
+        verificationError ? `${statusLabel}: ${verificationError}` : statusLabel
       }
       className={cn(
-        "flex h-full min-h-[132px] flex-col gap-2.5 border bg-card p-4 shadow-none transition-colors hover:border-foreground/30",
-        locked && "cursor-pointer"
+        "h-5 shrink-0 gap-1.5 rounded-full border-border bg-transparent px-2 text-[10px] font-medium",
+        tone.text
       )}
     >
+      {statusIndicator}
+      {statusLabel}
+    </Badge>
+  )
+
+  return (
+    <Card className="flex h-full min-h-[132px] flex-col gap-2.5 border bg-card p-4 shadow-none transition-colors hover:border-foreground/30">
       <div className="flex items-start justify-between gap-3">
         <ProviderIcon
           providerId={getMcpProviderIconId(entry.provider_id ?? entry.slug)}
-          className={cn("size-9 shrink-0", locked && "opacity-50 grayscale")}
+          className="size-9 shrink-0"
         />
 
         <div className="flex flex-wrap justify-end gap-1">
@@ -820,19 +956,19 @@ function McpCatalogCard({
           <h3 className="truncate text-sm font-semibold leading-5 text-foreground">
             {entry.name}
           </h3>
-          <Badge
-            variant="outline"
-            className={cn(
-              "h-5 shrink-0 gap-1 px-1.5 text-[10px] font-medium",
-              statusClassName
-            )}
-          >
-            {isActionPending ? (
-              <Loader2 className="size-3 animate-spin" />
-            ) : null}
-            {!isActionPending && locked ? <Lock className="size-3" /> : null}
-            {statusLabel}
-          </Badge>
+          {verificationError ? (
+            <Tooltip>
+              <TooltipTrigger asChild>{statusBadge}</TooltipTrigger>
+              <TooltipContent className="max-w-sm">
+                <p className="text-xs font-medium">Verification failed</p>
+                <p className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-words text-xs text-muted-foreground">
+                  {verificationError}
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            statusBadge
+          )}
         </div>
         <p className="line-clamp-2 text-xs leading-5 text-muted-foreground">
           {entry.description}

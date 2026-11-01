@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from tracecat.authz.controls import require_scope
+from tracecat.db.errors import is_unique_violation
 from tracecat.db.models import AgentPreset, AgentTag, AgentTagLink
 from tracecat.exceptions import (
     TracecatConflictError,
@@ -40,6 +41,10 @@ class AgentTagsService(BaseWorkspaceService):
             await self.session.commit()
         except IntegrityError as err:
             await self.session.rollback()
+            if not is_unique_violation(
+                err, "uq_agent_tag_name_workspace", "uq_agent_tag_ref_workspace"
+            ):
+                raise
             raise TracecatConflictError(conflict_message) from err
 
     async def _get_tag(self, tag_id: AgentTagID) -> AgentTag:
@@ -240,6 +245,7 @@ class AgentTagsService(BaseWorkspaceService):
             select(AgentPreset.id).where(
                 AgentPreset.id == preset_id,
                 AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.deleted_at.is_(None),
             )
         )
         tag_exists = exists(
@@ -257,6 +263,7 @@ class AgentTagsService(BaseWorkspaceService):
             select(AgentPreset.id).where(
                 AgentPreset.id == preset_id,
                 AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.deleted_at.is_(None),
             )
         )
         is_allowed = await self.session.scalar(select(preset_exists))
@@ -275,6 +282,7 @@ class AgentTagsService(BaseWorkspaceService):
             .where(
                 AgentTagLink.preset_id == preset_id,
                 AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.deleted_at.is_(None),
                 AgentTag.workspace_id == self.workspace_id,
             )
         )
@@ -298,6 +306,7 @@ class AgentTagsService(BaseWorkspaceService):
             .where(
                 AgentTagLink.preset_id == preset_id,
                 AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.deleted_at.is_(None),
                 AgentTag.workspace_id == self.workspace_id,
             )
         )
@@ -391,6 +400,7 @@ class AgentTagsService(BaseWorkspaceService):
                 AgentTagLink.preset_id == preset_id,
                 AgentTagLink.tag_id == tag_id,
                 AgentPreset.workspace_id == self.workspace_id,
+                AgentPreset.deleted_at.is_(None),
                 AgentTag.workspace_id == self.workspace_id,
             )
         )

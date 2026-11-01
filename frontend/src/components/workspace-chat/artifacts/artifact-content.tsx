@@ -6,6 +6,7 @@ import Link from "next/link"
 import { useEffect, useMemo } from "react"
 import { AgentPresetArtifactView } from "@/components/agents/agent-presets-builder"
 import { CasePanelView } from "@/components/cases/case-panel-view"
+import { parseCasePanelKey } from "@/components/cases/case-panels"
 import { AlertNotification } from "@/components/notifications"
 import { TablePanelProvider } from "@/components/tables/table-panel-context"
 import { TableSelectionProvider } from "@/components/tables/table-selection-context"
@@ -42,13 +43,6 @@ const WorkflowArtifactView = dynamic(
   }
 )
 
-const CASE_ARTIFACT_TABS = new Set([
-  "comments",
-  "activity",
-  "attachments",
-  "rows",
-  "payload",
-])
 const AGENT_ARTIFACT_TABS = new Set([
   "live-chat",
   "assistant",
@@ -57,7 +51,6 @@ const AGENT_ARTIFACT_TABS = new Set([
   "skills",
   "channels",
   "structured-output",
-  "versions",
 ])
 
 export interface ArtifactContentProps {
@@ -130,7 +123,10 @@ function normalizeArtifactTab(
 
   switch (artifact.type) {
     case "case":
-      return CASE_ARTIFACT_TABS.has(tab) ? tab : null
+      // Shares the switcher's registry so new panel keys pass through, and
+      // resolves retired values (`comments`) still arriving from shared chat
+      // URLs instead of resetting the tab to null.
+      return parseCasePanelKey(tab)
     case "agent":
       return AGENT_ARTIFACT_TABS.has(tab) ? tab : null
     default:
@@ -278,6 +274,12 @@ function ArtifactFields({ artifact }: { artifact: WorkspaceChatArtifact }) {
           <ArtifactField label="Status" value={artifact.status} />
           <ArtifactField label="Started" value={artifact.startedAt} />
           <ArtifactField label="Run ID" value={artifact.id} monospace />
+        </dl>
+      )
+    case "form":
+      return (
+        <dl className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-2">
+          <ArtifactField label="Status" value={artifact.status ?? "unknown"} />
         </dl>
       )
     case "generic":

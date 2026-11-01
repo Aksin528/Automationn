@@ -1,6 +1,5 @@
 "use client"
 
-import { useMutation, useQueryClient } from "@tanstack/react-query"
 import {
   buildDurationFilters,
   CaseDurationDialog,
@@ -8,6 +7,7 @@ import {
 } from "@/components/cases/case-duration-dialog"
 import { toast } from "@/components/ui/use-toast"
 import { createCaseDurationDefinition } from "@/lib/case-durations"
+import { useMutation, useQueryClient } from "@/lib/query"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 interface AddCaseDurationDialogProps {
@@ -93,7 +93,7 @@ export function AddCaseDurationDialog({
     <CaseDurationDialog
       open={open}
       onOpenChange={onOpenChange}
-      title="Add duration"
+      title="Create duration"
       description="Define a duration metric using matching case events."
       submitLabel={isPending ? "Creating..." : "Create duration"}
       isSubmitting={isPending}

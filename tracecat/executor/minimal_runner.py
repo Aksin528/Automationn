@@ -14,13 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import importlib
+import json
 import os
+import re
+import resource
+import signal
 import sys
+import threading
+import time
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Coroutine, Mapping
+from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal, cast
 
 # Only import what we absolutely need - no tracecat imports!
 # Prefer orjson for performance (4-12x faster), fall back to stdlib json
@@ -36,8 +44,12 @@ try:
         if hasattr(obj, "model_dump"):
             try:
                 return obj.model_dump(mode="json")
-            except Exception:
-                pass
+            except Exception as exc:
+                if resource_limit_from_error(exc):
+                    # A resource limit, not an unserializable type. Let it
+                    # out so serialize_result can degrade to the resource-limit
+                    # envelope instead of reporting a TypeError.
+                    raise
         raise TypeError(f"Type is not JSON serializable: {type(obj).__name__}")
 
     def json_dumps(obj: dict) -> bytes:
@@ -125,6 +137,66 @@ def _install_action_gateway_sdk_transport() -> None:
     tracecat_client_cls._tracecat_action_gateway_transport = True
 
 
+class ActionTimeoutError(TimeoutError):
+    """The action function call exceeded the action's timeout."""
+
+
+def _timeout_message(timeout_seconds: float) -> str:
+    return f"Action execution timed out after {timeout_seconds:g}s"
+
+
+async def _await_with_timeout(
+    coro: Coroutine[Any, Any, Any], timeout_seconds: float | None
+) -> Any:
+    scope = asyncio.timeout(timeout_seconds)
+    try:
+        async with scope:
+            result = await coro
+    except TimeoutError:
+        # Only our own deadline is an action timeout; a TimeoutError raised by
+        # the action itself propagates unchanged.
+        if timeout_seconds is not None and scope.expired():
+            raise ActionTimeoutError(_timeout_message(timeout_seconds)) from None
+        raise
+    # Blocking code in the coroutine can starve the event loop so the deadline
+    # never fires. A result that arrives late is still a timeout.
+    deadline = scope.when()
+    late = deadline is not None and asyncio.get_running_loop().time() >= deadline
+    if timeout_seconds is not None and late:
+        raise ActionTimeoutError(_timeout_message(timeout_seconds))
+    return result
+
+
+def _call_sync_with_timeout(
+    fn: Callable[..., Any], args: Mapping[str, Any], timeout_seconds: float | None
+) -> Any:
+    # SIGALRM interrupts blocking sync code but can only be armed from the main
+    # thread; elsewhere the host's subprocess deadline is the backstop.
+    if timeout_seconds is None or threading.current_thread() is not (
+        threading.main_thread()
+    ):
+        return fn(**args)
+
+    def _on_alarm(_signum: int, _frame: Any) -> None:
+        raise ActionTimeoutError(_timeout_message(timeout_seconds))
+
+    deadline = time.monotonic() + timeout_seconds
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        result = fn(**args)
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+    # The action can catch the alarm's exception and carry on. A result that
+    # arrives late is still a timeout.
+    if time.monotonic() >= deadline:
+        raise ActionTimeoutError(_timeout_message(timeout_seconds))
+    return result
+
+
 class _CappedTextBuffer:
     """Lightweight text buffer with a hard character cap."""
 
@@ -180,6 +252,8 @@ def run_action_minimal(
     action_impl: dict[str, Any],
     args: Mapping[str, Any],
     secret_env: dict[str, str],
+    *,
+    timeout_seconds: float | None = None,
 ) -> Any:
     """Run an action with minimal imports (sync, for subprocess execution).
 
@@ -196,6 +270,8 @@ def run_action_minimal(
             - template_definition: Template definition for template actions
         args: Pre-evaluated arguments to pass to the action
         secret_env: Flat env-ready secret mapping
+        timeout_seconds: Deadline for the function call alone. Imports and
+            context setup do not count toward it.
 
     Returns:
         The action result
@@ -203,11 +279,12 @@ def run_action_minimal(
     Raises:
         ValueError: If action_impl is missing required fields
         NotImplementedError: If action type is not supported
+        ActionTimeoutError: If the function call exceeds timeout_seconds
     """
     impl_type = action_impl.get("type")
 
     if impl_type == "udf":
-        return _run_udf(action_impl, args, secret_env)
+        return _run_udf(action_impl, args, secret_env, timeout_seconds=timeout_seconds)
     elif impl_type == "template":
         raise NotImplementedError(
             "Template actions must be orchestrated at the service layer. "
@@ -344,6 +421,8 @@ def _run_udf(
     action_impl: dict[str, Any],
     args: Mapping[str, Any],
     secret_env: dict[str, str],
+    *,
+    timeout_seconds: float | None = None,
 ) -> Any:
     """Run a UDF action by importing and calling the function."""
     module_path = action_impl.get("module")
@@ -397,9 +476,9 @@ def _run_udf(
 
         # Check if async and run appropriately
         if asyncio.iscoroutinefunction(fn):
-            return asyncio.run(fn(**args))
+            return asyncio.run(_await_with_timeout(fn(**args), timeout_seconds))
         else:
-            return fn(**args)
+            return _call_sync_with_timeout(fn, args, timeout_seconds)
     finally:
         # Reset secrets context
         if registry_secrets is not None and secrets_token is not None:
@@ -442,15 +521,23 @@ def _clear_env_secrets(secret_env: Mapping[str, Any]) -> None:
         os.environ.pop(key, None)
 
 
-def _collect_secret_mask_values(secret_env: Mapping[str, Any]) -> list[str]:
+def _collect_secret_mask_values(secret_env: Mapping[str, Any]) -> set[str]:
     """Normalize env values into mask candidates, failing closed on bad __str__."""
     mask_values: set[str] = set()
     for key, value in secret_env.items():
-        if (secret_str := _stringify_secret_env_value(key, value)) is None:
+        if not (secret_str := _stringify_secret_env_value(key, value)):
             continue
-        if len(secret_str) > 1:
-            mask_values.add(secret_str)
-    return sorted(mask_values, key=len, reverse=True)
+        # Exceptions and JSON escape secrets; mask the unquoted interiors too.
+        mask_values.update(
+            (
+                secret_str,
+                repr(secret_str)[1:-1],
+                ascii(secret_str)[1:-1],
+                json.dumps(secret_str)[1:-1],
+                json.dumps(secret_str, ensure_ascii=False)[1:-1],
+            )
+        )
+    return mask_values
 
 
 def main_minimal(input_data: dict[str, Any]) -> dict[str, Any]:
@@ -460,17 +547,40 @@ def main_minimal(input_data: dict[str, Any]) -> dict[str, Any]:
         input_data: Dict containing:
             - resolved_context: ResolvedContext with action_impl and evaluated_args
             - secret_env: Flat env-ready secret mapping
+            - secret_mask_values: Observed secret-derived diagnostic representations
             - input: RunActionInput (for metadata only)
+            - timeout_seconds: Optional deadline for the action function call
 
     Returns:
         Dict with 'success', 'result', and optionally 'error'
     """
     action_impl: dict[str, Any] | None = None
+    secret_env: dict[str, str] = input_data.get("secret_env", {})
+    mask_values: set[str] = set()
+    mask_pattern: re.Pattern[str] | None = None
+
+    def redact(text: str) -> str:
+        nonlocal mask_pattern
+        if not text or not mask_values:
+            return text
+        if mask_pattern is None:
+            # Successful, quiet actions never need a diagnostic matcher.
+            # Include the replacement token to keep short-mask passes idempotent.
+            mask_pattern = re.compile(
+                "|".join(
+                    re.escape(value)
+                    for value in sorted(mask_values | {"***"}, key=len, reverse=True)
+                    if value
+                )
+            )
+        return mask_pattern.sub("***", text)
+
     try:
+        mask_values.update(input_data.get("secret_mask_values", ()))
+        mask_values.update(_collect_secret_mask_values(secret_env))
         # Extract what we need from resolved_context
         resolved_context = input_data.get("resolved_context", {})
         action_impl = resolved_context.get("action_impl")
-        secret_env = input_data.get("secret_env", {})
         evaluated_args = resolved_context.get("evaluated_args", {})
 
         if not action_impl:
@@ -488,53 +598,66 @@ def main_minimal(input_data: dict[str, Any]) -> dict[str, Any]:
             contextlib.redirect_stdout(action_stdout),
             contextlib.redirect_stderr(action_stderr),
         ):
-            result = run_action_minimal(action_impl, evaluated_args, secret_env)
+            result = run_action_minimal(
+                action_impl,
+                evaluated_args,
+                secret_env,
+                timeout_seconds=input_data.get("timeout_seconds"),
+            )
 
         # Mask secret values in captured output to prevent leaking credentials
-        mask_values = _collect_secret_mask_values(secret_env)
         if captured_stdout := action_stdout.getvalue().strip():
-            for mask in mask_values:
-                captured_stdout = captured_stdout.replace(mask, "***")
             _emit_suppressed_output_notice(
                 stream_name="stdout",
-                output=captured_stdout,
+                output=redact(captured_stdout),
                 truncated=action_stdout.truncated,
             )
         if captured_stderr := action_stderr.getvalue().strip():
-            for mask in mask_values:
-                captured_stderr = captured_stderr.replace(mask, "***")
             _emit_suppressed_output_notice(
                 stream_name="stderr",
-                output=captured_stderr,
+                output=redact(captured_stderr),
                 truncated=action_stderr.truncated,
             )
 
         return {"success": True, "result": result}
 
     except Exception as e:
+        if (limit := resource_limit_from_error(e)) is not None:
+            # Skip the traceback walk, which needs memory the process may not
+            # have, and report a structured code so the host classifies the
+            # failure without inspecting error text. Release the frames first:
+            # the action's own locals are what exhausted the cap.
+            release_exception_chain(e)
+            return _resource_limit_envelope(
+                limit,
+                action_name=_action_display_name(action_impl),
+            )
+
         import traceback
 
         # Extract traceback info for ExecutorActionErrorInfo compatibility
         tb = traceback.extract_tb(e.__traceback__)
         last_frame = tb[-1] if tb else None
 
-        # Build action name from impl if available
-        action_name = "<unknown>"
-        if action_impl:
-            module = action_impl.get("module", "")
-            name = action_impl.get("name", "")
-            if module and name:
-                action_name = f"{module}.{name}"
-            elif name:
-                action_name = name
+        try:
+            message = redact(str(e))
+        except Exception as masking_error:
+            # Lazy compilation can exhaust memory while handling an action
+            # failure. Preserve the runner's structured resource-limit response.
+            if (limit := resource_limit_from_error(masking_error)) is None:
+                raise
+            release_exception_chain(masking_error)
+            return _resource_limit_envelope(
+                limit, action_name=_action_display_name(action_impl)
+            )
 
         return {
             "success": False,
             "result": None,
             "error": {
                 "type": type(e).__name__,
-                "message": str(e),
-                "action_name": action_name,
+                "message": message,
+                "action_name": _action_display_name(action_impl),
                 "filename": last_frame.filename if last_frame else "<unknown>",
                 "function": last_frame.name if last_frame else "<unknown>",
                 "lineno": last_frame.lineno if last_frame else None,
@@ -542,31 +665,238 @@ def main_minimal(input_data: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+def resource_limit_from_error(
+    error: BaseException,
+) -> Literal["memory", "file_size"] | None:
+    """Identify allocation or file-size failures through serializer wrappers.
+
+    Python ignores SIGXFSZ by default, so RLIMIT_FSIZE surfaces as EFBIG
+    rather than a signal exit. Pydantic and orjson can wrap these exceptions;
+    inspect both cause links without relying on error-message text.
+    """
+    seen: set[int] = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, MemoryError):
+            return "memory"
+        if isinstance(current, OSError):
+            if current.errno == errno.ENOMEM:
+                return "memory"
+            if current.errno == errno.EFBIG:
+                return "file_size"
+        for following in (current.__context__, current.__cause__):
+            if following is not None:
+                pending.append(following)
+    return None
+
+
+def release_exception_chain(error: BaseException) -> None:
+    """Drop the tracebacks, and the chain itself, of ``error`` and its causes.
+
+    A traceback keeps its frames alive, and a frame's locals can be the very
+    object that exhausted memory. Clearing only the outermost one is not
+    enough: orjson reports a failure inside its ``default`` hook as its own
+    error, so the frame still holding the oversized object hangs off
+    ``__cause__`` rather than off the exception that was caught.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        current.__traceback__ = None
+        # Both links, not the first one that happens to be set: an exception
+        # can carry a distinct cause and context, and either frame can be the
+        # one holding what exhausted the cap.
+        for following in (current.__cause__, current.__context__):
+            if following is not None:
+                pending.append(following)
+        current.__cause__ = None
+        current.__context__ = None
+
+
+def serialize_result(result: dict[str, Any], input_data: dict[str, Any]) -> bytes:
+    """Serialize the runner result, recovering structured resource failures.
+
+    An action whose return value fits under the address-space cap can still
+    exhaust it while being serialized, and that ``MemoryError`` is raised after
+    ``main_minimal`` has already returned. Without this the process would die
+    before writing ``result.json`` and the failure would degrade to a generic
+    workload error, losing the resource-limit code.
+    """
+    try:
+        return json_dumps(result)
+    except Exception as exc:
+        if (limit := resource_limit_from_error(exc)) is None:
+            raise
+        # Drop the oversized result, and every frame still pinning it through
+        # the serializer's locals, before allocating anything else.
+        release_exception_chain(exc)
+        result.clear()
+        return json_dumps(
+            _resource_limit_envelope(
+                limit,
+                action_name=_action_display_name(
+                    input_data.get("resolved_context", {}).get("action_impl")
+                ),
+            )
+        )
+
+
+def _resource_limit_envelope(
+    limit: Literal["memory", "file_size"], *, action_name: str
+) -> dict[str, Any]:
+    """Build a small structured envelope for an exhausted resource limit.
+
+    Allocates only small, fixed-size values so it stays usable in a process
+    that has already exhausted its address space.
+
+    The message stays neutral about where the memory ran out. This runner also
+    executes unjailed, under the default direct backend, where no address-space
+    rlimit exists; the host names the cap only on the sandboxed path, from
+    ``sandbox_resource_limit_message()``, and the direct path drops
+    ``error_code`` and surfaces this message as an ordinary action failure.
+    """
+    return {
+        "success": False,
+        "result": None,
+        "error": {
+            "type": "MemoryError" if limit == "memory" else "OSError",
+            "message": (
+                "Action ran out of memory"
+                if limit == "memory"
+                else "Action exceeded the file size limit"
+            ),
+            "action_name": action_name,
+            "filename": "<sandbox>",
+            "function": "run_action_minimal",
+            "lineno": None,
+        },
+        "error_code": "resource_limit_exceeded",
+    }
+
+
+def write_result_file(output_path: Path, result_bytes: bytes) -> None:
+    """Replace a result that exceeds RLIMIT_FSIZE with a small error envelope."""
+    try:
+        output_path.write_bytes(result_bytes)
+    except OSError as exc:
+        if exc.errno != errno.EFBIG:
+            raise
+        output_path.write_bytes(
+            json_dumps(_resource_limit_envelope("file_size", action_name="<unknown>"))
+        )
+
+
+def _action_display_name(action_impl: dict[str, Any] | None) -> str:
+    """Build the action name reported in a structured runner error."""
+    if not action_impl:
+        return "<unknown>"
+    module = action_impl.get("module", "")
+    name = action_impl.get("name", "")
+    if module and name:
+        return f"{module}.{name}"
+    if name:
+        return name
+    return "<unknown>"
+
+
+def _enforce_nproc_limit() -> None:
+    """Cap the sandbox's process count via RLIMIT_NPROC.
+
+    nsjail cannot enforce rlimit_nproc when it creates a user namespace
+    (clone_newuser), so the host injects the configured limit via
+    TRACECAT__SANDBOX_RLIMIT_NPROC and this trusted runner applies it before
+    any untrusted code runs. Lowering a hard rlimit is permitted for
+    unprivileged processes, and the limit is enforced per real UID, which
+    covers every process in the sandbox.
+    """
+    raw = os.environ.get("TRACECAT__SANDBOX_RLIMIT_NPROC")
+    if not raw:
+        return
+    try:
+        limit = int(raw)
+        if limit <= 0:
+            raise ValueError(f"non-positive cap: {limit}")
+        _soft, current_hard = resource.getrlimit(resource.RLIMIT_NPROC)
+        finite = current_hard != resource.RLIM_INFINITY
+        # Already capped when the inherited hard cap is at or below the
+        # requested limit (including 0 = no child processes), or when a
+        # stricter finite soft limit is in force: raising either would only
+        # relax enforcement.
+        already_capped = 0 <= current_hard <= limit if finite else 0 < _soft <= limit
+        if not already_capped:
+            resource.setrlimit(resource.RLIMIT_NPROC, (limit, limit))
+    except (ValueError, OSError, OverflowError) as exc:
+        # Values are host-injected; a malformed value or an unenforceable
+        # rlimit means the process cap is not in place. Exit instead of
+        # running untrusted code without the enforced cap.
+        raise SystemExit(
+            f"_enforce_nproc_limit: could not enforce RLIMIT_NPROC={raw!r}: "
+            f"{type(exc).__name__}"
+        ) from exc
+
+
 if __name__ == "__main__":
     """Standalone entry point for subprocess execution."""
     import sys
-    from pathlib import Path
+
+    # httpx imports its optional CLI (httpx._main -> rich, click, pygments)
+    # whenever those packages are installed, ~40 ms per sandbox start. Actions
+    # never use the CLI; a None entry makes that import raise ImportError, so
+    # httpx falls back to its stub `main`. Set only here, never at module
+    # import, because the executor process also imports this module.
+    sys.modules.setdefault("httpx._main", cast(ModuleType, None))
+
+    _enforce_nproc_limit()
 
     # Determine input source: file (sandbox) or stdin (direct)
     input_path = Path("/work/input.json")
     output_path = Path("/work/result.json")
 
-    if input_path.exists():
-        input_data = json_loads(input_path.read_bytes())
-        use_file_io = True
-    else:
-        input_bytes = sys.stdin.buffer.read()
-        input_data = json_loads(input_bytes)
-        use_file_io = False
+    # A large enough payload can exhaust the cap while it is being read or
+    # decoded, before main_minimal's handlers exist. Dying here would leave no
+    # result.json and report a generic workload failure for what really was
+    # the memory limit.
+    try:
+        if input_path.exists():
+            input_data = json_loads(input_path.read_bytes())
+            use_file_io = True
+        else:
+            input_bytes = sys.stdin.buffer.read()
+            input_data = json_loads(input_bytes)
+            use_file_io = False
+    except Exception as exc:
+        if (limit := resource_limit_from_error(exc)) is None:
+            raise
+        release_exception_chain(exc)
+        envelope = json_dumps(
+            _resource_limit_envelope(
+                limit,
+                action_name="<unknown>",
+            )
+        )
+        if input_path.exists():
+            output_path.write_bytes(envelope)
+        else:
+            sys.stdout.buffer.write(envelope)
+            sys.stdout.buffer.flush()
+        raise SystemExit(1) from None
 
     # Run the action
     result = main_minimal(input_data)
 
     # Output result
-    result_bytes = json_dumps(result)
+    result_bytes = serialize_result(result, input_data)
 
     if use_file_io:
-        output_path.write_bytes(result_bytes)
+        write_result_file(output_path, result_bytes)
     else:
         sys.stdout.buffer.write(result_bytes)
         sys.stdout.buffer.flush()

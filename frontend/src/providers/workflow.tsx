@@ -1,11 +1,5 @@
 "use client"
 
-import {
-  type MutateFunction,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query"
 import type React from "react"
 import {
   createContext,
@@ -29,7 +23,22 @@ import {
 } from "@/client"
 import { ToastAction } from "@/components/ui/toast"
 import { toast } from "@/components/ui/use-toast"
-import type { TracecatApiError } from "@/lib/errors"
+import {
+  ExportErrorMessage,
+  getExportError,
+} from "@/components/workspace-sync/export-error"
+import {
+  isPublishRequired,
+  PublishFirstDialog,
+  type PublishFirstError,
+} from "@/components/workspace-sync/publish-first-dialog"
+import { getApiErrorDetail, type TracecatApiError } from "@/lib/errors"
+import {
+  type MutateFunction,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@/lib/query"
 
 type WorkflowContextType = {
   workflow: WorkflowRead | null
@@ -49,7 +58,12 @@ type WorkflowContextType = {
     WorkflowDslPublish,
     unknown
   >
-  updateWorkflow: MutateFunction<void, ApiError, WorkflowUpdate, unknown>
+  updateWorkflow: MutateFunction<
+    WorkflowRead,
+    ApiError,
+    WorkflowUpdate,
+    unknown
+  >
   validationErrors: ValidationResult[] | null
   setValidationErrors: React.Dispatch<SetStateAction<ValidationResult[] | null>>
 }
@@ -75,6 +89,10 @@ export function WorkflowProvider({
   const [validationErrors, setValidationErrors] = useState<
     ValidationResult[] | null
   >(null)
+  const [publishRequiredOpen, setPublishRequiredOpen] = useState(false)
+  const [publishError, setPublishError] = useState<PublishFirstError | null>(
+    null
+  )
 
   // Queries
   const {
@@ -100,7 +118,7 @@ export function WorkflowProvider({
   })
 
   // Mutations
-  const { mutateAsync: commitWorkflow } = useMutation({
+  const { mutateAsync: commitWorkflow, isPending: isCommitting } = useMutation({
     mutationFn: async () =>
       await workflowsCommitWorkflow({ workspaceId, workflowId }),
     onSuccess: (response) => {
@@ -126,7 +144,7 @@ export function WorkflowProvider({
       toast({
         title: "Error saving workflow",
         description:
-          (error.body as TracecatErrorMessage).message ||
+          (error.body as TracecatErrorMessage | undefined)?.message ||
           "Could not save workflow. Please try again.",
         variant: "destructive",
       })
@@ -177,7 +195,21 @@ export function WorkflowProvider({
       queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] })
     },
     onError: (error: ApiError) => {
-      console.warn("Failed to publish workflow:", error)
+      if (isPublishRequired(error)) {
+        setPublishError(null)
+        setPublishRequiredOpen(true)
+        return
+      }
+      if (getExportError(error)) {
+        toast({
+          variant: "destructive",
+          title: "Failed to publish workflow",
+          description: (
+            <ExportErrorMessage error={error} workspaceId={workspaceId} />
+          ),
+        })
+        return
+      }
       const apiError = error as TracecatApiError<string>
       const detail = apiError.body?.detail
       switch (apiError.status) {
@@ -239,28 +271,63 @@ export function WorkflowProvider({
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] })
+      // A title change is visible on the dashboard too. Those lists are cached
+      // with a 5 minute staleTime and no refetch on focus, so without this the
+      // dashboard keeps showing the old name after a rename in the builder.
+      queryClient.invalidateQueries({ queryKey: ["workflows"] })
+      queryClient.invalidateQueries({ queryKey: ["directory-items"] })
+      queryClient.invalidateQueries({
+        queryKey: ["agent-preset-workflow-references", workspaceId],
+      })
     },
     onError: (error: TracecatApiError) => {
       console.error("Failed to update workflow:", error)
+      // `body` is absent on transport failures, and `String(undefined)` is the
+      // truthy string "undefined", so read the detail through the safe accessor
+      // rather than dereferencing it and defeating the fallbacks below.
+      const detail = getApiErrorDetail(error)
       switch (error.status) {
         case 409:
           toast({
             title: "Failed to update workflow",
             description:
-              String(error.body.detail) ||
+              detail ??
               "There was a conflict updating the workflow. Please try again.",
+            variant: "destructive",
           })
           break
         default:
           toast({
             title: "Failed to update workflow",
             description:
-              String(error.body.detail) ||
-              "Could not update workflow. Please the logs for more details.",
+              detail ?? "Could not update workflow. Please check the logs.",
+            variant: "destructive",
           })
       }
     },
   })
+
+  async function handlePublishFirst() {
+    setPublishError(null)
+    try {
+      const response = await commitWorkflow()
+      if (response.status === "success") {
+        setValidationErrors(null)
+        setPublishRequiredOpen(false)
+      } else {
+        setValidationErrors(response.errors || null)
+        setPublishError({
+          message: "Fix the workflow validation errors before publishing.",
+          validationErrors: response.errors,
+        })
+      }
+    } catch {
+      // The commit mutation also shows the "Error saving workflow" toast.
+      setPublishError({
+        message: "Could not publish this workflow. Please try again.",
+      })
+    }
+  }
 
   return (
     <WorkflowContext.Provider
@@ -278,6 +345,13 @@ export function WorkflowProvider({
       }}
     >
       {children}
+      <PublishFirstDialog
+        open={publishRequiredOpen}
+        onOpenChange={setPublishRequiredOpen}
+        onPublish={handlePublishFirst}
+        isPublishing={isCommitting}
+        publishError={publishError}
+      />
     </WorkflowContext.Provider>
   )
 }

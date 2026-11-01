@@ -52,8 +52,6 @@ async def test_auto_title_updates_session_on_first_prompt(role: Role) -> None:
     )
     agent_session.id = uuid.uuid4()
 
-    service._is_first_prompt_for_session = AsyncMock(return_value=True)
-
     with patch(
         "tracecat.agent.session.service.generate_session_title",
         AsyncMock(return_value="Investigate login failures"),
@@ -61,6 +59,7 @@ async def test_auto_title_updates_session_on_first_prompt(role: Role) -> None:
         await service.auto_title_session_on_first_prompt(
             agent_session,
             "Users cannot sign in",
+            expected_title=agent_session.title,
         )
 
     assert agent_session.title == "Investigate login failures"
@@ -82,8 +81,6 @@ async def test_auto_title_uses_service_role_for_generation(user_role: Role) -> N
         entity_id=uuid.uuid4(),
     )
     agent_session.id = uuid.uuid4()
-    service._is_first_prompt_for_session = AsyncMock(return_value=True)
-
     generate_title = AsyncMock(return_value="Investigate login failures")
     with patch(
         "tracecat.agent.session.service.generate_session_title",
@@ -92,6 +89,7 @@ async def test_auto_title_uses_service_role_for_generation(user_role: Role) -> N
         await service.auto_title_session_on_first_prompt(
             agent_session,
             "Users cannot sign in",
+            expected_title=agent_session.title,
         )
 
     generate_title.assert_awaited_once()
@@ -106,27 +104,48 @@ async def test_auto_title_uses_service_role_for_generation(user_role: Role) -> N
 
 
 @pytest.mark.anyio
-async def test_auto_title_skips_when_not_first_prompt(role: Role) -> None:
+async def test_auto_title_does_not_skip_when_history_exists(role: Role) -> None:
     session = AsyncMock()
+    session.execute.return_value = SimpleNamespace(
+        scalar_one_or_none=lambda: uuid.uuid4()
+    )
     service = AgentSessionService(session, role)
     agent_session = AgentSession(
         workspace_id=role.workspace_id,
-        title="Existing title",
+        title="New Chat",
         entity_type="copilot",
         entity_id=uuid.uuid4(),
     )
     agent_session.id = uuid.uuid4()
 
-    service._is_first_prompt_for_session = AsyncMock(return_value=False)
+    service.is_first_prompt_for_session = AsyncMock(return_value=False)
 
-    await service.auto_title_session_on_first_prompt(agent_session, "Do something")
+    with patch(
+        "tracecat.agent.session.service.generate_session_title",
+        AsyncMock(return_value="Do something useful"),
+    ):
+        await service.auto_title_session_on_first_prompt(
+            agent_session,
+            "Do something",
+            expected_title=agent_session.title,
+        )
 
-    session.execute.assert_not_awaited()
+    assert agent_session.title == "Do something useful"
+    service.is_first_prompt_for_session.assert_not_awaited()
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error",
+    [
+        TracecatNotFoundError("model missing"),
+        LLMCompletionError("provider down"),
+        TracecatValidationError("invalid model config"),
+    ],
+    ids=["not-found", "llm-completion", "validation"],
+)
 async def test_auto_title_does_not_raise_on_expected_generation_error(
-    role: Role,
+    role: Role, error: Exception
 ) -> None:
     session = AsyncMock()
     service = AgentSessionService(session, role)
@@ -138,73 +157,14 @@ async def test_auto_title_does_not_raise_on_expected_generation_error(
     )
     agent_session.id = uuid.uuid4()
 
-    service._is_first_prompt_for_session = AsyncMock(return_value=True)
-
     with patch(
         "tracecat.agent.session.service.generate_session_title",
-        AsyncMock(side_effect=TracecatNotFoundError("model missing")),
+        AsyncMock(side_effect=error),
     ):
         await service.auto_title_session_on_first_prompt(
             agent_session,
             "Find issue",
-        )
-
-    session.execute.assert_not_awaited()
-    session.commit.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_auto_title_does_not_raise_on_llm_completion_error(
-    role: Role,
-) -> None:
-    session = AsyncMock()
-    service = AgentSessionService(session, role)
-    agent_session = AgentSession(
-        workspace_id=role.workspace_id,
-        title="New Chat",
-        entity_type="workflow",
-        entity_id=uuid.uuid4(),
-    )
-    agent_session.id = uuid.uuid4()
-
-    service._is_first_prompt_for_session = AsyncMock(return_value=True)
-
-    with patch(
-        "tracecat.agent.session.service.generate_session_title",
-        AsyncMock(side_effect=LLMCompletionError("provider down")),
-    ):
-        await service.auto_title_session_on_first_prompt(
-            agent_session,
-            "Find issue",
-        )
-
-    session.execute.assert_not_awaited()
-    session.commit.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_auto_title_does_not_raise_on_validation_error(
-    role: Role,
-) -> None:
-    session = AsyncMock()
-    service = AgentSessionService(session, role)
-    agent_session = AgentSession(
-        workspace_id=role.workspace_id,
-        title="New Chat",
-        entity_type="workflow",
-        entity_id=uuid.uuid4(),
-    )
-    agent_session.id = uuid.uuid4()
-
-    service._is_first_prompt_for_session = AsyncMock(return_value=True)
-
-    with patch(
-        "tracecat.agent.session.service.generate_session_title",
-        AsyncMock(side_effect=TracecatValidationError("invalid model config")),
-    ):
-        await service.auto_title_session_on_first_prompt(
-            agent_session,
-            "Find issue",
+            expected_title=agent_session.title,
         )
 
     session.execute.assert_not_awaited()
@@ -223,8 +183,6 @@ async def test_auto_title_raises_on_unexpected_generation_error(role: Role) -> N
     )
     agent_session.id = uuid.uuid4()
 
-    service._is_first_prompt_for_session = AsyncMock(return_value=True)
-
     with (
         patch(
             "tracecat.agent.session.service.generate_session_title",
@@ -235,6 +193,7 @@ async def test_auto_title_raises_on_unexpected_generation_error(role: Role) -> N
         await service.auto_title_session_on_first_prompt(
             agent_session,
             "Find issue",
+            expected_title=agent_session.title,
         )
 
 
@@ -250,7 +209,11 @@ async def test_auto_title_skips_empty_prompt(role: Role) -> None:
     )
     agent_session.id = uuid.uuid4()
 
-    await service.auto_title_session_on_first_prompt(agent_session, "   ")
+    await service.auto_title_session_on_first_prompt(
+        agent_session,
+        "   ",
+        expected_title=agent_session.title,
+    )
 
     session.execute.assert_not_awaited()
     session.commit.assert_not_awaited()
@@ -269,8 +232,6 @@ async def test_auto_title_skips_when_compare_and_set_guard_fails(role: Role) -> 
     )
     agent_session.id = uuid.uuid4()
 
-    service._is_first_prompt_for_session = AsyncMock(return_value=True)
-
     with patch(
         "tracecat.agent.session.service.generate_session_title",
         AsyncMock(return_value="Approval follow-up investigation"),
@@ -278,6 +239,42 @@ async def test_auto_title_skips_when_compare_and_set_guard_fails(role: Role) -> 
         await service.auto_title_session_on_first_prompt(
             agent_session,
             "Investigate this approval request",
+            expected_title=agent_session.title,
         )
 
     session.refresh.assert_awaited_once_with(agent_session)
+
+
+@pytest.mark.anyio
+async def test_auto_title_preserves_manual_rename_after_scheduling(
+    role: Role,
+) -> None:
+    session = AsyncMock()
+    service = AgentSessionService(session, role)
+    agent_session = AgentSession(
+        workspace_id=role.workspace_id,
+        title="New Chat",
+        entity_type="approval",
+        entity_id=uuid.uuid4(),
+    )
+    agent_session.id = uuid.uuid4()
+    expected_title = agent_session.title
+
+    agent_session.title = "Manually renamed session"
+    await session.commit()
+
+    generate_title = AsyncMock(return_value="Approval follow-up investigation")
+    with patch(
+        "tracecat.agent.session.service.generate_session_title",
+        generate_title,
+    ):
+        await service.auto_title_session_on_first_prompt(
+            agent_session,
+            "Investigate this approval request",
+            expected_title=expected_title,
+        )
+
+    assert agent_session.title == "Manually renamed session"
+    generate_title.assert_not_awaited()
+    session.execute.assert_not_awaited()
+    session.commit.assert_awaited_once()

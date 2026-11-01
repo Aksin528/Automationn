@@ -2,21 +2,27 @@
  * @jest-environment jsdom
  */
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { render, screen } from "@testing-library/react"
 import type { ReactNode } from "react"
 import { CaseItem } from "@/components/cases/case-item"
+import { QueryClient, QueryClientProvider } from "@/lib/query"
 
 jest.mock("@/providers/workspace-id", () => ({
   useWorkspaceId: () => "workspace-1",
 }))
 
-jest.mock("@/components/cases/cases-feed-event", () => ({
-  EventCreatedAt: ({ createdAt }: { createdAt: string }) => (
-    <span>{`created ${createdAt}`}</span>
-  ),
-  EventUpdatedAt: ({ updatedAt }: { updatedAt: string }) => (
-    <span>{`updated ${updatedAt}`}</span>
+jest.mock("@/components/timestamps", () => ({
+  RowTimestamps: ({
+    createdAt,
+    updatedAt,
+  }: {
+    createdAt: string
+    updatedAt: string
+  }) => (
+    <>
+      <span>{`created ${createdAt}`}</span>
+      <span>{`updated ${updatedAt}`}</span>
+    </>
   ),
 }))
 
@@ -29,7 +35,9 @@ jest.mock("@/components/ui/tooltip", () => ({
   ),
 }))
 
-function renderCaseItem() {
+function renderCaseItem(
+  searchMatch?: NonNullable<import("@/client").CaseReadMinimal["search_match"]>
+) {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -42,7 +50,9 @@ function renderCaseItem() {
       <CaseItem
         caseData={{
           id: "case-1",
+          search_match: searchMatch,
           short_id: "CASE-0001",
+          num_sub_cases: 0,
           created_at: "2026-04-13T00:00:00Z",
           updated_at: "2026-04-13T00:01:30Z",
           summary: "Database alert",
@@ -84,7 +94,14 @@ function renderCaseItem() {
           "field:priority_reason",
           "duration:duration-1",
         ]}
-        fieldTypesById={new Map([["priority_reason", "TEXT"]])}
+        fieldMetadataById={
+          new Map([
+            [
+              "priority_reason",
+              { display_name: "Why this matters", type: "TEXT" },
+            ],
+          ])
+        }
         durationNamesById={new Map([["duration-1", "Time to resolve"]])}
       />
     </QueryClientProvider>
@@ -92,6 +109,20 @@ function renderCaseItem() {
 }
 
 describe("CaseItem", () => {
+  it("renders lexical excerpts as text and never executes source markup", () => {
+    const source =
+      '<img src=x onerror="alert(1)"> PowerShell <script>alert(2)</script>'
+    const { container } = renderCaseItem({
+      score: 2000000,
+      matched_columns: ["description"],
+      excerpts: [source],
+    })
+    expect(screen.getByText("Matched description")).toBeInTheDocument()
+    expect(container).toHaveTextContent(source)
+    expect(container.querySelector("script")).toBeNull()
+    expect(container.querySelector('img[src="x"]')).toBeNull()
+  })
+
   it("renders durations after tags and before timestamps, with tooltip labels", () => {
     const { container } = renderCaseItem()
 
@@ -120,6 +151,6 @@ describe("CaseItem", () => {
     expect(screen.getByText(/Started:/)).toBeInTheDocument()
     expect(screen.getByText(/Ended:/)).toBeInTheDocument()
     expect(screen.getByText("Analyst verdict")).toBeInTheDocument()
-    expect(screen.getByText("Priority reason")).toBeInTheDocument()
+    expect(screen.getByText("Why this matters")).toBeInTheDocument()
   })
 })

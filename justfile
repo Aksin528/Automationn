@@ -104,6 +104,9 @@ gen-client-ci:
 	pnpm -C frontend generate-client-ci
 	just lint-fix
 
+skill-library *args:
+	uv run python scripts/skill_library.py {{args}}
+
 gen-mcp-docs:
 	uv run python scripts/generate_mcp_docs.py
 
@@ -112,6 +115,15 @@ gen-tool-docs:
 
 gen-functions-docs:
 	uv run python scripts/generate_functions_docs.py
+
+# Validate a PR title against .github/commit-conventions.toml
+check-pr-title $title:
+	PR_TITLE="$title" uv run python scripts/check_pr_title.py
+
+# Report how merged PRs line up with the commit conventions
+# Subcommands: labels, prefixes, backfill, sections, labels-for
+audit-conventions *args:
+	uv run python scripts/audit_commit_conventions.py {{args}}
 
 # Update version number. If no version is provided, increments patch version.
 update-version *after='':

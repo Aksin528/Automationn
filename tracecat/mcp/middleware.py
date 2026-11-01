@@ -14,12 +14,14 @@ from fastmcp.server.dependencies import get_access_token, get_http_request
 from fastmcp.server.middleware.middleware import CallNext, Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 
+from tracecat.contexts import ctx_request_audit
 from tracecat.logger import logger
 from tracecat.mcp.auth import MCPTokenIdentity, get_email_claim, get_token_identity
 from tracecat.mcp.config import (
     TRACECAT_MCP__MAX_INPUT_SIZE_BYTES,
     TRACECAT_MCP__TOOL_TIMEOUT_SECONDS,
 )
+from tracecat.middleware.request import build_request_audit_context
 
 
 class AccessTokenClaims(TypedDict, total=False):
@@ -71,6 +73,26 @@ class MCPInputSizeLimitMiddleware(Middleware):
                             f"({size} bytes > {self.max_bytes} bytes)"
                         )
         return await call_next(context)
+
+
+class MCPRequestAuditMiddleware(Middleware):
+    """Attribute audit events from tool calls with the client's IP and user agent."""
+
+    async def on_call_tool(
+        self,
+        context: MiddlewareContext[mt.CallToolRequestParams],
+        call_next: CallNext[mt.CallToolRequestParams, ToolResult],
+    ) -> ToolResult:
+        try:
+            audit_context = build_request_audit_context(get_http_request())
+        except Exception:
+            # Non-HTTP transport: no request attribution available.
+            return await call_next(context)
+        token = ctx_request_audit.set(audit_context)
+        try:
+            return await call_next(context)
+        finally:
+            ctx_request_audit.reset(token)
 
 
 class MCPTimeoutMiddleware(Middleware):
@@ -169,21 +191,22 @@ class WatchtowerMonitorMiddleware(Middleware):
         except Exception:
             return await call_next(context)
 
+        workspace_id = _resolve_workspace_id(
+            identity=identity,
+            arguments=context.message.arguments,
+        )
         try:
             call_context, block_reason = await get_watchtower_tool_call_context(
                 email=identity.email,
                 mcp_session_id=session_id,
                 claimed_org_ids=identity.organization_ids or None,
                 claimed_workspace_ids=identity.workspace_ids or None,
+                workspace_id=workspace_id,
+                organization_id=_resolve_organization_id(context.message.arguments),
             )
         except Exception as exc:
             logger.warning("Failed to resolve Watchtower call context", error=str(exc))
             return await call_next(context)
-
-        workspace_id = _resolve_workspace_id(
-            identity=identity,
-            arguments=context.message.arguments,
-        )
 
         if block_reason is not None:
             if call_context is not None:
@@ -312,6 +335,18 @@ def _resolve_workspace_id(
         workspace_id = _coerce_uuid(arguments.get(key))
         if workspace_id is not None:
             return workspace_id
+    return None
+
+
+def _resolve_organization_id(
+    arguments: dict[str, object] | None,
+) -> uuid.UUID | None:
+    if not arguments:
+        return None
+    for key in ("org_id", "organization_id"):
+        organization_id = _coerce_uuid(arguments.get(key))
+        if organization_id is not None:
+            return organization_id
     return None
 
 

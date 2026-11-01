@@ -5,6 +5,7 @@ from __future__ import annotations
 from tracecat.agent.common.types import (
     MCPHttpServerConfig,
     MCPServerConfig,
+    MCPServerToolSummary,
     MCPStdioServerConfig,
 )
 from tracecat.agent.skill.types import ResolvedSkillRef
@@ -13,6 +14,7 @@ from tracecat.agent.workflow_schemas import (
     AgentConfigPayload,
     MCPHttpServerConfigPayload,
     MCPServerConfigPayload,
+    MCPServerToolSummaryPayload,
     MCPStdioServerConfigPayload,
     ResolvedSkillRefPayload,
 )
@@ -35,6 +37,11 @@ def _mcp_server_to_payload(
                 env=server.get("env"),
                 timeout=server.get("timeout"),
                 id=server.get("id"),
+                tools=(
+                    [MCPServerToolSummaryPayload.model_validate(tool) for tool in tools]
+                    if (tools := server.get("tools")) is not None
+                    else None
+                ),
             )
         case {
             "name": str(name),
@@ -48,6 +55,12 @@ def _mcp_server_to_payload(
                 transport=server.get("transport"),
                 timeout=server.get("timeout"),
                 id=server.get("id"),
+                tunnel_id=server.get("tunnel_id"),
+                tools=(
+                    [MCPServerToolSummaryPayload.model_validate(tool) for tool in tools]
+                    if (tools := server.get("tools")) is not None
+                    else None
+                ),
             )
         case _:
             raise ValueError(f"Unsupported MCP server config: {server!r}")
@@ -69,6 +82,19 @@ def _mcp_server_from_payload(server: MCPServerConfigPayload) -> MCPServerConfig:
                 stdio_server["timeout"] = server.timeout
             if server.id is not None:
                 stdio_server["id"] = server.id
+            if server.tools is not None:
+                tools: list[MCPServerToolSummary] = []
+                for tool in server.tools:
+                    summary: MCPServerToolSummary = {
+                        "name": tool.name,
+                        "enabled": tool.enabled,
+                        "requires_approval": tool.requires_approval,
+                        "status": tool.status,
+                    }
+                    if tool.description is not None:
+                        summary["description"] = tool.description
+                    tools.append(summary)
+                stdio_server["tools"] = tools
             return stdio_server
         case MCPHttpServerConfigPayload():
             http_server: MCPHttpServerConfig = {
@@ -84,6 +110,21 @@ def _mcp_server_from_payload(server: MCPServerConfigPayload) -> MCPServerConfig:
                 http_server["timeout"] = server.timeout
             if server.id is not None:
                 http_server["id"] = server.id
+            if server.tunnel_id is not None:
+                http_server["tunnel_id"] = server.tunnel_id
+            if server.tools is not None:
+                http_tools: list[MCPServerToolSummary] = []
+                for tool in server.tools:
+                    http_summary: MCPServerToolSummary = {
+                        "name": tool.name,
+                        "enabled": tool.enabled,
+                        "requires_approval": tool.requires_approval,
+                        "status": tool.status,
+                    }
+                    if tool.description is not None:
+                        http_summary["description"] = tool.description
+                    http_tools.append(http_summary)
+                http_server["tools"] = http_tools
             return http_server
 
 
@@ -91,6 +132,7 @@ def _resolved_skill_to_payload(skill: ResolvedSkillRef) -> ResolvedSkillRefPaylo
     """Convert a resolved skill ref into a workflow-safe payload."""
 
     return ResolvedSkillRefPayload(
+        origin=skill.origin,
         skill_id=skill.skill_id,
         skill_name=skill.skill_name,
         skill_version_id=skill.skill_version_id,
@@ -102,6 +144,7 @@ def _resolved_skill_from_payload(skill: ResolvedSkillRefPayload) -> ResolvedSkil
     """Convert a workflow-safe skill ref back into a runtime dataclass."""
 
     return ResolvedSkillRef(
+        origin=skill.origin,
         skill_id=skill.skill_id,
         skill_name=skill.skill_name,
         skill_version_id=skill.skill_version_id,
@@ -122,6 +165,7 @@ def agent_config_to_payload(config: AgentConfig) -> AgentConfigPayload:
         actions=config.actions,
         namespaces=config.namespaces,
         tool_approvals=config.tool_approvals,
+        tool_tunnels=config.tool_tunnels,
         model_settings=config.model_settings,
         mcp_servers=(
             [_mcp_server_to_payload(server) for server in config.mcp_servers]
@@ -137,6 +181,8 @@ def agent_config_to_payload(config: AgentConfig) -> AgentConfigPayload:
             if config.resolved_skills
             else None
         ),
+        builtin_skills=config.builtin_skills,
+        library_skills=config.library_skills,
     )
 
 
@@ -153,6 +199,7 @@ def agent_config_from_payload(payload: AgentConfigPayload) -> AgentConfig:
         actions=payload.actions,
         namespaces=payload.namespaces,
         tool_approvals=payload.tool_approvals,
+        tool_tunnels=payload.tool_tunnels,
         model_settings=payload.model_settings,
         mcp_servers=(
             [_mcp_server_from_payload(server) for server in payload.mcp_servers]
@@ -168,4 +215,6 @@ def agent_config_from_payload(payload: AgentConfigPayload) -> AgentConfig:
             if payload.resolved_skills
             else None
         ),
+        builtin_skills=payload.builtin_skills,
+        library_skills=payload.library_skills,
     )

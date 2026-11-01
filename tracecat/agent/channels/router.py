@@ -10,8 +10,6 @@ import orjson
 from fastapi import (
     APIRouter,
     BackgroundTasks,
-    Depends,
-    HTTPException,
     Query,
     Request,
     Response,
@@ -39,23 +37,16 @@ from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.engine import get_async_session_context_manager
 from tracecat.db.models import Workspace
 from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
-from tracecat.feature_flags import is_feature_enabled
-from tracecat.feature_flags.enums import FeatureFlag
 from tracecat.logger import logger
+from tracecat.tiers.access import is_org_entitled
+from tracecat.tiers.enums import Entitlement
 
-
-def _require_agent_channels_enabled() -> None:
-    if not is_feature_enabled(FeatureFlag.AGENT_CHANNELS):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Feature not enabled",
-        )
+_SLACK_CHANNEL_CONFIG_INACTIVE_MESSAGE = "Channel configuration is no longer active"
 
 
 router = APIRouter(
     prefix="/agent/channels",
     tags=["public"],
-    dependencies=[Depends(_require_agent_channels_enabled)],
 )
 
 
@@ -112,6 +103,20 @@ async def _resolve_service_role_for_workspace(
     )
 
 
+async def _is_workspace_entitled_to_channels(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+) -> bool:
+    result = await session.execute(
+        select(Workspace.organization_id).where(Workspace.id == workspace_id)
+    )
+    organization_id = result.scalar_one_or_none()
+    if organization_id is None:
+        return False
+    return await is_org_entitled(session, organization_id, Entitlement.AGENT_CHANNELS)
+
+
 async def _process_channel_event_async(
     *,
     channel_type: ChannelType,
@@ -156,6 +161,15 @@ async def handle_channel_event(
         request=request,
         session=session,
     )
+    if not await _is_workspace_entitled_to_channels(
+        session, workspace_id=validated_token.workspace_id
+    ):
+        logger.warning(
+            "Ignoring channel event without agent_channels entitlement",
+            workspace_id=str(validated_token.workspace_id),
+            channel_type=channel_type.value,
+        )
+        return Response(status_code=status.HTTP_200_OK)
     try:
         raw_body = await request.body()
     except ValueError:
@@ -266,6 +280,7 @@ async def handle_slack_oauth_callback(
             token = await service.get_token(token_id)
             if token is None:
                 raise TracecatNotFoundError(f"Channel token '{token_id}' not found")
+            await service.require_active_preset_for_token(token, lock=True)
 
             slack_config = service.parse_stored_channel_config(
                 channel_type=ChannelType(token.channel_type),
@@ -296,11 +311,16 @@ async def handle_slack_oauth_callback(
                 ),
             )
     except (TracecatNotFoundError, TracecatValidationError) as exc:
+        message = (
+            _SLACK_CHANNEL_CONFIG_INACTIVE_MESSAGE
+            if isinstance(exc, TracecatNotFoundError)
+            else str(exc)
+        )
         return RedirectResponse(
             _build_callback_redirect_url(
                 base_url=return_url,
                 status="error",
-                message=str(exc),
+                message=message,
             )
         )
     except SlackApiError as exc:

@@ -2,7 +2,6 @@
  * @jest-environment jsdom
  */
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import type { ReactNode } from "react"
 import type {
@@ -13,6 +12,7 @@ import type {
   UserReadMinimal,
 } from "@/client"
 import { ServiceAccountsManager } from "@/components/organization/service-accounts-manager"
+import { QueryClient, QueryClientProvider } from "@/lib/query"
 
 jest.mock("@/components/cases/case-panel-section", () => ({
   CasePanelSection: ({
@@ -29,6 +29,10 @@ jest.mock("@/components/cases/case-panel-section", () => ({
       <div>{children}</div>
     </section>
   ),
+}))
+
+jest.mock("@/hooks/use-forms-access", () => ({
+  useFormsAccess: () => "hidden",
 }))
 
 jest.mock("@/components/copy-button", () => ({
@@ -49,6 +53,7 @@ jest.mock("@/components/ui/dialog", () => ({
     onOpenChange?: (open: boolean) => void
     children: ReactNode
   }) => (open ? <div>{children}</div> : null),
+  DialogBody: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   DialogContent: ({ children }: { children: ReactNode }) => (
     <div>{children}</div>
   ),

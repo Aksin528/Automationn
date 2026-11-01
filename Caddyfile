@@ -1,12 +1,18 @@
 {
-	skip_install_trust
+	skip_install_trust # fork: certificates are provided as files, never install a CA
+	servers {
+		trusted_proxies static {$TRACECAT__TRUSTED_PROXY_CIDRS:127.0.0.1/32}
+		trusted_proxies_strict
+	}
 }
 
 :443 {
-	tls /etc/caddy/certs/server.crt /etc/caddy/certs/server.key
+	tls /etc/caddy/certs/server.crt /etc/caddy/certs/server.key # fork: own certificate
 	bind {$ADDRESS} # Binds to all available network interfaces if not specified
 
-	# MinIO S3 API proxy for presigned URLs
+	# MinIO S3 API proxy for presigned URLs.
+	# fork: MinIO serves HTTPS with a self-signed certificate and presigned URLs
+	# are signed against the public host, so forward the original Host header.
 	handle_path /s3/* {
 		reverse_proxy https://minio:9000 {
 			header_up Host {host}
@@ -19,10 +25,10 @@
 
 	handle_path /api* {
 		reverse_proxy http://api:8000 {
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Real-IP {remote_host}
-			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-For {client_ip}
+			header_up X-Real-IP {client_ip}
 			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
 		}
 	}
 
@@ -30,31 +36,31 @@
 	handle /mcp* {
 		reverse_proxy http://mcp:8099 {
 			flush_interval -1
+			header_up X-Forwarded-For {client_ip}
+			header_up X-Real-IP {client_ip}
 		}
 	}
 
 	# MCP OAuth and discovery routes (served at root level by FastMCP)
-	handle /.well-known/oauth-authorization-server {
-		reverse_proxy http://mcp:8099
+	@mcp_oauth_routes {
+		path /.well-known/oauth-authorization-server
+		path /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/*
+		path /authorize /authorize/*
+		path /token
+		path /register
+		path /consent /consent/*
+		path /auth/callback /auth/callback/*
 	}
-	handle /.well-known/oauth-protected-resource* {
-		reverse_proxy http://mcp:8099
-	}
-	handle /authorize* {
-		reverse_proxy http://mcp:8099
-	}
-	handle /token {
-		reverse_proxy http://mcp:8099
-	}
-	handle /register {
-		reverse_proxy http://mcp:8099
-	}
-	handle /consent* {
-		reverse_proxy http://mcp:8099
-	}
-	handle /auth/callback* {
-		reverse_proxy http://mcp:8099
+	handle @mcp_oauth_routes {
+		reverse_proxy http://mcp:8099 {
+			flush_interval -1
+			header_up X-Forwarded-For {client_ip}
+			header_up X-Real-IP {client_ip}
+		}
 	}
 
-	reverse_proxy http://ui:3000
+	reverse_proxy http://ui:3000 {
+		header_up X-Forwarded-For {client_ip}
+		header_up X-Real-IP {client_ip}
+	}
 }

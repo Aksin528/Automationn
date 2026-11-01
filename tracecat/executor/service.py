@@ -8,17 +8,22 @@ from datetime import datetime
 from typing import Any, cast
 
 from aiocache import Cache
+from pydantic import ValidationError
 from sqlalchemy import and_, or_, select, union_all
+from tracecat_ee.tunnels.routing import (
+    TunnelRouteError,
+    effective_tunnel,
+    resolve_tunnel_route,
+)
 
 from tracecat import config
-from tracecat.auth.executor_tokens import mint_executor_token
+from tracecat.auth.executor_tokens import ExecutionOrigin, mint_executor_token
 from tracecat.auth.types import Role
 from tracecat.authz.controls import require_action_scope
 from tracecat.contexts import (
-    ctx_interaction,
     ctx_logical_time,
     ctx_role,
-    ctx_run,
+    ctx_secret_masks,
 )
 from tracecat.db.engine import get_async_session_bypass_rls_context_manager
 from tracecat.db.models import (
@@ -28,6 +33,7 @@ from tracecat.db.models import (
     RegistryVersion,
 )
 from tracecat.dsl.common import context_locator, create_default_execution_context
+from tracecat.dsl.enums import PlatformAction
 from tracecat.dsl.schemas import (
     ActionStatement,
     DSLEnvironment,
@@ -45,30 +51,43 @@ from tracecat.exceptions import (
 )
 from tracecat.executor import registry_resolver
 from tracecat.executor.backends.base import ExecutorBackend
+from tracecat.executor.error_policy import chained_error_classification
+from tracecat.executor.minimal_runner import ActionTimeoutError
 from tracecat.executor.schemas import (
     ExecutorActionErrorInfo,
     ExecutorResultSuccess,
     ResolvedContext,
 )
 from tracecat.executor.secret_preprocessors import (
-    SecretEnvProjection,
+    collect_mask_values,
     project_secret_env,
 )
-from tracecat.expressions.common import ExprContext, ExprOperand
+from tracecat.expressions.common import ExprContext
 from tracecat.expressions.eval import (
     collect_expressions,
     eval_templated_object,
     get_iterables_from_expression,
 )
 from tracecat.expressions.expectations import create_expectation_model
+from tracecat.expressions.policy import (
+    ActionArgumentPlan,
+    ProvenanceMap,
+    build_provenance,
+    resolve_action_args,
+)
 from tracecat.identifiers import OrganizationID
 from tracecat.logger import logger
-from tracecat.registry.actions.bound import BoundRegistryAction
+from tracecat.observability.sentry import capture_activity_failure
 from tracecat.registry.actions.schemas import TemplateActionDefinition
-from tracecat.registry.actions.service import RegistryActionsService
 from tracecat.registry.constants import DEFAULT_REGISTRY_ORIGIN
+from tracecat.runtime.errors import RuntimeErrorClassification, RuntimeErrorOwner
 from tracecat.secrets import secrets_manager
-from tracecat.secrets.common import apply_masks_object
+from tracecat.secrets.common import (
+    apply_masks_object,
+    await_with_masked_errors,
+    call_with_masked_errors,
+)
+from tracecat.secrets.masking import SecretMaskCollector
 from tracecat.variables.schemas import VariableSearch
 from tracecat.variables.service import VariablesService
 
@@ -77,6 +96,54 @@ from tracecat.variables.service import VariablesService
 
 type ArgsT = Mapping[str, Any]
 type ExecutionResult = Any | ExecutorActionErrorInfo
+
+
+def _sanitize_error_info(
+    info: ExecutorActionErrorInfo,
+    classification: RuntimeErrorClassification | None,
+) -> ExecutorActionErrorInfo:
+    """Keep diagnostics, masking observed secrets before transport or logging."""
+    if (
+        classification is not None
+        and classification.owner is RuntimeErrorOwner.PLATFORM
+    ):
+        info = info.model_copy(update={"message": classification.message})
+    masks = ctx_secret_masks.get()
+    return (
+        ExecutorActionErrorInfo.model_validate(
+            {key: masks.redact(value) for key, value in info.model_dump().items()}
+        )
+        if masks is not None
+        else info.model_copy()
+    )
+
+
+def _execution_origin_for_role(role: Role) -> ExecutionOrigin:
+    """Classify the trusted entry point that dispatched an executor action."""
+    match role:
+        case Role(type="service", service_id="tracecat-mcp"):
+            return "agent"
+        case _:
+            return "workflow"
+
+
+def _mint_action_executor_token(input: RunActionInput, role: Role) -> str:
+    """Mint SDK credentials carrying the root action's trusted provenance."""
+    if role.workspace_id is None:
+        raise ValueError("workspace_id is required for action execution")
+    execution_origin = _execution_origin_for_role(role)
+    return mint_executor_token(
+        workspace_id=role.workspace_id,
+        user_id=role.user_id,
+        service_id=role.service_id,
+        execution_origin=execution_origin,
+        root_action=input.task.action,
+        agent_session_id=(
+            input.agent_session_id if execution_origin == "agent" else None
+        ),
+        wf_id=str(input.run_context.wf_id),
+        wf_exec_id=str(input.run_context.wf_run_id),
+    )
 
 
 @dataclass
@@ -244,136 +311,30 @@ async def get_registry_artifacts_for_lock(
     return sorted(all_artifacts, key=lambda x: x.origin)
 
 
-async def _run_action_direct(*, action: BoundRegistryAction, args: ArgsT) -> Any:
-    """Execute the UDF directly.
+def _sanitized_validation_message(
+    exc: Exception, *, action: str, expects: Mapping[str, Any]
+) -> str:
+    """Render a validation failure without echoing the submitted value.
 
-    At this point, the UDF cannot be a template.
+    Pydantic reports the rejected input verbatim, and repr() escaping means a
+    secret can survive exact-string masking there. Both the value and the `loc`
+    path are dropped: `loc` carries user-controlled mapping keys for dict-typed
+    fields. Only field names the template itself declares are named back.
     """
-    if action.is_template:
-        # This should not be reachable
-        raise ValueError("Templates cannot be executed directly")
+    if not isinstance(exc, ValidationError):
+        return f"Validation error for template action {action!r}."
 
-    validated_args = action.validate_args(args=args, mode="python")
-    try:
-        if action.is_async:
-            logger.trace("Running UDF async")
-            return await action.fn(**validated_args)
-        logger.trace("Running UDF sync")
-        return await asyncio.to_thread(action.fn, **validated_args)
-    except Exception as e:
-        logger.error(
-            f"Error running UDF {action.action!r}", error=e, type=type(e).__name__
-        )
-        raise e
+    details: list[str] = []
+    for error in exc.errors(
+        include_input=False, include_context=False, include_url=False
+    ):
+        loc = error.get("loc") or ()
+        head = loc[0] if loc else None
+        field = head if isinstance(head, str) and head in expects else "<input>"
+        details.append(f"{field}: {error.get('msg', 'invalid')} [{error.get('type')}]")
 
-
-async def run_template_action(
-    *,
-    action: BoundRegistryAction,
-    args: ArgsT,
-    context: ExecutionContext | None = None,
-) -> Any:
-    """Handle template execution."""
-    if not action.template_action:
-        raise ValueError(
-            "Attempted to run a non-template UDF as a template. "
-            "UDFs should be executed directly via the executor backend."
-        )
-    defn = action.template_action.definition
-
-    # Validate arguments and apply defaults
-    logger.trace(
-        "Validating template action arguments", expects=defn.expects, args=args
-    )
-    validated_args: dict[str, Any] = {}
-    if defn.expects:
-        validated_args = action.validate_args(args=args)
-
-    secrets_context = {}
-    env_context = DSLEnvironment()
-    vars_context = {}
-    if context is not None:
-        secrets_context = context.get("SECRETS", {})
-        env_context = context.get("ENV", DSLEnvironment())
-        vars_context = context.get("VARS", {})
-
-    template_context = TemplateExecutionContext(
-        SECRETS=secrets_context,
-        ENV=env_context,
-        VARS=vars_context,
-        inputs=validated_args,
-        steps={},
-    )
-    logger.info("Running template action", action=defn.action)
-    return await _run_template_steps(defn, template_context)
-
-
-async def _run_template_steps(
-    defn: TemplateActionDefinition, template_context: TemplateExecutionContext
-) -> Any:
-    for step in defn.steps:
-        evaled_args = cast(
-            ArgsT,
-            eval_templated_object(
-                step.args, operand=cast(ExprOperand[str], template_context)
-            ),
-        )
-        async with RegistryActionsService.with_session() as service:
-            step_action = await service.load_action_impl(
-                action_name=step.action, mode="execution"
-            )
-        logger.trace("Running action step", step_action=step_action.action)
-        result = await _run_single_template_step(
-            action=step_action,
-            args=evaled_args,
-            context=template_context,
-        )
-        # Store the result of the step
-        logger.trace("Storing step result", step=step.ref, result=result)
-        template_context["steps"][step.ref] = TaskResult.from_result(
-            result
-        ).to_materialized_dict()
-
-    # Handle returns
-    return eval_templated_object(
-        defn.returns, operand=cast(ExprOperand[str], template_context)
-    )
-
-
-async def _run_single_template_step(
-    *,
-    action: BoundRegistryAction,
-    args: ArgsT,
-    context: TemplateExecutionContext,
-) -> Any:
-    """Run a UDF async."""
-    if action.is_template:
-        logger.info("Running template action async", action=action.name)
-        if not action.template_action:
-            raise ValueError("Template action missing template_action")
-        defn = action.template_action.definition
-
-        # Validate args against nested template's expects and create fresh context
-        # with nested template's own inputs, but reuse parent's SECRETS/ENV/VARS
-        validated_args: dict[str, Any] = {}
-        if defn.expects:
-            validated_args = action.validate_args(args=args)
-
-        nested_context = TemplateExecutionContext(
-            SECRETS=context.get("SECRETS", {}),
-            ENV=context.get("ENV", DSLEnvironment()),
-            VARS=context.get("VARS", {}),
-            inputs=validated_args,
-            steps={},
-        )
-        result = await _run_template_steps(defn, nested_context)
-    else:
-        logger.trace("Running UDF async", action=action.name)
-        secret_projection = await _get_template_secret_projection(context)
-        with secrets_manager.env_sandbox(secret_projection.env):
-            result = await _run_action_direct(action=action, args=args)
-
-    return result
+    joined = "; ".join(details) or "invalid input"
+    return f"Validation error for template action {action!r}: {joined}"
 
 
 async def _prepare_step_context(
@@ -398,16 +359,8 @@ async def _prepare_step_context(
         step_action, input.registry_lock, role.organization_id
     )
 
-    # Mint new executor token for step (required for SDK authentication)
-    if role.workspace_id is None:
-        raise ValueError("workspace_id is required for template step execution")
-    executor_token = mint_executor_token(
-        workspace_id=role.workspace_id,
-        user_id=role.user_id,
-        service_id=role.service_id,
-        wf_id=str(input.run_context.wf_id),
-        wf_exec_id=str(input.run_context.wf_run_id),
-    )
+    # Mint a fresh step token while retaining the root action's provenance.
+    executor_token = _mint_action_executor_token(input, role)
 
     # Reuse parent secrets/variables, use pre-evaluated args
     return ResolvedContext(
@@ -421,7 +374,68 @@ async def _prepare_step_context(
         executor_token=executor_token,  # Mint new token for step
         logical_time=parent_resolved.logical_time,
         secret_projection=parent_resolved.secret_projection,
+        tunnel_name=parent_resolved.tunnel_name,
+        tunnel_proxy_url=parent_resolved.tunnel_proxy_url,
+        tunnel_gateway_ip=parent_resolved.tunnel_gateway_ip,
+        tunnel_gateway_port=parent_resolved.tunnel_gateway_port,
     )
+
+
+async def _invoke_template_step(
+    *,
+    backend: ExecutorBackend,
+    resolved_context: ResolvedContext,
+    input: RunActionInput,
+    ctx: DispatchActionContext,
+    timeout: float,
+    provenance: ProvenanceMap,
+    step_ref: str,
+    step_action: str,
+) -> Any:
+    """Run one template step and sever unsafe exception chains.
+
+    Built inside the handler, raised after it: the original can carry
+    plaintext and a chained __cause__/__context__ is re-serialized downstream.
+    """
+    try:
+        return await _invoke_step(
+            backend=backend,
+            resolved_context=resolved_context,
+            input=input,
+            ctx=ctx,
+            timeout=timeout,
+            provenance=provenance,
+        )
+    except ExecutionError as e:
+        if e.info is None:
+            raise
+        classification = chained_error_classification(e)
+        info = _sanitize_error_info(e.info, classification)
+        error = ExecutionError(
+            info=info,
+            classification=classification,
+            sentry_capture=e.sentry_capture,
+        )
+    except Exception as e:
+        logger.error(
+            "Template step failed",
+            step_ref=step_ref,
+            step_action=step_action,
+            error_type=type(e).__name__,
+        )
+        info = ExecutorActionErrorInfo.from_exc(e, action_name=step_action)
+        classification = chained_error_classification(e)
+        info = _sanitize_error_info(info, classification)
+        error = ExecutionError(
+            info=info,
+            classification=classification,
+            sentry_capture=(
+                capture_activity_failure(e, classification)
+                if classification is not None
+                else None
+            ),
+        )
+    raise error
 
 
 async def _execute_template_action(
@@ -430,6 +444,7 @@ async def _execute_template_action(
     ctx: DispatchActionContext,
     resolved_context: ResolvedContext,
     timeout: float,
+    provenance: ProvenanceMap,
 ) -> Any:
     """Execute a template action by orchestrating its steps.
 
@@ -444,7 +459,9 @@ async def _execute_template_action(
         input: The original RunActionInput
         ctx: Dispatch context containing the role
         resolved_context: Pre-resolved context with secrets and template definition
-        timeout: Execution timeout
+        timeout: The action's own timeout, unclamped. invoke_once enforces it
+            across all of the template's steps.
+        provenance: Authored input-source and secret-path mapping for this invocation
 
     Returns:
         The evaluated returns expression result
@@ -461,6 +478,7 @@ async def _execute_template_action(
     # Validate input args against the template's expects schema
     # This applies defaults and validates types (including enums)
     validated_input_args: dict[str, Any] = {}
+    validation_error: RegistryValidationError | None = None
     if template_def.expects:
         try:
             args_model = create_expectation_model(
@@ -469,12 +487,32 @@ async def _execute_template_action(
             validated = args_model.model_validate(resolved_context.evaluated_args)
             validated_input_args = validated.model_dump(mode="json")
         except Exception as e:
-            raise RegistryValidationError(
-                f"Validation error for template action {template_def.action!r}: {e}",
+            validation_error = RegistryValidationError(
+                _sanitized_validation_message(
+                    e, action=template_def.action, expects=template_def.expects
+                ),
                 key=template_def.action,
-            ) from e
+            )
     else:
         validated_input_args = dict(resolved_context.evaluated_args)
+    # Raised outside the handler: the pydantic original echoes the rejected
+    # value, and a chained __cause__/__context__ is re-serialized downstream.
+    if validation_error is not None:
+        raise validation_error
+
+    # Defaults enter the runtime input mapping during validation rather than
+    # through the caller's action arguments. Seed their authored source here so
+    # policy-aware child steps can redact or preserve them like explicit inputs.
+    default_source_args: dict[str, Any] = {
+        parameter: field.default
+        for parameter, field in template_def.expects.items()
+        if parameter not in provenance and field.has_default()
+    }
+    if default_source_args:
+        provenance = {
+            **provenance,
+            **build_provenance(default_source_args, provenance),
+        }
 
     # Build template context for expression evaluation.
     secrets_context = resolved_context.secrets
@@ -488,7 +526,6 @@ async def _execute_template_action(
         inputs=validated_input_args,
         steps={},
     )
-
     logger.info(
         "Executing template action via backend",
         action=template_def.action,
@@ -503,10 +540,11 @@ async def _execute_template_action(
             step_action=step.action,
         )
 
-        # Evaluate step args with template context
-        evaled_args = cast(
-            dict[str, Any],
-            eval_templated_object(step.args, operand=template_context),
+        evaled_args = resolve_action_args(
+            step.action,
+            step.args,
+            template_context,
+            provenance,
         )
 
         # Prepare step context (reuses parent secrets, no re-fetch)
@@ -518,29 +556,24 @@ async def _execute_template_action(
             role=role,
         )
 
+        # Nested templates receive provenance derived in this scope.
+        child_provenance = (
+            build_provenance(step.args, provenance)
+            if step_resolved.action_impl.type == "template"
+            else {}
+        )
+
         # Execute step via _invoke_step (handles nested templates)
-        try:
-            step_result = await _invoke_step(
-                backend=backend,
-                resolved_context=step_resolved,
-                input=input,
-                ctx=ctx,
-                timeout=timeout,
-            )
-        except ExecutionError:
-            # Re-raise with step context preserved
-            raise
-        except Exception as e:
-            # Wrap other exceptions
-            logger.error(
-                "Template step failed",
-                step_ref=step.ref,
-                step_action=step.action,
-                error=str(e),
-            )
-            raise ExecutionError(
-                info=ExecutorActionErrorInfo.from_exc(e, action_name=step.action)
-            ) from e
+        step_result = await _invoke_template_step(
+            backend=backend,
+            resolved_context=step_resolved,
+            input=input,
+            ctx=ctx,
+            timeout=timeout,
+            provenance=child_provenance,
+            step_ref=step.ref,
+            step_action=step.action,
+        )
 
         # Store step result for subsequent steps (materialized for expression access)
         template_context["steps"][step.ref] = TaskResult.from_result(
@@ -549,7 +582,9 @@ async def _execute_template_action(
         logger.trace("Template step completed", step_ref=step.ref)
 
     # Evaluate returns expression with final template context
-    return eval_templated_object(template_def.returns, operand=template_context)
+    return eval_templated_object(
+        template_def.returns, operand=template_context, provenance=provenance
+    )
 
 
 async def _invoke_step(
@@ -558,6 +593,7 @@ async def _invoke_step(
     input: RunActionInput,
     ctx: DispatchActionContext,
     timeout: float,
+    provenance: ProvenanceMap,
 ) -> Any:
     """Execute a template step. Skips masking (done at root level).
 
@@ -570,7 +606,9 @@ async def _invoke_step(
         resolved_context: Pre-resolved context for the step
         input: The original RunActionInput
         ctx: Dispatch context containing the role
-        timeout: Execution timeout
+        timeout: The action's own timeout, unclamped. Each UDF subprocess call
+            is capped at the deployment's maximum.
+        provenance: Authored input-source and secret-path mapping for this invocation
 
     Returns:
         The step execution result (unmasked)
@@ -584,26 +622,87 @@ async def _invoke_step(
                 ctx=ctx,
                 resolved_context=resolved_context,
                 timeout=timeout,
+                provenance=provenance,
             )
         case "udf":
             # Leaf node - execute via backend
+            call_timeout = _udf_call_timeout(resolved_context, timeout)
             result = await backend.execute(
                 input=input,
                 role=ctx.role,
                 resolved_context=resolved_context,
-                timeout=timeout,
+                timeout=call_timeout,
             )
             if isinstance(result, ExecutorResultSuccess):
+                # Opaque code can transform credentials without an AST observer.
+                # Register its output before a later template expression can
+                # expose it. Steps inherit the parent's secret environment, so
+                # literal arguments alone do not make their results public.
+                if (masks := ctx_secret_masks.get()) is not None and (
+                    masks.contains(resolved_context.evaluated_args)
+                    or masks.contains(resolved_context.secrets)
+                    or (
+                        resolved_context.secret_projection is not None
+                        and masks.contains(resolved_context.secret_projection.env)
+                    )
+                ):
+                    masks.observe(result.result, include_keys=True)
                 return result.result
             else:
                 # Error response from backend
                 error_data = result.error
                 exec_result = ExecutorActionErrorInfo.model_validate(error_data)
+                if (
+                    exec_result.type == ActionTimeoutError.__name__
+                    and call_timeout < timeout
+                ):
+                    # The deployment cap, not the action's timeout, ended the call.
+                    exec_result.message = _timeout_message(
+                        timeout, capped_at=call_timeout
+                    )
                 raise ExecutionError(info=exec_result)
         case _:
             raise ValueError(
                 f"Unknown action type: {resolved_context.action_impl.type}"
             )
+
+
+def _action_timeout(input: RunActionInput) -> float:
+    """Return the action's own timeout, unclamped.
+
+    A timeout of 0 or less falls back to the deployment's maximum.
+    """
+    requested = input.task.retry_policy.timeout
+    return requested if requested > 0 else config.TRACECAT__EXECUTOR_CLIENT_TIMEOUT
+
+
+def _udf_call_timeout(resolved_context: ResolvedContext, timeout: float) -> float:
+    """Cap one UDF subprocess call at the deployment's maximum.
+
+    run_python runs in its own sandbox and keeps the action's own timeout.
+    """
+    if resolved_context.action_impl.action_name == PlatformAction.RUN_PYTHON:
+        return timeout
+    return min(timeout, config.TRACECAT__EXECUTOR_CLIENT_TIMEOUT)
+
+
+def _timeout_message(action_timeout: float, *, capped_at: float | None = None) -> str:
+    """Describe an action timeout by the action's own timeout, or the cap that hit."""
+    if capped_at is None:
+        return f"Action execution timed out after {action_timeout:g}s"
+    return (
+        f"Action execution timed out after {capped_at:g}s, this deployment's maximum "
+        "action timeout (TRACECAT__EXECUTOR_CLIENT_TIMEOUT). The action's own timeout "
+        f"is {action_timeout:g}s."
+    )
+
+
+def _attach_loop_context(info: ExecutorActionErrorInfo, iteration: int | None) -> None:
+    """Record which for_each iteration failed, when running inside one."""
+    if iteration is None:
+        return
+    # Keep the iteration number without copying the whole runtime loop value.
+    info.loop_iteration = iteration
 
 
 @dataclass
@@ -612,27 +711,7 @@ class PreparedContext:
 
     resolved_context: ResolvedContext
     mask_values: set[str] | None
-
-
-async def _get_template_secret_projection(
-    context: TemplateExecutionContext,
-) -> SecretEnvProjection:
-    secrets = context.get("SECRETS", {})
-    role = ctx_role.get()
-    run_context = ctx_run.get()
-    if role is None or run_context is None:
-        flat_secrets = secrets_manager.flatten_secrets(secrets)
-        mask_values = {
-            value
-            for value in flat_secrets.values()
-            if isinstance(value, str) and len(value) > 1
-        }
-        return SecretEnvProjection(env=flat_secrets, mask_values=mask_values)
-    return await project_secret_env(
-        secrets=secrets,
-        role=role,
-        run_context=run_context,
-    )
+    provenance: ProvenanceMap | None = None
 
 
 async def prepare_resolved_context(
@@ -663,8 +742,12 @@ async def prepare_resolved_context(
         action_name, input.registry_lock, role.organization_id
     )
 
-    # Collect expressions to know what secrets/variables are needed
-    collected = collect_expressions(task.args)
+    # Apply field policy before expression collection: preserved source is
+    # excluded, while secret-dependent occurrences in durable content are
+    # replaced before any argument-driven secret lookup.
+    argument_plan = ActionArgumentPlan.build(action_name, task.args)
+    provenance = build_provenance(task.args) if action_impl.type == "template" else None
+    collected = collect_expressions(argument_plan.evaluable)
 
     # Fetch secrets and variables
     secrets = await secrets_manager.get_action_secrets(
@@ -681,6 +764,18 @@ async def prepare_resolved_context(
     context["SECRETS"] = secrets
     context["VARS"] = workspace_variables
 
+    # Derive masks from the raw secrets before they can reach an exception.
+    # project_secret_env() runs preprocessors that may hit the network, so it
+    # stays below; its projection masks are unioned in once it has run.
+    early_mask_values = (
+        set()
+        if config.TRACECAT__UNSAFE_DISABLE_SM_MASKING
+        else collect_mask_values([secrets])
+    )
+
+    if masks := ctx_secret_masks.get():
+        masks.observe(secrets)
+
     # Extract and set logical_time BEFORE evaluating args
     # This ensures FN.now(), FN.utcnow(), FN.today() use the deterministic time
     env_context = context.get(ExprContext.ENV) or {}
@@ -695,29 +790,29 @@ async def prepare_resolved_context(
         # logical_time may be serialized as ISO string through Temporal
         logical_time = datetime.fromisoformat(logical_time)
     logical_time_token = ctx_logical_time.set(logical_time)
-    # Set interaction context for FN.get_interaction() during args evaluation
-    interaction_token = ctx_interaction.set(input.interaction_context)
     try:
         logger.trace(
             "Context set before template evaluation",
             task_ref=task.ref,
             logical_time=logical_time,
-            has_interaction=input.interaction_context is not None,
         )
-
-        # Evaluate templated args (now with logical_time and interaction context set)
-        evaluated_args = evaluate_templated_args(task, context)
+        # Expression errors echo their operand, so the raw secret can be in the
+        # message: failures surface as a chainless masked copy.
+        evaluated_args = call_with_masked_errors(
+            lambda: argument_plan.evaluate(context), masks=early_mask_values
+        )
     finally:
         ctx_logical_time.reset(logical_time_token)
-        ctx_interaction.reset(interaction_token)
 
     if role.workspace_id is None:
         raise ValueError("workspace_id is required for action execution")
 
-    secret_projection = await project_secret_env(
-        secrets=secrets,
-        role=role,
-        run_context=input.run_context,
+    # Preprocessors handle live credentials (e.g. AWS STS), so their errors can
+    # carry secret-derived values. invoke_once() has no mask set until this
+    # function returns, so fail closed here instead.
+    secret_projection = await await_with_masked_errors(
+        project_secret_env(secrets=secrets, role=role, run_context=input.run_context),
+        masks=early_mask_values,
     )
 
     # Build root-level masks from the runtime projection so host-side credential
@@ -728,16 +823,30 @@ async def prepare_resolved_context(
         )
         mask_values = None
     else:
-        mask_values = set(secret_projection.mask_values)
+        mask_values = early_mask_values | set(secret_projection.mask_values)
+
+    if masks := ctx_secret_masks.get():
+        for value in secret_projection.mask_values:
+            masks.observe(value)
 
     # Generate executor token for SDK authentication
-    executor_token = mint_executor_token(
-        workspace_id=role.workspace_id,
-        user_id=role.user_id,
-        service_id=role.service_id,
-        wf_id=str(input.run_context.wf_id),
-        wf_exec_id=str(input.run_context.wf_run_id),
-    )
+    executor_token = _mint_action_executor_token(input, role)
+
+    tunnel_route = None
+    if tunnel_name := effective_tunnel(input):
+        if PlatformAction.is_interface(action_name):
+            raise TunnelRouteError(f"Action {action_name!r} cannot use a tunnel")
+        tunnel_route = await resolve_tunnel_route(
+            name=tunnel_name,
+            workspace_id=role.workspace_id,
+            organization_id=role.organization_id,
+            subject=(
+                f"agent_session:{input.agent_session_id}"
+                if input.agent_session_id is not None
+                else str(input.run_context.wf_exec_id)
+            ),
+            action_ref=task.ref,
+        )
 
     resolved_context = ResolvedContext(
         secrets=secrets,
@@ -750,9 +859,17 @@ async def prepare_resolved_context(
         executor_token=executor_token,
         logical_time=logical_time,
         secret_projection=secret_projection,
+        tunnel_name=tunnel_route.tunnel_name if tunnel_route else None,
+        tunnel_proxy_url=tunnel_route.proxy_url if tunnel_route else None,
+        tunnel_gateway_ip=tunnel_route.gateway_ip if tunnel_route else None,
+        tunnel_gateway_port=tunnel_route.gateway_port if tunnel_route else None,
     )
 
-    return PreparedContext(resolved_context=resolved_context, mask_values=mask_values)
+    return PreparedContext(
+        resolved_context=resolved_context,
+        mask_values=mask_values,
+        provenance=provenance,
+    )
 
 
 async def invoke_once(
@@ -764,20 +881,23 @@ async def invoke_once(
     """Execute action using the configured backend.
 
     The backend is selected via TRACECAT__EXECUTOR_BACKEND config:
-    - 'pool': Warm nsjail workers (single-tenant, high throughput)
-    - 'ephemeral': Cold nsjail subprocess per action (multitenant, full isolation)
+    - 'nsjail' ('ephemeral' alias): Cold nsjail subprocess per action (multitenant, full isolation)
     - 'direct': Direct subprocess execution
-    - 'test': In-process execution (tests only)
-    - 'auto': Auto-select based on environment
     """
     role = ctx.role
     action_name = input.task.action
-    timeout = config.TRACECAT__EXECUTOR_CLIENT_TIMEOUT
+    # Budgets the action's function calls; platform preparation is excluded.
+    timeout = _action_timeout(input)
 
     # Ensure organization_id is set (workflows are always org-scoped)
     if role.organization_id is None:
         raise ValueError("organization_id is required for action dispatch")
 
+    # Bound before the try so context-preparation failures stay safe.
+    mask_values: set[str] | None = None
+
+    masks = SecretMaskCollector()
+    masks_token = ctx_secret_masks.set(masks)
     try:
         # Prefetch registry lock manifests into cache for O(1) resolution.
         # Keep this inside the error wrapper so entitlement failures are
@@ -791,47 +911,95 @@ async def invoke_once(
         prepared = await prepare_resolved_context(input, role)
         resolved_context = prepared.resolved_context
         mask_values = prepared.mask_values
+        for value in mask_values or ():
+            masks.observe(value)
 
         # Set logical_time for deterministic FN.now() (applies to in-process backends)
         # Sandboxed backends set this in their subprocess from resolved_context.logical_time
         ctx_logical_time.set(resolved_context.logical_time)
 
-        # Delegate execution to _invoke_step (shared logic for template/udf)
-        # This handles both template orchestration and UDF execution
-        action_result = await _invoke_step(
-            backend=backend,
-            resolved_context=resolved_context,
-            input=input,
-            ctx=ctx,
-            timeout=timeout,
+        # A template is one action, so all its steps share the action's
+        # timeout; cancelling the running step terminates its subprocess. A
+        # single UDF call is timed inside the runner instead, so subprocess
+        # startup doesn't count toward it.
+        template_scope = asyncio.timeout(
+            timeout if resolved_context.action_impl.type == "template" else None
         )
+        try:
+            async with template_scope:
+                # Delegate execution to _invoke_step (shared logic for template/udf)
+                # This handles both template orchestration and UDF execution
+                action_result = await _invoke_step(
+                    backend=backend,
+                    resolved_context=resolved_context,
+                    input=input,
+                    ctx=ctx,
+                    timeout=timeout,
+                    provenance=prepared.provenance or {},
+                )
+        except TimeoutError:
+            # A TimeoutError raised by a step itself propagates unchanged.
+            if template_scope.expired():
+                raise ActionTimeoutError(_timeout_message(timeout)) from None
+            raise
+        # Synchronous work after the last await can cross the deadline before
+        # the scope fires. A template that finishes late is still a timeout.
+        deadline = template_scope.when()
+        if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+            raise ActionTimeoutError(_timeout_message(timeout))
 
     except ExecutionError as e:
         # ExecutionError already has proper error info, just add loop context if needed
-        if iteration is not None and e.info is not None:
-            e.info.loop_iteration = iteration
-            e.info.loop_vars = input.exec_context.get(ExprContext.LOCAL_VARS)
-        raise
+        if e.info is None:
+            raise
+        classification = chained_error_classification(e)
+        exec_result = _sanitize_error_info(e.info, classification).model_copy()
+        _attach_loop_context(exec_result, iteration)
+        safe_error = ExecutionError(
+            info=exec_result,
+            classification=classification,
+            sentry_capture=e.sentry_capture,
+        )
     except Exception as e:
         # Infrastructure errors need to be wrapped for consistent error handling
+        exec_result = ExecutorActionErrorInfo.from_exc(e, action_name=action_name)
+        classification = chained_error_classification(e)
+        _attach_loop_context(exec_result, iteration)
+        exec_result = _sanitize_error_info(exec_result, classification)
+        # Log only the safe diagnostic when secrets may be in scope.
         logger.error(
             "Backend execution failed",
             action=action_name,
-            error=str(e),
-            error_type=type(e).__name__,
+            error=exec_result.message,
+            error_type=exec_result.type,
             backend=type(backend).__name__,
         )
-        exec_result = ExecutorActionErrorInfo.from_exc(e, action_name=action_name)
-        if iteration is not None:
-            exec_result.loop_iteration = iteration
-            exec_result.loop_vars = input.exec_context.get(ExprContext.LOCAL_VARS)
-        raise ExecutionError(info=exec_result) from e
-
-    # Apply secret masking at root level only
-    # Steps don't mask - masking happens once here after all execution completes
-    if mask_values:
-        action_result = apply_masks_object(action_result, masks=mask_values)
-    return action_result
+        # Drop the cause AND the context even with no masks: secret-derived
+        # ACTIONS/var inputs mean the original can carry plaintext, and a
+        # chained __cause__/__context__ is re-serialized downstream.
+        safe_error = ExecutionError(
+            info=exec_result,
+            classification=classification,
+            sentry_capture=(
+                capture_activity_failure(e, classification)
+                if classification is not None
+                else None
+            ),
+        )
+    else:
+        # Apply secret masking at root level only. Large action results can make
+        # this CPU-bound traversal expensive, so keep it off the activity event
+        # loop where it could otherwise delay heartbeats for every activity on
+        # the worker.
+        if mask_values:
+            action_result = await asyncio.to_thread(
+                apply_masks_object, action_result, masks=mask_values
+            )
+        return action_result
+    finally:
+        ctx_secret_masks.reset(masks_token)
+    # Raise outside the handlers so the plaintext original is not attached.
+    raise safe_error
 
 
 async def dispatch_action(backend: ExecutorBackend, input: RunActionInput) -> Any:

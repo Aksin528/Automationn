@@ -1,5 +1,6 @@
 """HTTP-level tests for workflow execution routes that accept slash-delimited IDs."""
 
+import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
@@ -9,60 +10,73 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from temporalio.client import WorkflowExecutionStatus
 
+from tracecat.api.app import app as api_app
 from tracecat.auth.types import Role
+from tracecat.db.engine import get_async_session
 from tracecat.dsl.common import DSLInput
+from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.validation.schemas import ValidationResult, ValidationResultType
 from tracecat.workflow.executions import internal_router as internal_executions_router
 from tracecat.workflow.executions import router as executions_router
+from tracecat.workflow.executions.correlation import build_case_task_correlation_id
+
+
+def _workflow_definition_content(title: str = "Test Workflow") -> dict:
+    return DSLInput(
+        **{
+            "title": title,
+            "description": "Test workflow",
+            "entrypoint": {"ref": "start"},
+            "actions": [{"ref": "start", "action": "core.noop"}],
+            "config": {"enable_runtime_tests": False},
+        }
+    ).model_dump()
+
 
 # --- Internal Router: GET /executions/{execution_id} ---
 
 
 @pytest.mark.anyio
-async def test_internal_get_execution_status_accepts_slash_id(
-    client: TestClient,
+@pytest.mark.parametrize(
+    ("path_id", "wf_exec_id", "exec_status"),
+    [
+        pytest.param(
+            "wf_abc/exec_def",
+            "wf_abc/exec_def",
+            WorkflowExecutionStatus.RUNNING,
+            id="slash",
+        ),
+        pytest.param(
+            quote("wf_abc/exec_def", safe=""),
+            "wf_abc/exec_def",
+            WorkflowExecutionStatus.COMPLETED,
+            id="url-encoded-slash",
+        ),
+        pytest.param(
+            "wf_abc:exec_def",
+            "wf_abc:exec_def",
+            WorkflowExecutionStatus.RUNNING,
+            id="colon",
+        ),
+    ],
+)
+async def test_internal_get_execution_status_accepts_delimited_ids(
+    action_gateway_client: TestClient,
     test_admin_role: Role,
+    path_id: str,
+    wf_exec_id: str,
+    exec_status: WorkflowExecutionStatus,
 ) -> None:
-    """Test that the internal router accepts execution IDs with slash delimiter."""
-    wf_exec_id = "wf_abc/exec_def"
-
+    """The internal router accepts slash, URL-encoded slash, and colon execution IDs."""
     mock_execution = Mock()
-    mock_execution.status = WorkflowExecutionStatus.RUNNING
+    mock_execution.status = exec_status
     mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
-    mock_execution.close_time = None
+    mock_execution.close_time = (
+        datetime(2024, 1, 1, 0, 5, tzinfo=UTC)
+        if exec_status == WorkflowExecutionStatus.COMPLETED
+        else None
+    )
 
-    mock_svc = AsyncMock()
-    mock_svc.get_execution.return_value = mock_execution
-
-    with patch.object(
-        internal_executions_router.WorkflowExecutionsService,
-        "connect",
-        AsyncMock(return_value=mock_svc),
-    ):
-        response = client.get(f"/internal/workflows/executions/{wf_exec_id}")
-
-    assert response.status_code == status.HTTP_200_OK
-    payload = response.json()
-    assert payload["workflow_execution_id"] == wf_exec_id
-    assert payload["status"] == "RUNNING"
-    mock_svc.get_execution.assert_awaited_once_with(wf_exec_id)
-
-
-@pytest.mark.anyio
-async def test_internal_get_execution_status_accepts_url_encoded_slash(
-    client: TestClient,
-    test_admin_role: Role,
-) -> None:
-    """Test that URL-encoded slash (%2F) is decoded correctly."""
-    wf_exec_id = "wf_abc/exec_def"
-    encoded_id = quote(wf_exec_id, safe="")  # wf_abc%2Fexec_def
-
-    mock_execution = Mock()
-    mock_execution.status = WorkflowExecutionStatus.COMPLETED
-    mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
-    mock_execution.close_time = datetime(2024, 1, 1, 0, 5, tzinfo=UTC)
-
-    # Setup mock handle with async result method
     mock_handle = Mock()
     mock_handle.result = AsyncMock(return_value={"output": "success"})
 
@@ -75,47 +89,20 @@ async def test_internal_get_execution_status_accepts_url_encoded_slash(
         "connect",
         AsyncMock(return_value=mock_svc),
     ):
-        response = client.get(f"/internal/workflows/executions/{encoded_id}")
-
-    assert response.status_code == status.HTTP_200_OK
-    payload = response.json()
-    # The path parameter should be URL-decoded
-    assert payload["workflow_execution_id"] == wf_exec_id
-    assert payload["status"] == "COMPLETED"
-
-
-@pytest.mark.anyio
-async def test_internal_get_execution_status_accepts_colon_delimiter(
-    client: TestClient,
-    test_admin_role: Role,
-) -> None:
-    """Test that execution IDs with colon delimiter are accepted."""
-    wf_exec_id = "wf_abc:exec_def"
-
-    mock_execution = Mock()
-    mock_execution.status = WorkflowExecutionStatus.RUNNING
-    mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
-    mock_execution.close_time = None
-
-    mock_svc = AsyncMock()
-    mock_svc.get_execution.return_value = mock_execution
-
-    with patch.object(
-        internal_executions_router.WorkflowExecutionsService,
-        "connect",
-        AsyncMock(return_value=mock_svc),
-    ):
-        response = client.get(f"/internal/workflows/executions/{wf_exec_id}")
+        response = action_gateway_client.get(
+            f"/internal/workflows/executions/{path_id}"
+        )
 
     assert response.status_code == status.HTTP_200_OK
     payload = response.json()
     assert payload["workflow_execution_id"] == wf_exec_id
+    assert payload["status"] == exec_status.name
     mock_svc.get_execution.assert_awaited_once_with(wf_exec_id)
 
 
 @pytest.mark.anyio
 async def test_internal_get_execution_status_returns_404_when_not_found(
-    client: TestClient,
+    action_gateway_client: TestClient,
     test_admin_role: Role,
 ) -> None:
     """Test that 404 is returned when execution is not found."""
@@ -129,7 +116,9 @@ async def test_internal_get_execution_status_returns_404_when_not_found(
         "connect",
         AsyncMock(return_value=mock_svc),
     ):
-        response = client.get(f"/internal/workflows/executions/{wf_exec_id}")
+        response = action_gateway_client.get(
+            f"/internal/workflows/executions/{wf_exec_id}"
+        )
 
     assert response.status_code == status.HTTP_404_NOT_FOUND
     assert "not found" in response.json()["detail"].lower()
@@ -137,7 +126,7 @@ async def test_internal_get_execution_status_returns_404_when_not_found(
 
 @pytest.mark.anyio
 async def test_internal_get_execution_status_returns_error_for_failed_workflow(
-    client: TestClient,
+    action_gateway_client: TestClient,
     test_admin_role: Role,
 ) -> None:
     """Test that error details are returned for failed workflows."""
@@ -167,7 +156,9 @@ async def test_internal_get_execution_status_returns_error_for_failed_workflow(
         "connect",
         AsyncMock(return_value=mock_svc),
     ):
-        response = client.get(f"/internal/workflows/executions/{wf_exec_id}")
+        response = action_gateway_client.get(
+            f"/internal/workflows/executions/{wf_exec_id}"
+        )
 
     assert response.status_code == status.HTTP_200_OK
     payload = response.json()
@@ -178,7 +169,7 @@ async def test_internal_get_execution_status_returns_error_for_failed_workflow(
 
 @pytest.mark.anyio
 async def test_internal_get_execution_status_unwraps_nested_failure_cause(
-    client: TestClient,
+    action_gateway_client: TestClient,
     test_admin_role: Role,
 ) -> None:
     """Test that nested ActivityError-style causes are unwrapped to root message."""
@@ -216,7 +207,9 @@ async def test_internal_get_execution_status_unwraps_nested_failure_cause(
         "connect",
         AsyncMock(return_value=mock_svc),
     ):
-        response = client.get(f"/internal/workflows/executions/{wf_exec_id}")
+        response = action_gateway_client.get(
+            f"/internal/workflows/executions/{wf_exec_id}"
+        )
 
     assert response.status_code == status.HTTP_200_OK
     payload = response.json()
@@ -226,12 +219,244 @@ async def test_internal_get_execution_status_unwraps_nested_failure_cause(
     assert "Activity task failed" not in payload["error"]
 
 
+@pytest.mark.anyio
+async def test_internal_get_execution_status_leaves_event_fields_null_by_default(
+    action_gateway_client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Without include_events the event fields are null (unset, not empty)."""
+    wf_exec_id = "wf_abc/exec_def"
+
+    mock_execution = Mock()
+    mock_execution.status = WorkflowExecutionStatus.RUNNING
+    mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_execution.close_time = None
+
+    mock_svc = AsyncMock()
+    mock_svc.get_execution.return_value = mock_execution
+
+    with patch.object(
+        internal_executions_router.WorkflowExecutionsService,
+        "connect",
+        AsyncMock(return_value=mock_svc),
+    ):
+        response = action_gateway_client.get(
+            f"/internal/workflows/executions/{wf_exec_id}"
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    payload = response.json()
+    assert payload["events"] is None
+    assert payload["history_length"] is None
+    mock_svc.list_workflow_execution_events_compact.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_internal_get_execution_status_includes_events_when_requested(
+    action_gateway_client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """include_events populates the shared status envelope's event fields."""
+    wf_exec_id = "wf_abc/exec_def"
+
+    mock_execution = Mock()
+    mock_execution.id = wf_exec_id
+    mock_execution.status = WorkflowExecutionStatus.RUNNING
+    mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_execution.close_time = None
+    mock_execution.history_length = 7
+    mock_execution.typed_search_attributes = {}
+
+    mock_event = Mock()
+    mock_event.action_ref = "start"
+    mock_event.action_name = "core.noop"
+    mock_event.status = "COMPLETED"
+    mock_event.schedule_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_event.start_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_event.close_time = None
+    mock_event.action_error = None
+    mock_event.action_result = {"ok": True}
+
+    mock_svc = AsyncMock()
+    mock_svc.get_execution.return_value = mock_execution
+    mock_svc.list_workflow_execution_events_compact.return_value = [mock_event]
+
+    with patch.object(
+        internal_executions_router.WorkflowExecutionsService,
+        "connect",
+        AsyncMock(return_value=mock_svc),
+    ):
+        response = action_gateway_client.get(
+            f"/internal/workflows/executions/{wf_exec_id}",
+            params={"include_events": "true"},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    payload = response.json()
+    assert payload["status"] == "RUNNING"
+    assert payload["history_length"] == 7
+    assert payload["events"] == [
+        {
+            "action_ref": "start",
+            "action_name": "core.noop",
+            "status": "COMPLETED",
+            "schedule_time": "2024-01-01 00:00:00+00:00",
+            "start_time": "2024-01-01 00:00:00+00:00",
+            "close_time": None,
+            "error": None,
+            "result": {"ok": True},
+            "result_truncated": None,
+        }
+    ]
+    mock_svc.list_workflow_execution_events_compact.assert_awaited_once_with(wf_exec_id)
+
+
+@pytest.mark.anyio
+async def test_internal_get_execution_status_truncates_large_event_result(
+    action_gateway_client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Oversized action results are truncated to 2000 chars plus an ellipsis."""
+    wf_exec_id = "wf_abc/exec_big"
+
+    mock_execution = Mock()
+    mock_execution.id = wf_exec_id
+    mock_execution.status = WorkflowExecutionStatus.RUNNING
+    mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_execution.close_time = None
+    mock_execution.history_length = 3
+    mock_execution.typed_search_attributes = {}
+
+    mock_event = Mock()
+    mock_event.action_ref = "big"
+    mock_event.action_name = "core.noop"
+    mock_event.status = "COMPLETED"
+    mock_event.schedule_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_event.start_time = None
+    mock_event.close_time = None
+    mock_event.action_error = None
+    mock_event.action_result = "x" * 5000
+
+    mock_svc = AsyncMock()
+    mock_svc.get_execution.return_value = mock_execution
+    mock_svc.list_workflow_execution_events_compact.return_value = [mock_event]
+
+    with patch.object(
+        internal_executions_router.WorkflowExecutionsService,
+        "connect",
+        AsyncMock(return_value=mock_svc),
+    ):
+        response = action_gateway_client.get(
+            f"/internal/workflows/executions/{wf_exec_id}",
+            params={"include_events": "true"},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    event = response.json()["events"][0]
+    assert event["result"] is None
+    assert event["result_truncated"] is not None
+    assert len(event["result_truncated"]) == 2003
+    assert event["result_truncated"].endswith("...")
+
+
+# --- Internal Router: GET /{workflow_id}/executions ---
+
+
+@pytest.mark.anyio
+async def test_internal_list_workflow_executions_returns_summaries(
+    action_gateway_client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """The list route returns cursor-paginated execution summaries."""
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+
+    mock_execution = Mock()
+    mock_execution.id = f"{workflow_id}/exec_abc"
+    mock_execution.run_id = "run_123"
+    mock_execution.status = WorkflowExecutionStatus.COMPLETED
+    mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_execution.close_time = datetime(2024, 1, 1, 0, 5, tzinfo=UTC)
+    mock_execution.typed_search_attributes = {}
+
+    mock_page = Mock()
+    mock_page.items = [mock_execution]
+    mock_page.next_cursor = "next"
+    mock_page.prev_cursor = None
+    mock_page.has_more = True
+    mock_page.has_previous = False
+
+    mock_svc = AsyncMock()
+    mock_svc.list_executions_paginated.return_value = mock_page
+
+    with patch.object(
+        internal_executions_router.WorkflowExecutionsService,
+        "connect",
+        AsyncMock(return_value=mock_svc),
+    ):
+        response = action_gateway_client.get(
+            f"/internal/workflows/{workflow_id}/executions"
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    payload = response.json()
+    assert payload["next_cursor"] == "next"
+    assert payload["has_more"] is True
+    assert payload["items"] == [
+        {
+            "id": f"{workflow_id}/exec_abc",
+            "run_id": "run_123",
+            "status": "COMPLETED",
+            "start_time": "2024-01-01 00:00:00+00:00",
+            "close_time": "2024-01-01 00:05:00+00:00",
+            "trigger_type": "manual",
+            "execution_type": "published",
+        }
+    ]
+    pagination = mock_svc.list_executions_paginated.await_args.kwargs["pagination"]
+    assert pagination.limit == 20
+    assert pagination.cursor is None
+
+
+@pytest.mark.anyio
+async def test_internal_list_workflow_executions_clamps_limit(
+    action_gateway_client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Requested limits are clamped into the 1-100 range."""
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+
+    mock_page = Mock()
+    mock_page.items = []
+    mock_page.next_cursor = None
+    mock_page.prev_cursor = None
+    mock_page.has_more = False
+    mock_page.has_previous = False
+
+    mock_svc = AsyncMock()
+    mock_svc.list_executions_paginated.return_value = mock_page
+
+    with patch.object(
+        internal_executions_router.WorkflowExecutionsService,
+        "connect",
+        AsyncMock(return_value=mock_svc),
+    ):
+        response = action_gateway_client.get(
+            f"/internal/workflows/{workflow_id}/executions",
+            params={"limit": 5000, "cursor": "opaque"},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    pagination = mock_svc.list_executions_paginated.await_args.kwargs["pagination"]
+    assert pagination.limit == 100
+    assert pagination.cursor == "opaque"
+
+
 # --- Internal Router: POST /executions ---
 
 
 @pytest.mark.anyio
 async def test_internal_execute_workflow_by_id(
-    client: TestClient,
+    action_gateway_client: TestClient,
     test_admin_role: Role,
 ) -> None:
     """Test executing a workflow by workflow_id."""
@@ -279,7 +504,7 @@ async def test_internal_execute_workflow_by_id(
             AsyncMock(return_value=mock_exec_service),
         ),
     ):
-        response = client.post(
+        response = action_gateway_client.post(
             "/internal/workflows/executions",
             json={"workflow_id": workflow_id, "trigger_inputs": {"key": "value"}},
         )
@@ -292,7 +517,7 @@ async def test_internal_execute_workflow_by_id(
 
 @pytest.mark.anyio
 async def test_internal_execute_workflow_by_alias(
-    client: TestClient,
+    action_gateway_client: TestClient,
     test_admin_role: Role,
 ) -> None:
     """Test executing a workflow by workflow_alias."""
@@ -354,7 +579,7 @@ async def test_internal_execute_workflow_by_alias(
             AsyncMock(return_value=mock_exec_service),
         ),
     ):
-        response = client.post(
+        response = action_gateway_client.post(
             "/internal/workflows/executions",
             json={"workflow_alias": workflow_alias},
         )
@@ -366,14 +591,36 @@ async def test_internal_execute_workflow_by_alias(
 
 
 @pytest.mark.anyio
-async def test_internal_execute_workflow_returns_404_for_unknown_alias(
-    client: TestClient,
+@pytest.mark.parametrize(
+    ("payload", "status_code", "detail_fragment"),
+    [
+        pytest.param(
+            {"workflow_alias": "nonexistent-alias"},
+            status.HTTP_404_NOT_FOUND,
+            "not found",
+            id="unknown-alias",
+        ),
+        pytest.param(
+            {},
+            status.HTTP_400_BAD_REQUEST,
+            "either workflow_id or workflow_alias",
+            id="no-id-or-alias",
+        ),
+        pytest.param(
+            {"workflow_id": "wf_nodefinition"},
+            status.HTTP_404_NOT_FOUND,
+            "definition",
+            id="missing-definition",
+        ),
+    ],
+)
+async def test_internal_execute_workflow_rejects_unresolvable_targets(
+    action_gateway_client: TestClient,
     test_admin_role: Role,
+    payload: dict[str, str],
+    status_code: int,
+    detail_fragment: str,
 ) -> None:
-    """Test that 404 is returned when workflow alias is not found."""
-    mock_wf_service = AsyncMock()
-    mock_wf_service.resolve_workflow_alias.return_value = None
-
     with (
         patch.object(
             internal_executions_router.WorkflowsManagementService,
@@ -383,45 +630,8 @@ async def test_internal_execute_workflow_returns_404_for_unknown_alias(
         patch.object(
             internal_executions_router.WorkflowsManagementService,
             "resolve_workflow_alias",
-            mock_wf_service.resolve_workflow_alias,
+            AsyncMock(return_value=None),
         ),
-    ):
-        response = client.post(
-            "/internal/workflows/executions",
-            json={"workflow_alias": "nonexistent-alias"},
-        )
-
-    assert response.status_code == status.HTTP_404_NOT_FOUND
-    assert "not found" in response.json()["detail"].lower()
-
-
-@pytest.mark.anyio
-async def test_internal_execute_workflow_returns_400_when_no_id_or_alias(
-    client: TestClient,
-    test_admin_role: Role,
-) -> None:
-    """Test that 400 is returned when neither workflow_id nor workflow_alias provided."""
-    response = client.post(
-        "/internal/workflows/executions",
-        json={},
-    )
-
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert "either workflow_id or workflow_alias" in response.json()["detail"].lower()
-
-
-@pytest.mark.anyio
-async def test_internal_execute_workflow_returns_404_for_missing_definition(
-    client: TestClient,
-    test_admin_role: Role,
-) -> None:
-    """Test that 404 is returned when workflow definition is not found."""
-    workflow_id = "wf_nodefinition"
-
-    mock_defn_service = AsyncMock()
-    mock_defn_service.get_definition_by_workflow_id.return_value = None
-
-    with (
         patch.object(
             internal_executions_router.WorkflowDefinitionsService,
             "__init__",
@@ -430,16 +640,15 @@ async def test_internal_execute_workflow_returns_404_for_missing_definition(
         patch.object(
             internal_executions_router.WorkflowDefinitionsService,
             "get_definition_by_workflow_id",
-            mock_defn_service.get_definition_by_workflow_id,
+            AsyncMock(return_value=None),
         ),
     ):
-        response = client.post(
-            "/internal/workflows/executions",
-            json={"workflow_id": workflow_id},
+        response = action_gateway_client.post(
+            "/internal/workflows/executions", json=payload
         )
 
-    assert response.status_code == status.HTTP_404_NOT_FOUND
-    assert "definition" in response.json()["detail"].lower()
+    assert response.status_code == status_code
+    assert detail_fragment in response.json()["detail"].lower()
 
 
 @pytest.mark.anyio
@@ -466,17 +675,10 @@ async def test_get_workflow_execution_compact_accepts_slash_id(
     mock_svc.get_execution.return_value = mock_execution
     mock_svc.list_workflow_execution_events_compact.return_value = []
 
-    with (
-        patch.object(
-            executions_router.WorkflowExecutionsService,
-            "connect",
-            AsyncMock(return_value=mock_svc),
-        ),
-        patch.object(
-            executions_router,
-            "_list_interactions",
-            AsyncMock(return_value=[]),
-        ),
+    with patch.object(
+        executions_router.WorkflowExecutionsService,
+        "connect",
+        AsyncMock(return_value=mock_svc),
     ):
         response = client.get(f"/workflow-executions/{wf_exec_id}/compact")
 
@@ -486,6 +688,194 @@ async def test_get_workflow_execution_compact_accepts_slash_id(
     assert payload["status"] == "RUNNING"
     mock_svc.get_execution.assert_awaited_once_with(wf_exec_id)
     mock_svc.list_workflow_execution_events_compact.assert_awaited_once_with(wf_exec_id)
+
+
+@pytest.mark.anyio
+async def test_create_workflow_execution_uses_workspace_scoped_definition(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+    wf_exec_id = f"{workflow_id}/exec_abc"
+
+    mock_defn = Mock()
+    mock_defn.content = _workflow_definition_content()
+    mock_defn.registry_lock = None
+
+    mock_get_definition = AsyncMock(return_value=mock_defn)
+    mock_exec_service = AsyncMock()
+    mock_exec_service.create_workflow_execution_nowait = Mock(
+        return_value={
+            "wf_id": workflow_id,
+            "wf_exec_id": wf_exec_id,
+            "message": "Workflow execution started",
+        }
+    )
+
+    with (
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "__init__",
+            lambda self, session, role: None,
+        ),
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "get_definition_by_workflow_id",
+            mock_get_definition,
+        ),
+        patch.object(
+            executions_router.WorkflowExecutionsService,
+            "connect",
+            AsyncMock(return_value=mock_exec_service),
+        ),
+    ):
+        response = client.post(
+            "/workflow-executions",
+            json={"workflow_id": workflow_id, "inputs": {"key": "value"}},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["wf_exec_id"] == wf_exec_id
+    mock_get_definition.assert_awaited_once_with(
+        WorkflowUUID.new(workflow_id), load_relationships=False
+    )
+    mock_exec_service.create_workflow_execution_nowait.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_create_workflow_execution_returns_404_for_unscoped_definition(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Cross-workspace workflow IDs are rejected by the scoped definition lookup."""
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+
+    mock_get_definition = AsyncMock(return_value=None)
+    mock_connect = AsyncMock()
+
+    with (
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "__init__",
+            lambda self, session, role: None,
+        ),
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "get_definition_by_workflow_id",
+            mock_get_definition,
+        ),
+        patch.object(
+            executions_router.WorkflowExecutionsService,
+            "connect",
+            mock_connect,
+        ),
+    ):
+        response = client.post(
+            "/workflow-executions",
+            json={"workflow_id": workflow_id, "inputs": {"key": "value"}},
+        )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["detail"] == "Invalid workflow ID"
+    mock_get_definition.assert_awaited_once_with(
+        WorkflowUUID.new(workflow_id), load_relationships=False
+    )
+    mock_connect.assert_not_awaited()
+
+
+async def _mock_db_session() -> AsyncMock:
+    return await api_app.dependency_overrides[get_async_session]()
+
+
+@pytest.mark.anyio
+async def test_create_workflow_execution_tags_case_task_runs(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+    task_id = uuid.uuid4()
+
+    mock_defn = Mock()
+    mock_defn.content = _workflow_definition_content()
+    mock_defn.registry_lock = None
+    mock_session = await _mock_db_session()
+    mock_session.scalar = AsyncMock(return_value=task_id)
+    mock_exec_service = AsyncMock()
+    mock_exec_service.create_workflow_execution_nowait = Mock(
+        return_value={
+            "wf_id": workflow_id,
+            "wf_exec_id": f"{workflow_id}/exec_abc",
+            "message": "Workflow execution started",
+        }
+    )
+
+    with (
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "__init__",
+            lambda self, session, role: None,
+        ),
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "get_definition_by_workflow_id",
+            AsyncMock(return_value=mock_defn),
+        ),
+        patch.object(
+            executions_router.WorkflowExecutionsService,
+            "connect",
+            AsyncMock(return_value=mock_exec_service),
+        ),
+    ):
+        response = client.post(
+            "/workflow-executions",
+            json={"workflow_id": workflow_id, "case_task_id": str(task_id)},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    call = mock_exec_service.create_workflow_execution_nowait.call_args
+    assert call.kwargs["correlation_id"] == build_case_task_correlation_id(task_id)
+
+
+@pytest.mark.anyio
+async def test_create_workflow_execution_returns_404_for_unknown_case_task(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """A task outside the caller's workspace is not found and nothing starts."""
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+
+    mock_defn = Mock()
+    mock_defn.content = _workflow_definition_content()
+    mock_defn.registry_lock = None
+    mock_session = await _mock_db_session()
+    mock_session.scalar = AsyncMock(return_value=None)
+    mock_connect = AsyncMock()
+
+    with (
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "__init__",
+            lambda self, session, role: None,
+        ),
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "get_definition_by_workflow_id",
+            AsyncMock(return_value=mock_defn),
+        ),
+        patch.object(
+            executions_router.WorkflowExecutionsService,
+            "connect",
+            mock_connect,
+        ),
+    ):
+        response = client.post(
+            "/workflow-executions",
+            json={"workflow_id": workflow_id, "case_task_id": str(uuid.uuid4())},
+        )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["detail"] == "Case task not found"
+    mock_connect.assert_not_awaited()
 
 
 @pytest.mark.anyio

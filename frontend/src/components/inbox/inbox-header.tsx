@@ -7,9 +7,10 @@ import {
   FilterIcon,
   HashIcon,
   LayersIcon,
-  SearchIcon,
+  XIcon,
 } from "lucide-react"
 import type { AgentSessionEntity } from "@/client"
+import { ListHeaderSearch } from "@/components/list-header-search"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -20,7 +21,6 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { Input } from "@/components/ui/input"
 import type { DateFilterValue } from "@/hooks/use-inbox"
 import { cn } from "@/lib/utils"
 
@@ -31,8 +31,11 @@ const ENTITY_TYPE_OPTIONS: Array<{
   { value: "all", label: "All types" },
   { value: "case", label: "Case" },
   { value: "agent_preset", label: "Agent preset" },
+  { value: "agent_preset_builder", label: "Agent preset builder" },
   { value: "workflow", label: "Workflow" },
   { value: "copilot", label: "Copilot" },
+  { value: "approval", label: "Approval" },
+  { value: "external_channel", label: "External channel" },
 ]
 
 const LIMIT_OPTIONS = [
@@ -63,6 +66,8 @@ interface InboxHeaderProps {
   onUpdatedAfterChange: (value: DateFilterValue) => void
   createdAfter: DateFilterValue
   onCreatedAfterChange: (value: DateFilterValue) => void
+  caseId: string | null
+  onClearCaseFilter: () => void
 }
 
 export function InboxHeader({
@@ -76,38 +81,43 @@ export function InboxHeader({
   onUpdatedAfterChange,
   createdAfter,
   onCreatedAfterChange,
+  caseId,
+  onClearCaseFilter,
 }: InboxHeaderProps) {
   // Count only non-default filters (don't count limit since it always has a value)
   const activeFilterCount =
     (entityType !== "all" ? 1 : 0) +
     (updatedAfter !== null ? 1 : 0) +
-    (createdAfter !== null ? 1 : 0)
+    (createdAfter !== null ? 1 : 0) +
+    (caseId ? 1 : 0)
 
   return (
-    <header className="flex h-10 shrink-0 items-center border-b pl-3 pr-4">
-      {/* Left section: Search input with magnifying glass */}
-      <div className="flex items-center gap-3 min-w-0">
-        {/* Match SidebarTrigger dimensions (h-7 w-7) for alignment */}
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center">
-          <SearchIcon className="size-4 text-muted-foreground" />
-        </div>
-        <Input
-          type="text"
-          placeholder="Search sessions..."
-          value={searchQuery}
-          onChange={(e) => onSearchChange(e.target.value)}
-          className={cn(
-            "h-7 w-48 border-none bg-transparent p-0",
-            "text-sm",
-            "shadow-none outline-none",
-            "placeholder:text-muted-foreground",
-            "focus-visible:ring-0 focus-visible:ring-offset-0"
-          )}
-        />
-      </div>
-
-      {/* Middle section: spacer */}
-      <div className="flex-1" />
+    <header className="flex h-10 shrink-0 items-center gap-3 border-b pl-3 pr-4">
+      <ListHeaderSearch
+        placeholder="Search sessions..."
+        value={searchQuery}
+        onChange={(e) => onSearchChange(e.target.value)}
+      >
+        {caseId ? (
+          <div
+            className="flex h-6 max-w-56 items-center gap-1.5 rounded-md border bg-muted/40 px-2 text-xs"
+            title={caseId}
+          >
+            <span className="shrink-0 text-muted-foreground">
+              Filtered by case
+            </span>
+            <span className="truncate font-mono">{caseId.slice(0, 8)}</span>
+            <button
+              type="button"
+              aria-label="Clear case filter"
+              className="ml-0.5 rounded-sm text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
+              onClick={onClearCaseFilter}
+            >
+              <XIcon className="size-3.5" />
+            </button>
+          </div>
+        ) : null}
+      </ListHeaderSearch>
 
       {/* Right section: Filter dropdown */}
       <div className="flex items-center shrink-0">

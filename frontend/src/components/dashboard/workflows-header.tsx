@@ -6,7 +6,6 @@ import {
   ArrowUpIcon,
   CalendarClockIcon,
   CalendarIcon,
-  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -15,7 +14,6 @@ import {
   FolderIcon,
   HistoryIcon,
   ListIcon,
-  SearchIcon,
   TagIcon,
   TypeIcon,
   WebhookIcon,
@@ -26,6 +24,8 @@ import {
   CASE_EVENT_SUGGESTIONS,
   getCaseEventLabel,
 } from "@/components/builder/panel/case-event-suggestions"
+import { ListHeaderSearch } from "@/components/list-header-search"
+import { CheckIndicator } from "@/components/ui/check-indicator"
 import {
   Command,
   CommandEmpty,
@@ -34,7 +34,6 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command"
-import { Input } from "@/components/ui/input"
 import {
   Popover,
   PopoverContent,
@@ -280,18 +279,9 @@ function TagFilterSelect({
                       onChange(nextValue)
                       setOpen(true)
                     }}
-                    className="flex items-center gap-2 text-xs"
+                    className="group flex items-center gap-2 text-xs"
                   >
-                    <div
-                      className={cn(
-                        "flex size-4 shrink-0 items-center justify-center rounded-sm border",
-                        isSelected
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-muted-foreground/40"
-                      )}
-                    >
-                      {isSelected && <Check className="size-3" aria-hidden />}
-                    </div>
+                    <CheckIndicator checked={isSelected} />
                     <div
                       className={cn(
                         "size-2 shrink-0 rounded-full",
@@ -381,18 +371,9 @@ function CaseTriggerFilterSelect({
                       onChange(nextValue)
                       setOpen(true)
                     }}
-                    className="flex items-center gap-2 text-xs"
+                    className="group flex items-center gap-2 text-xs"
                   >
-                    <div
-                      className={cn(
-                        "flex size-4 shrink-0 items-center justify-center rounded-sm border",
-                        isSelected
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : "border-muted-foreground/40"
-                      )}
-                    >
-                      {isSelected && <Check className="size-3" aria-hidden />}
-                    </div>
+                    <CheckIndicator checked={isSelected} />
                     <span className="truncate">{option.label}</span>
                   </CommandItem>
                 )
@@ -564,25 +545,12 @@ export function WorkflowsHeader({
 
   return (
     <div className="shrink-0 border-b">
-      <header className="flex h-10 items-center border-b pl-3 pr-4">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="flex h-7 w-7 shrink-0 items-center justify-center">
-            <SearchIcon className="size-4 text-muted-foreground" />
-          </div>
-          <Input
-            type="text"
-            placeholder="Search workflows..."
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className={cn(
-              "h-7 w-56 border-none bg-transparent p-0",
-              "text-sm",
-              "shadow-none outline-none",
-              "placeholder:text-muted-foreground",
-              "focus-visible:ring-0 focus-visible:ring-offset-0"
-            )}
-          />
-        </div>
+      <header className="flex h-10 items-center gap-3 border-b pl-3 pr-4">
+        <ListHeaderSearch
+          placeholder="Search workflows..."
+          value={searchQuery}
+          onChange={(e) => onSearchChange(e.target.value)}
+        />
 
         <div className="ml-auto flex items-center gap-2">
           <span className="text-xs text-muted-foreground">

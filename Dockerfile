@@ -4,32 +4,55 @@
 FROM debian:bookworm-slim AS nsjail-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Build from specific commit that includes pasta/user_net support
-ENV NSJAIL_COMMIT=b24be32d38a26656568491c2c5fcffa6e77341d6
+# Pin NsJail 4.0 source with the in-process NSTUN policy backend.
+ENV NSJAIL_COMMIT=388b9655a696e88df3185d09e36c0378a8532904
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git gcc g++ make pkg-config bison flex \
     libprotobuf-dev protobuf-compiler libnl-route-3-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+COPY docker/nsjail/nstun-bounded-memory.patch /tmp/nstun-bounded-memory.patch
+
 RUN git clone https://github.com/google/nsjail.git /tmp/nsjail && \
     cd /tmp/nsjail && git checkout "${NSJAIL_COMMIT}" && \
+    git apply --check /tmp/nstun-bounded-memory.patch && \
+    git apply /tmp/nstun-bounded-memory.patch && \
     git submodule update --init --recursive && \
     make -j"$(nproc)" && \
     install -m 0755 nsjail /usr/local/bin/nsjail && \
     rm -rf /tmp/nsjail
 
+COPY docker/loop-device-sync.cc /tmp/loop-device-sync.cc
+
+RUN g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wformat=2 \
+        -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -pie \
+        -Wl,-z,relro,-z,now \
+        /tmp/loop-device-sync.cc -o /usr/local/bin/tracecat-loop-device-sync && \
+    strip /usr/local/bin/tracecat-loop-device-sync && \
+    rm /tmp/loop-device-sync.cc
+
 # ====================
 # Stage 2: Create minimal sandbox rootfs
 # ====================
-FROM node:22.13.1-slim AS node-bin
+FROM node:22.23.4-slim AS node-bin
 FROM python:3.12-slim-bookworm AS sandbox-rootfs
 
 ARG TARGETARCH
 ARG DUCKDB_VERSION=1.4.3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl wget jq iputils-ping && rm -rf /var/lib/apt/lists/*
+    ca-certificates curl wget jq iputils-ping git openssh-client squashfs-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# The slim base ships the stdlib without bytecode, and sandboxes mount this
+# rootfs read-only, so every sandboxed Python process would recompile the
+# stdlib from source. Checked hash-based .pyc files stay valid whatever mtimes
+# the later COPY steps leave on the sources. Python still hashes each source
+# on import, so an image built on this one that patches a stdlib module never
+# runs stale bytecode.
+RUN python -m compileall -q -j0 --invalidation-mode checked-hash \
+    "$(python -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')"
 
 # This rootfs is shared by run_python and agent sandboxes; CLI additions here
 # are intentionally available to both. DuckDB is not available from Bookworm
@@ -87,8 +110,8 @@ RUN set -eu; \
     duckdb --version; \
     test "$(duckdb -csv -noheader -c "SELECT count(*) FROM duckdb_extensions() WHERE extension_name IN ('json', 'httpfs', 'inet', 'fts') AND installed AND loaded;")" = "4"
 
-COPY --from=ghcr.io/astral-sh/uv:0.9.15 /uv /usr/local/bin/uv
-COPY --from=ghcr.io/astral-sh/uv:0.9.15 /uvx /usr/local/bin/uvx
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uvx /usr/local/bin/uvx
 COPY --from=node-bin /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-bin /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
@@ -103,7 +126,8 @@ ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 # ====================
 # Stage 3: Shared base with runtime dependencies
 # ====================
-FROM ghcr.io/astral-sh/uv:0.9.15-python3.12-bookworm-slim AS base
+FROM python:3.12-slim-bookworm AS base
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /uvx /usr/local/bin/
 
 ENV HOST=0.0.0.0 PORT=8000
 
@@ -120,7 +144,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     acl git openssh-client xmlsec1 libmagic1 curl ca-certificates jq \
     libnl-route-3-200 libprotobuf32 libcap2-bin util-linux \
-    passt squashfs-tools \
+    squashfs-tools \
     && apt-get -y upgrade \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -132,15 +156,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # extensions from this directory instead of autoinstalling over the network.
 ENV TRACECAT__DUCKDB_EXTENSION_DIRECTORY=/usr/local/lib/duckdb/extensions
 
-# Allow the non-root executor process to invoke mount/umount when the container
-# runtime grants the needed bounding capabilities. Without these file caps,
-# privileged Docker containers still run apiuser with no effective capabilities.
-RUN chmod u-s /usr/bin/mount /usr/bin/umount && \
-    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/mount && \
-    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/umount
-
-# Copy sandbox rootfs
-COPY --from=sandbox-rootfs /usr /var/lib/tracecat/sandbox-rootfs/usr
+# Copy sandbox rootfs. --chmod=755 normalizes every copied path and drops
+# setuid/setgid bits at copy time; a recursive chmod after the copy would store
+# a second full copy of the rootfs in its own layer.
+COPY --from=sandbox-rootfs --chmod=755 /usr /var/lib/tracecat/sandbox-rootfs/usr
 
 # Expose the single rootfs DuckDB copy to the executor host via symlinks, so the
 # host CLI and the in-process DuckDB Python package work without a second copy
@@ -152,13 +171,13 @@ RUN ln -s /var/lib/tracecat/sandbox-rootfs/usr/local/lib/duckdb /usr/local/lib/d
     ln -s /var/lib/tracecat/sandbox-rootfs/usr/local/bin/duckdb /usr/local/bin/duckdb && \
     jq --version && duckdb --version
 
-COPY --from=sandbox-rootfs /lib /var/lib/tracecat/sandbox-rootfs/lib
-COPY --from=sandbox-rootfs /bin /var/lib/tracecat/sandbox-rootfs/bin
-COPY --from=sandbox-rootfs /sbin /var/lib/tracecat/sandbox-rootfs/sbin
-COPY --from=sandbox-rootfs /etc/passwd /var/lib/tracecat/sandbox-rootfs/etc/passwd
-COPY --from=sandbox-rootfs /etc/group /var/lib/tracecat/sandbox-rootfs/etc/group
-COPY --from=sandbox-rootfs /etc/ssl /var/lib/tracecat/sandbox-rootfs/etc/ssl
-COPY --from=sandbox-rootfs /etc/ca-certificates /var/lib/tracecat/sandbox-rootfs/etc/ca-certificates
+COPY --from=sandbox-rootfs --chmod=755 /lib /var/lib/tracecat/sandbox-rootfs/lib
+COPY --from=sandbox-rootfs --chmod=755 /bin /var/lib/tracecat/sandbox-rootfs/bin
+COPY --from=sandbox-rootfs --chmod=755 /sbin /var/lib/tracecat/sandbox-rootfs/sbin
+COPY --from=sandbox-rootfs --chmod=755 /etc/passwd /var/lib/tracecat/sandbox-rootfs/etc/passwd
+COPY --from=sandbox-rootfs --chmod=755 /etc/group /var/lib/tracecat/sandbox-rootfs/etc/group
+COPY --from=sandbox-rootfs --chmod=755 /etc/ssl /var/lib/tracecat/sandbox-rootfs/etc/ssl
+COPY --from=sandbox-rootfs --chmod=755 /etc/ca-certificates /var/lib/tracecat/sandbox-rootfs/etc/ca-certificates
 RUN install -m 0644 /dev/null /var/lib/tracecat/sandbox-rootfs/etc/resolv.conf && \
     install -m 0644 /dev/null /var/lib/tracecat/sandbox-rootfs/etc/hosts && \
     install -m 0644 /dev/null /var/lib/tracecat/sandbox-rootfs/etc/nsswitch.conf
@@ -179,14 +198,13 @@ RUN mkdir -p /var/lib/tracecat/sandbox-rootfs/tmp \
     /var/lib/tracecat/sandbox-rootfs/home/sandbox \
     /var/lib/tracecat/sandbox-cache/packages \
     /var/lib/tracecat/sandbox-cache/uv-cache && \
-    chmod -R 755 /var/lib/tracecat/sandbox-rootfs && \
     chown -R 1000:1000 /var/lib/tracecat/sandbox-rootfs/work \
         /var/lib/tracecat/sandbox-rootfs/cache \
         /var/lib/tracecat/sandbox-rootfs/packages \
         /var/lib/tracecat/sandbox-rootfs/home/sandbox && \
     chmod 1777 /var/lib/tracecat/sandbox-rootfs/tmp
 
-# Create apiuser for non-root runtime (required for pasta userspace networking)
+# Create apiuser for the non-root runtime.
 RUN groupadd -g 1001 apiuser && useradd -m -u 1001 -g apiuser apiuser && \
     mkdir -p /home/apiuser/.cache/uv /home/apiuser/.cache/s3 /home/apiuser/.cache/tmp /home/apiuser/.local/bin && \
     chown -R apiuser:apiuser /home/apiuser
@@ -194,10 +212,95 @@ RUN groupadd -g 1001 apiuser && useradd -m -u 1001 -g apiuser apiuser && \
 # Create MCP socket directory for apiuser
 RUN mkdir -p /var/run/tracecat && chown 1001:1001 /var/run/tracecat
 
+# Allow the non-root executor process to invoke mount/umount and synchronize
+# kernel-confirmed loop nodes when the runtime grants the needed bounding
+# capabilities. The fixed-purpose sync helper cannot create arbitrary devices.
+COPY --from=nsjail-builder /usr/local/bin/tracecat-loop-device-sync /usr/local/bin/tracecat-loop-device-sync
+
+RUN chmod u-s /usr/bin/mount /usr/bin/umount && \
+    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/mount && \
+    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/umount && \
+    setcap cap_mknod,cap_dac_override,cap_setuid+ep /usr/local/bin/tracecat-loop-device-sync
+
 WORKDIR /app
 
 # ====================
-# Stage 4: Development app
+# Stage 4: Fetch workspace-chat copilot skills
+# ====================
+FROM base AS plugin-skills
+
+ARG TRACECAT_PLUGINS_REF=0140783181f0afcb69961661fa1474402ca46a4e
+ARG TRACECAT_PLUGINS_ARCHIVE_SHA256=408928d337e7330d10fd099d07c818d724def925eb6b77eaf0cb6ace2777f5dd
+
+# Pinned to a tracecat-plugins commit on main. Bump both values when the
+# vendored skills change so the trusted payload is verified before extraction.
+RUN set -eux; \
+    mkdir -p /skills /tmp/tracecat-plugins; \
+    curl -fsSL \
+        "https://github.com/TracecatHQ/tracecat-plugins/archive/${TRACECAT_PLUGINS_REF}.tar.gz" \
+        -o /tmp/tracecat-plugins.tar.gz; \
+    echo "${TRACECAT_PLUGINS_ARCHIVE_SHA256}  /tmp/tracecat-plugins.tar.gz" \
+        | sha256sum -c -; \
+    tar -xzf /tmp/tracecat-plugins.tar.gz \
+        -C /tmp/tracecat-plugins \
+        --strip-components=1; \
+    for skill in \
+        tracecat-workspace-chat \
+        tracecat-automation-best-practices \
+        tracecat-slackbot-best-practices; do \
+        source="/tmp/tracecat-plugins/plugins/tracecat/skills/${skill}"; \
+        test -d "${source}"; \
+        test -f "${source}/SKILL.md"; \
+        cp -a "${source}" /skills/; \
+    done; \
+    test "$(find /skills -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 3; \
+    rm -rf /tmp/tracecat-plugins /tmp/tracecat-plugins.tar.gz
+
+# Workspace Chat reads platform guidance from docs built from this same commit.
+# Keep source structure so docs.json and MDX imports remain useful navigation.
+COPY ./docs /tmp/tracecat-docs
+
+RUN set -eux; \
+    docs_source=/tmp/tracecat-docs; \
+    docs_target=/skills/tracecat-workspace-chat/references/docs; \
+    mkdir -p "${docs_target}"; \
+    cd "${docs_source}"; \
+    find . -type f \( \
+        -name '*.mdx' -o \
+        -name 'docs.json' -o \
+        -path './automations/core-actions/_examples.yaml' -o \
+        -path './automations/core-actions/_manifest.yaml' \
+    \) -exec cp --parents '{}' "${docs_target}" \;; \
+    source_count="$(find "${docs_source}" -type f \( \
+        -name '*.mdx' -o \
+        -name 'docs.json' -o \
+        -path '*/automations/core-actions/_examples.yaml' -o \
+        -path '*/automations/core-actions/_manifest.yaml' \
+    \) | wc -l)"; \
+    target_count="$(find "${docs_target}" -type f | wc -l)"; \
+    test "${source_count}" -gt 0; \
+    test "${source_count}" -eq "${target_count}"; \
+    test -f "${docs_target}/docs.json"; \
+    test -f "${docs_target}/agents/workspace-chat.mdx"; \
+    test -f "${docs_target}/automations/workflows.mdx"; \
+    test -f "${docs_target}/automations/core-actions/_examples.yaml"; \
+    test -f "${docs_target}/automations/core-actions/_manifest.yaml"; \
+    test -z "$(find "${docs_target}" -type f \( \
+        -iname '*.gif' -o -iname '*.jpeg' -o -iname '*.jpg' -o \
+        -iname '*.png' -o -iname '*.svg' -o -iname '*.webp' \
+    \) -print -quit)"; \
+    rm -rf "${docs_source}"
+
+# ====================
+# Stage 5: Prepare development source without bundled docs
+# ====================
+FROM base AS development-source
+
+COPY . /source/
+RUN rm -rf /source/docs
+
+# ====================
+# Stage 6: Development app
 # ====================
 FROM base AS development-app
 
@@ -207,44 +310,42 @@ ENV TMPDIR="/home/apiuser/.cache/tmp" TEMP="/home/apiuser/.cache/tmp" TMP="/home
 RUN chown -R 1001:1001 /var/lib/tracecat/sandbox-cache && \
     chmod -R 755 /var/lib/tracecat/sandbox-cache
 
-# Prime uv cache (as root, before switching user)
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN chown apiuser:apiuser /app
+
+# Switch to the non-root user used in production before installing, so /app
+# never needs a recursive chown (which would store a second copy of the venv).
+USER apiuser
+
+# Install third-party dependencies only, so this layer is reused until uv.lock or
+# pyproject.toml change. --frozen because uv cannot validate the lockfile
+# without workspace member sources; the sync below runs with --locked.
+RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    --mount=type=bind,source=packages,target=packages \
-    uv sync --locked --no-install-project --no-dev --no-editable
+    uv sync --frozen --no-install-workspace --no-dev --no-editable
 
-COPY --chown=apiuser:apiuser . /app/
+COPY --from=development-source --chown=apiuser:apiuser /source/ /app/
+COPY --from=plugin-skills --chown=apiuser:apiuser /skills/ /var/lib/tracecat/copilot-skills/
 
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
-
-# Fix ownership of /app (uv sync creates .venv as root)
-RUN chown -R apiuser:apiuser /app
+RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 uv sync --locked --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/home/apiuser/.local"
 
 RUN mkdir -p /home/apiuser/.local/bin && ln -s $(which uv) /home/apiuser/.local/bin/uv
 
-COPY docker/scripts/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-# Switch to non-root user (matches production, required for pasta userspace networking)
-USER apiuser
-
-ENTRYPOINT ["/app/entrypoint.sh"]
 EXPOSE $PORT
 CMD ["sh", "-c", "python3 -m uvicorn tracecat.api.app:app --host $HOST --port $PORT --reload"]
 
 # ====================
-# Stage 5: Development registry manifest
+# Stage 7: Development registry manifest
 # ====================
 FROM development-app AS development-registry-manifest
 
 RUN /app/.venv/bin/python -m tracecat.registry.sync.prebuild
 
 # ====================
-# Stage 6: Development target
+# Stage 8: Development target
 # ====================
 FROM development-app AS development
 
@@ -253,7 +354,7 @@ FROM development-app AS development
 COPY --from=development-registry-manifest --chown=apiuser:apiuser /app/.registry-artifacts /app/.registry-artifacts
 
 # ====================
-# Stage 7: Test target (development + pytest)
+# Stage 9: Test target (development + pytest)
 # ====================
 FROM development AS test
 
@@ -263,7 +364,7 @@ RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 uv sync 
 CMD ["python", "-m", "pytest"]
 
 # ====================
-# Stage 8: Production app
+# Stage 10: Production app
 # ====================
 FROM base AS production-app
 
@@ -284,19 +385,19 @@ RUN mkdir -p /app/.scripts && chown -R apiuser:apiuser /app
 # Switch to non-root user
 USER apiuser
 
-# Install dependencies as apiuser
+# Install third-party dependencies only, so this layer is reused until uv.lock or
+# pyproject.toml change. --frozen because uv cannot validate the lockfile
+# without workspace member sources; the final sync below runs with --locked.
 RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    --mount=type=bind,source=packages,target=packages \
-    uv sync --locked --no-install-project --no-dev --no-editable
+    uv sync --frozen --no-install-workspace --no-dev --no-editable
 
 COPY --chown=apiuser:apiuser ./tracecat /app/tracecat
 COPY --chown=apiuser:apiuser ./packages /app/packages
+COPY --from=plugin-skills --chown=apiuser:apiuser /skills/ /var/lib/tracecat/copilot-skills/
 COPY --chown=apiuser:apiuser ./pyproject.toml ./uv.lock ./.python-version ./README.md ./LICENSE ./alembic.ini /app/
 COPY --chown=apiuser:apiuser ./alembic /app/alembic
-COPY --chown=apiuser:apiuser docker/scripts/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
 
 RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 \
     uv sync --locked --no-dev --no-editable
@@ -306,14 +407,14 @@ ENV PATH="/app/.venv/bin:/home/apiuser/.local/bin:/usr/local/bin:/usr/bin:/bin"
 RUN ln -sf $(which uv) /home/apiuser/.local/bin/uv
 
 # ====================
-# Stage 9: Production registry manifest
+# Stage 11: Production registry manifest
 # ====================
 FROM production-app AS registry-manifest
 
 RUN /app/.venv/bin/python -m tracecat.registry.sync.prebuild
 
 # ====================
-# Stage 10: Production target
+# Stage 12: Production target
 # ====================
 FROM production-app AS production
 
@@ -325,5 +426,4 @@ COPY --from=registry-manifest --chown=apiuser:apiuser /app/.registry-artifacts /
 RUN nsjail --help > /dev/null 2>&1 && echo "nsjail available"
 
 EXPOSE $PORT
-ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["sh", "-c", "python3 -m uvicorn tracecat.api.app:app --host $HOST --port $PORT"]

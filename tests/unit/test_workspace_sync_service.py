@@ -1,0 +1,3601 @@
+"""Tests for simple workspace sync service behavior."""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import tarfile
+import uuid
+from collections import Counter
+from math import ceil
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+import pytest
+import respx
+from github.GithubException import GithubException, RateLimitExceededException
+
+from tests.support.fake_vcs import FakeVcsServer
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
+from tracecat.cases.enums import CaseEventType
+from tracecat.dsl.common import DSLEntrypoint, DSLInput
+from tracecat.dsl.schemas import ActionStatement
+from tracecat.exceptions import (
+    EntitlementRequired,
+    ScopeDeniedError,
+    TracecatSettingsError,
+    TracecatValidationError,
+)
+from tracecat.feature_flags import FeatureFlag
+from tracecat.git.types import GitUrl
+from tracecat.identifiers.workflow import WorkflowUUID
+from tracecat.logger import logger
+from tracecat.sync import CommitInfo, PullDiagnostic, PullOptions, PushStatus
+from tracecat.vcs.github.app import GitHubAppError
+from tracecat.workflow.store.schemas import (
+    RemoteCaseTrigger,
+    RemoteForm,
+    RemoteWorkflowSchedule,
+)
+from tracecat.workspace_sync.adapters import (
+    AGENT_PRESET_RESOURCE_ADAPTER,
+    SECRET_METADATA_RESOURCE_ADAPTER,
+    VARIABLE_RESOURCE_ADAPTER,
+)
+from tracecat.workspace_sync.enums import SyncResourceType, VcsProvider
+from tracecat.workspace_sync.exceptions import WorkflowExportValidationError
+from tracecat.workspace_sync.schemas import (
+    MANIFEST_FILENAME,
+    AgentPresetResourceSpec,
+    AgentPresetSkillBinding,
+    CaseDropdownResourceSpec,
+    ResourceRef,
+    SecretMetadataResourceSpec,
+    SkillResourceSpec,
+    VariableResourceSpec,
+    WorkflowExportDiagnostic,
+    WorkflowResourceSpec,
+    WorkspaceManifest,
+    WorkspaceManifestResources,
+    WorkspaceProjection,
+    WorkspaceRemoteSnapshot,
+    WorkspaceSpec,
+    WorkspaceSyncExportPreviewRequest,
+    WorkspaceSyncExportRequest,
+)
+from tracecat.workspace_sync.serialization import canonical_json_text
+from tracecat.workspace_sync.service import (
+    WorkspaceSyncService,
+    _table_names,
+)
+from tracecat.workspace_sync.transport import (
+    _GITHUB_TREE_CHUNK_SIZE,
+    GitHubWorkspaceSyncTransport,
+    VcsTreeSnapshot,
+    _git_blob_sha,
+    _git_blob_sha_bytes,
+)
+from tracecat.workspace_sync.types import PreparedSnapshot, SyncCommitConflictError
+from tracecat.workspace_sync.workflow import (
+    serialize_workflow_spec,
+    workflow_source_path,
+    workflow_spec_to_remote,
+    workflow_spec_with_source_workflow_ids,
+)
+
+
+@pytest.fixture
+def sample_dsl() -> DSLInput:
+    return DSLInput(
+        title="Sync me",
+        description="A workflow for workspace sync tests",
+        entrypoint=DSLEntrypoint(ref="start", expects={}),
+        actions=[
+            ActionStatement(
+                ref="start",
+                action="core.transform.passthrough",
+                args={"value": "test"},
+            )
+        ],
+    )
+
+
+@pytest.fixture
+def workspace_sync_service() -> WorkspaceSyncService:
+    session = AsyncMock()
+    session.info = {}
+    transaction = AsyncMock()
+    transaction.__aenter__.return_value = None
+    transaction.__aexit__.return_value = None
+    session.begin_nested = Mock(return_value=transaction)
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-api"],
+    )
+    return WorkspaceSyncService(session=session, role=role)
+
+
+@pytest.mark.anyio
+async def test_pull_does_not_sync_schedules_by_default(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    spec = WorkflowResourceSpec(
+        id="sync-me",
+        alias="sync-me",
+        definition=sample_dsl,
+    )
+    files = {
+        "tracecat.json": canonical_json_text(WorkspaceManifest()),
+        workflow_source_path(spec.id): serialize_workflow_spec(spec),
+    }
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=files,
+    )
+    import_service = AsyncMock()
+    import_service.validate_workflows.return_value = []
+    workspace_sync_service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+    workspace_sync_service._resolve_local_workflow_id = AsyncMock(
+        return_value=WorkflowUUID.new_uuid4()
+    )
+    workspace_sync_service._upsert_mappings = AsyncMock()
+
+    with (
+        patch(
+            "tracecat.workspace_sync.service.vcs_transport_for_provider",
+            return_value=transport,
+        ),
+        patch(
+            "tracecat.workspace_sync.service.WorkflowImportService",
+            return_value=import_service,
+        ),
+    ):
+        result = await workspace_sync_service.pull(
+            options=PullOptions(commit_sha="a" * 40),
+        )
+
+    assert result.success is True
+    import_service.validate_workflows.assert_awaited_once()
+    import_service.import_workflows.assert_awaited_once()
+    assert import_service.import_workflows.call_args.kwargs["sync_schedules"] is False
+
+
+@pytest.mark.anyio
+async def test_pull_dry_run_returns_resource_diffs_without_import(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    source_id = "sync-me"
+    current_dsl = sample_dsl.model_copy(update={"title": "Current title"})
+    incoming_dsl = sample_dsl.model_copy(update={"title": "Incoming title"})
+    current_spec = WorkflowResourceSpec(
+        id=source_id,
+        alias="sync-me",
+        definition=current_dsl,
+    )
+    incoming_spec = WorkflowResourceSpec(
+        id=source_id,
+        alias="sync-me",
+        definition=incoming_dsl,
+    )
+    current_files = _workspace_files(current_spec)
+    incoming_files = _workspace_files(incoming_spec)
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=incoming_files,
+    )
+    import_service = AsyncMock()
+    import_service.validate_workflows.return_value = []
+    workspace_sync_service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+    workspace_sync_service._resolve_local_workflow_id = AsyncMock(
+        return_value=WorkflowUUID.new_uuid4()
+    )
+    workspace_sync_service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(workflows={source_id: current_spec}),
+            files=current_files,
+        )
+    )
+
+    with (
+        patch(
+            "tracecat.workspace_sync.service.vcs_transport_for_provider",
+            return_value=transport,
+        ),
+        patch(
+            "tracecat.workspace_sync.service.WorkflowImportService",
+            return_value=import_service,
+        ),
+    ):
+        result = await workspace_sync_service.pull(
+            options=PullOptions(commit_sha="a" * 40, dry_run=True),
+        )
+
+    assert result.success is True
+    assert result.workflows_imported == 0
+    assert result.resource_diffs is not None
+    assert len(result.resource_diffs) == 1
+    assert result.files == sorted(incoming_files)
+    assert result.resources is not None
+    assert [(resource.name, resource.path) for resource in result.resources] == [
+        ("sync-me", workflow_source_path(source_id))
+    ]
+    diff = result.resource_diffs[0]
+    assert diff.change_type == "modified"
+    assert diff.resource_type == SyncResourceType.WORKFLOW.value
+    assert diff.source_id == source_id
+    assert diff.title == "Incoming title"
+    assert "Current title" in diff.diff
+    assert "Incoming title" in diff.diff
+    import_service.validate_workflows.assert_awaited_once()
+    import_service.import_workflows.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_pull_dry_run_projects_current_workspace_by_target_resource_types(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    source_id = "default/api_token"
+    current_spec = WorkspaceSpec(
+        variables={
+            source_id: VariableResourceSpec(
+                id=source_id,
+                name="api_token",
+                environment="default",
+                description="current",
+            )
+        }
+    )
+    incoming_spec = WorkspaceSpec(
+        variables={
+            source_id: VariableResourceSpec(
+                id=source_id,
+                name="api_token",
+                environment="default",
+                description="incoming",
+            )
+        }
+    )
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=workspace_sync_service._files_from_spec(
+            manifest=WorkspaceManifest(),
+            spec=incoming_spec,
+        ),
+    )
+    import_service = AsyncMock()
+    import_service.validate_workflows.return_value = []
+    workspace_sync_service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+    workspace_sync_service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=current_spec,
+            files=workspace_sync_service._files_from_spec(
+                manifest=WorkspaceManifest(),
+                spec=current_spec,
+            ),
+        )
+    )
+
+    with (
+        patch(
+            "tracecat.workspace_sync.service.vcs_transport_for_provider",
+            return_value=transport,
+        ),
+        patch(
+            "tracecat.workspace_sync.service.WorkflowImportService",
+            return_value=import_service,
+        ),
+    ):
+        result = await workspace_sync_service.pull(
+            options=PullOptions(commit_sha="a" * 40, dry_run=True),
+        )
+
+    assert result.success is True
+    assert result.resource_diffs is not None
+    assert len(result.resource_diffs) == 1
+    diff = result.resource_diffs[0]
+    assert diff.resource_type == SyncResourceType.VARIABLE.value
+    assert diff.title == "api_token"
+    assert "current" in diff.diff
+    assert "incoming" in diff.diff
+    workspace_sync_service.project_workspace.assert_awaited_once()
+    await_args = workspace_sync_service.project_workspace.await_args
+    assert await_args is not None
+    _, kwargs = await_args
+    assert kwargs["create_missing_mappings"] is False
+    assert kwargs["resource_ids"] == {SyncResourceType.VARIABLE: set()}
+    import_service.import_workflows.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_pull_dry_run_ignores_schedule_diff_when_schedule_sync_is_disabled(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    source_id = "sync-me"
+    current_spec = WorkflowResourceSpec(
+        id=source_id,
+        alias="sync-me",
+        definition=sample_dsl,
+    )
+    incoming_spec = current_spec.model_copy(
+        update={"schedules": [RemoteWorkflowSchedule(cron="0 8 * * *")]}
+    )
+    current_files = _workspace_files(current_spec)
+    incoming_files = _workspace_files(incoming_spec)
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=incoming_files,
+    )
+    import_service = AsyncMock()
+    import_service.validate_workflows.return_value = []
+    workspace_sync_service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+    workspace_sync_service._resolve_local_workflow_id = AsyncMock(
+        return_value=WorkflowUUID.new_uuid4()
+    )
+    workspace_sync_service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(workflows={source_id: current_spec}),
+            files=current_files,
+        )
+    )
+
+    with (
+        patch(
+            "tracecat.workspace_sync.service.vcs_transport_for_provider",
+            return_value=transport,
+        ),
+        patch(
+            "tracecat.workspace_sync.service.WorkflowImportService",
+            return_value=import_service,
+        ),
+    ):
+        result = await workspace_sync_service.pull(
+            options=PullOptions(commit_sha="a" * 40, dry_run=True),
+            sync_schedules=False,
+        )
+
+    assert result.success is True
+    assert result.resource_diffs == []
+
+
+@pytest.mark.anyio
+async def test_parse_files_rejects_legacy_workflow_tree_without_manifest(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    source_id = WorkflowUUID.new_uuid4().short()
+
+    snapshot, diagnostics = await workspace_sync_service.parse_files(
+        {
+            workflow_source_path(source_id): _legacy_workflow_yaml(
+                source_id,
+                title="Legacy workflow",
+            )
+        }
+    )
+
+    assert snapshot.spec == WorkspaceSpec()
+    assert len(diagnostics) == 1
+    assert diagnostics[0].details == {"code": "workspace_format_outdated"}
+    assert "new Push" in diagnostics[0].message
+
+
+@pytest.mark.anyio
+async def test_parse_files_rejects_legacy_string_version_manifest(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    source_id = WorkflowUUID.new_uuid4().short()
+
+    snapshot, diagnostics = await workspace_sync_service.parse_files(
+        {
+            MANIFEST_FILENAME: '{"version":"1"}',
+            workflow_source_path(source_id): _legacy_workflow_yaml(
+                source_id,
+                title="Legacy manifest workflow",
+            ),
+        }
+    )
+
+    assert snapshot.spec == WorkspaceSpec()
+    assert len(diagnostics) == 1
+    assert diagnostics[0].details is not None
+    assert "outdated workspace format" in diagnostics[0].details["error"]
+    assert "new Push" in diagnostics[0].details["error"]
+
+
+@pytest.mark.anyio
+async def test_parse_files_accepts_nested_workflow_manifest_root(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    source_id = "qa-nested"
+    workflow_spec = WorkflowResourceSpec(
+        id=source_id,
+        alias="qa-nested",
+        definition=sample_dsl,
+    )
+    manifest = WorkspaceManifest(
+        resources=WorkspaceManifestResources(workflows="sync/workflows/")
+    )
+
+    snapshot, diagnostics = await workspace_sync_service.parse_files(
+        {
+            MANIFEST_FILENAME: canonical_json_text(manifest),
+            f"sync/workflows/{source_id}/definition.yml": serialize_workflow_spec(
+                workflow_spec
+            ),
+        }
+    )
+
+    assert diagnostics == []
+    assert list(snapshot.spec.workflows) == [source_id]
+    assert snapshot.spec.workflows[source_id].alias == "qa-nested"
+
+
+@pytest.mark.anyio
+async def test_resource_ref_without_ids_selects_resource_type(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    resource_ids = await workspace_sync_service._local_ids_from_resource_refs(
+        [
+            ResourceRef(resource_type=SyncResourceType.AGENT_PRESET),
+            ResourceRef(resource_type=SyncResourceType.SKILL),
+        ]
+    )
+
+    assert resource_ids == {
+        SyncResourceType.AGENT_PRESET: set(),
+        SyncResourceType.SKILL: set(),
+    }
+
+
+def test_table_names_collects_explicit_table_reference_fields() -> None:
+    payloads = [
+        {
+            "args": {
+                "table": "qa_indicators",
+                "nested": [
+                    {"table_name": "case_context"},
+                    {"table_slug": "enrichment_cache"},
+                ],
+            }
+        }
+    ]
+
+    assert _table_names(payloads) == {
+        "case_context",
+        "enrichment_cache",
+        "qa_indicators",
+    }
+
+
+def test_table_names_ignores_free_form_string_tokens() -> None:
+    payloads = [
+        {
+            "title": "Escalate customers affected by Okta alert",
+            "args": {
+                "prompt": (
+                    "Find customers mentioned in this alert and compare them "
+                    "against qa_indicators."
+                )
+            },
+        }
+    ]
+
+    assert _table_names(payloads) == set()
+
+
+@pytest.mark.anyio
+async def test_preview_export_counts_resources_without_mutating_mappings(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    spec = WorkspaceSpec(
+        workflows={
+            "wf-1": WorkflowResourceSpec(
+                id="wf-1", alias="wf-1", definition=sample_dsl
+            ),
+            "wf-2": WorkflowResourceSpec(
+                id="wf-2", alias="wf-2", definition=sample_dsl
+            ),
+        }
+    )
+    workspace_sync_service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=spec,
+            files={"b.json": "{}", "a.json": "{}"},
+        )
+    )
+
+    preview = await workspace_sync_service.preview_export_workspace(
+        WorkspaceSyncExportPreviewRequest(
+            resources=[ResourceRef(resource_type=SyncResourceType.WORKFLOW)],
+        )
+    )
+
+    assert preview.resource_counts[SyncResourceType.WORKFLOW.value] == 2
+    assert preview.resource_counts[SyncResourceType.AGENT_PRESET.value] == 0
+    # Files come back sorted for a stable preview payload.
+    assert preview.files == ["a.json", "b.json"]
+    assert [
+        (resource.resource_type, resource.source_id, resource.name, resource.path)
+        for resource in preview.resources
+    ] == [
+        (
+            SyncResourceType.WORKFLOW,
+            "wf-1",
+            "wf-1",
+            "workflows/wf-1/definition.yml",
+        ),
+        (
+            SyncResourceType.WORKFLOW,
+            "wf-2",
+            "wf-2",
+            "workflows/wf-2/definition.yml",
+        ),
+    ]
+    # Preview must never create sync mappings as a side effect.
+    workspace_sync_service.project_workspace.assert_awaited_once()
+    await_args = workspace_sync_service.project_workspace.await_args
+    assert await_args is not None
+    _, kwargs = await_args
+    assert kwargs["create_missing_mappings"] is False
+    assert kwargs["resource_ids"] == {SyncResourceType.WORKFLOW: set()}
+
+
+@pytest.mark.anyio
+async def test_preview_export_reports_resource_diffs_against_compare_ref(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    fake_vcs = FakeVcsServer()
+    git_url = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+    seed_transport = fake_vcs.transport_factory(
+        VcsProvider.GITHUB,
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+    )
+    await seed_transport.write_files(
+        url=git_url,
+        files={
+            MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+            "workflows/remove/definition.yml": "version: 1\n",
+            "workflows/stale/definition.yml": "version: 1\n",
+            "README.md": "# keep me\n",
+        },
+        message="Seed sync branch",
+        branch="sync/workspace",
+        create_pr=False,
+    )
+    service = WorkspaceSyncService(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+        transport_factory=fake_vcs.transport_factory,
+    )
+    service._workspace_git_url = AsyncMock(return_value=git_url)
+    service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(
+                workflows={
+                    "fresh": WorkflowResourceSpec(
+                        id="fresh",
+                        alias="fresh",
+                        definition=sample_dsl,
+                    ),
+                    "stale": WorkflowResourceSpec(
+                        id="stale",
+                        alias="stale",
+                        definition=sample_dsl,
+                    ),
+                }
+            ),
+            files={
+                MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+                "workflows/fresh/definition.yml": "version: 1\n",
+                "workflows/stale/definition.yml": "version: 2\n",
+            },
+        )
+    )
+
+    preview = await service.preview_export_workspace(
+        WorkspaceSyncExportPreviewRequest(compare_ref="sync/workspace")
+    )
+
+    assert [
+        (diff.change_type, diff.source_path, diff.title)
+        for diff in preview.resource_diffs
+    ] == [
+        ("added", "workflows/fresh/definition.yml", "Sync me"),
+        ("deleted", "workflows/remove/definition.yml", None),
+        ("modified", "workflows/stale/definition.yml", "Sync me"),
+    ]
+    assert "README.md" not in {diff.source_path for diff in preview.resource_diffs}
+    assert "+version: 2" in preview.resource_diffs[2].diff
+    assert "-version: 1" in preview.resource_diffs[1].diff
+
+
+@pytest.mark.anyio
+async def test_preview_export_reports_type_wide_deletion_diffs(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    fake_vcs = FakeVcsServer()
+    git_url = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+    seed_transport = fake_vcs.transport_factory(
+        VcsProvider.GITHUB,
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+    )
+    await seed_transport.write_files(
+        url=git_url,
+        files={
+            MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+            "tables/stale/table.yml": "version: 1\n",
+            "workflows/stale/definition.yml": "version: 1\n",
+        },
+        message="Seed sync branch",
+        branch="sync/workspace",
+        create_pr=False,
+    )
+    service = WorkspaceSyncService(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+        transport_factory=fake_vcs.transport_factory,
+    )
+    service._workspace_git_url = AsyncMock(return_value=git_url)
+    service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(),
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+        )
+    )
+
+    preview = await service.preview_export_workspace(
+        WorkspaceSyncExportPreviewRequest(
+            resources=[ResourceRef(resource_type=SyncResourceType.TABLE)],
+            compare_ref="sync/workspace",
+        )
+    )
+
+    assert [
+        (diff.change_type, diff.source_path, diff.title)
+        for diff in preview.resource_diffs
+    ] == [("deleted", "tables/stale/table.yml", None)]
+
+
+@pytest.mark.anyio
+async def test_preview_export_requires_scopes_for_projected_sensitive_metadata() -> (
+    None
+):
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workspace_sync:sync"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=role)
+    service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(
+                variables={
+                    "default/api_token": VariableResourceSpec(
+                        id="default/api_token",
+                        name="api_token",
+                        environment="default",
+                    )
+                },
+                secret_metadata={
+                    "default/vendor_api": SecretMetadataResourceSpec(
+                        id="default/vendor_api",
+                        name="vendor_api",
+                        environment="default",
+                        keys=["TOKEN"],
+                    )
+                },
+            ),
+            files={},
+        )
+    )
+
+    with pytest.raises(ScopeDeniedError) as exc_info:
+        await service.preview_export_workspace(WorkspaceSyncExportPreviewRequest())
+
+    assert set(exc_info.value.missing_scopes) == {"secret:read", "variable:read"}
+
+
+@pytest.mark.anyio
+async def test_mcp_metadata_queries_require_integration_read_before_sql() -> None:
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workspace_sync:sync", "agent:read"}),
+    )
+    session = AsyncMock()
+    service = WorkspaceSyncService(session=session, role=role)
+
+    with pytest.raises(ScopeDeniedError) as export_error:
+        await AGENT_PRESET_RESOURCE_ADAPTER._mcp_integration_hints(
+            service,
+            {str(uuid.uuid4())},
+        )
+    with pytest.raises(ScopeDeniedError) as pull_error:
+        await AGENT_PRESET_RESOURCE_ADAPTER._local_mcp_integrations(service)
+
+    assert export_error.value.missing_scopes == ["integration:read"]
+    assert pull_error.value.missing_scopes == ["integration:read"]
+    session.execute.assert_not_awaited()
+
+
+def test_workflow_export_scope_accepts_legacy_or_workspace_sync_grant() -> None:
+    base_role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workflow:update", "workflow:sync"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=base_role)
+
+    service._require_workflow_export_scope()
+
+    service.role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=base_role.workspace_id,
+        organization_id=base_role.organization_id,
+        scopes=frozenset({"workflow:update", "workspace_sync:sync"}),
+    )
+    service._require_workflow_export_scope()
+
+    service.role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=base_role.workspace_id,
+        organization_id=base_role.organization_id,
+        scopes=frozenset({"workflow:update"}),
+    )
+    with pytest.raises(ScopeDeniedError):
+        service._require_workflow_export_scope()
+
+
+@pytest.mark.anyio
+async def test_workflow_export_allows_projected_dependencies_with_publish_scope(
+    sample_dsl: DSLInput,
+) -> None:
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workflow:update", "workflow:sync"}),
+    )
+    session = AsyncMock()
+    session.add = Mock()
+    service = WorkspaceSyncService(session=session, role=role)
+    workflow_id = WorkflowUUID.new_uuid4()
+    workflow = cast(Any, SimpleNamespace(id=workflow_id, git_sync_branch=None))
+    projection_spec = WorkspaceSpec(
+        workflows={
+            "parent": WorkflowResourceSpec(
+                id="parent",
+                alias="parent",
+                definition=sample_dsl,
+            )
+        },
+        variables={
+            "default/api_token": VariableResourceSpec(
+                id="default/api_token",
+                name="api_token",
+                environment="default",
+            )
+        },
+        secret_metadata={
+            "default/vendor_api": SecretMetadataResourceSpec(
+                id="default/vendor_api",
+                name="vendor_api",
+                environment="default",
+                keys=["TOKEN"],
+            )
+        },
+    )
+    projection_manifest = WorkspaceManifest()
+    projection = WorkspaceProjection(
+        manifest=projection_manifest,
+        spec=projection_spec,
+        files=service._files_from_spec(
+            manifest=projection_manifest,
+            spec=projection_spec,
+        ),
+    )
+    service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+    service.project_workspace = AsyncMock(return_value=projection)
+    transport = AsyncMock()
+    transport.write_files.return_value = CommitInfo(
+        status=PushStatus.COMMITTED,
+        sha="a" * 40,
+        ref="sync/workflow",
+        base_ref="main",
+        pr_url=None,
+        pr_number=None,
+        pr_reused=False,
+        message="Committed workspace sync changes.",
+    )
+
+    with patch(
+        "tracecat.workspace_sync.service.vcs_transport_for_provider",
+        return_value=transport,
+    ):
+        result = await service.export_workflow(
+            workflow=workflow,
+            dsl=sample_dsl,
+            params=WorkspaceSyncExportRequest(
+                message="Publish workflow",
+                branch="sync/workflow",
+                create_pr=False,
+            ),
+        )
+
+    assert result.commit.status is PushStatus.COMMITTED
+    transport.write_files.assert_awaited_once()
+    expected_paths = {
+        MANIFEST_FILENAME,
+        workflow_source_path("parent"),
+        VARIABLE_RESOURCE_ADAPTER.source_path("default/api_token"),
+        SECRET_METADATA_RESOURCE_ADAPTER.source_path("default/vendor_api"),
+    }
+    written_files = transport.write_files.await_args.kwargs["files"]
+    assert set(written_files) == expected_paths
+    assert set(result.files) == expected_paths
+    assert workflow.git_sync_branch == "sync/workflow"
+
+
+def test_sync_operation_scope_accepts_legacy_or_workspace_sync_grant() -> None:
+    base_role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workflow:sync"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=base_role)
+
+    service._require_sync_operation_scope()
+
+    service.role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=base_role.workspace_id,
+        organization_id=base_role.organization_id,
+        scopes=frozenset({"workspace_sync:sync"}),
+    )
+    service._require_sync_operation_scope()
+
+    service.role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=base_role.workspace_id,
+        organization_id=base_role.organization_id,
+        scopes=frozenset(),
+    )
+    with pytest.raises(ScopeDeniedError):
+        service._require_sync_operation_scope()
+
+
+@pytest.mark.parametrize("is_workspace_default", [None, False, True])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_pull_requires_workspace_update_only_for_explicit_default_metadata(
+    is_workspace_default: bool | None,
+    dry_run: bool,
+) -> None:
+    role = Role(
+        type="user",
+        service_id="tracecat-api",
+        user_id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workspace_sync:sync", "agent:create", "agent:update"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=role)
+    spec = WorkspaceSpec(
+        agent_presets={
+            "qa-default": AgentPresetResourceSpec(
+                id="qa-default",
+                slug="qa-default",
+                name="QA default",
+                use_in_chat=True,
+                is_workspace_default=is_workspace_default,
+            )
+        }
+    )
+    if is_workspace_default is not None and not dry_run:
+        with pytest.raises(ScopeDeniedError) as exc_info:
+            service._require_pull_scopes(spec, dry_run=dry_run)
+        assert exc_info.value.missing_scopes == ["workspace:update"]
+    else:
+        service._require_pull_scopes(spec, dry_run=dry_run)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_pull_requires_form_write_scopes_only_to_apply_a_form_block(
+    dry_run: bool,
+    sample_dsl: DSLInput,
+) -> None:
+    """Applying a workflow's ``form:`` block needs form:create and form:update."""
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset(
+            {
+                "workspace_sync:sync",
+                "workflow:read",
+                "workflow:create",
+                "workflow:update",
+            }
+        ),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=role)
+    spec = WorkspaceSpec(
+        workflows={
+            "intake": WorkflowResourceSpec(
+                id="intake", form=RemoteForm(title="Intake"), definition=sample_dsl
+            )
+        }
+    )
+
+    if dry_run:
+        service._require_pull_scopes(spec, dry_run=dry_run)
+    else:
+        with pytest.raises(ScopeDeniedError) as exc_info:
+            service._require_pull_scopes(spec, dry_run=dry_run)
+        assert exc_info.value.missing_scopes == ["form:create", "form:update"]
+
+
+@pytest.mark.anyio
+async def test_preview_export_rejects_missing_skill_head(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    workspace_sync_service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(
+                agent_presets={
+                    "qa-triage": AgentPresetResourceSpec(
+                        id="qa-triage",
+                        slug="qa-triage",
+                        name="QA triage",
+                        skills=[AgentPresetSkillBinding(slug="qa-enrichment-skill")],
+                    )
+                },
+                skills={},
+            ),
+            files={},
+        )
+    )
+
+    with pytest.raises(TracecatValidationError, match="missing skill slug"):
+        await workspace_sync_service.preview_export_workspace(
+            WorkspaceSyncExportPreviewRequest()
+        )
+
+
+@pytest.mark.anyio
+async def test_pull_dry_run_requires_read_scopes_for_incoming_resources() -> None:
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workspace_sync:sync"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=role)
+    incoming_spec = WorkspaceSpec(
+        variables={
+            "default/api_token": VariableResourceSpec(
+                id="default/api_token",
+                name="api_token",
+                environment="default",
+            )
+        },
+        secret_metadata={
+            "default/vendor_api": SecretMetadataResourceSpec(
+                id="default/vendor_api",
+                name="vendor_api",
+                environment="default",
+                keys=["TOKEN"],
+            )
+        },
+    )
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=service._files_from_spec(
+            manifest=WorkspaceManifest(),
+            spec=incoming_spec,
+        ),
+    )
+    service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+    service.project_workspace = AsyncMock()
+
+    with (
+        patch(
+            "tracecat.workspace_sync.service.vcs_transport_for_provider",
+            return_value=transport,
+        ),
+        pytest.raises(ScopeDeniedError) as exc_info,
+    ):
+        await service.pull(options=PullOptions(commit_sha="a" * 40, dry_run=True))
+
+    assert set(exc_info.value.missing_scopes) == {"secret:read", "variable:read"}
+    service.project_workspace.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_pull_apply_requires_create_scopes_for_incoming_resources() -> None:
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workspace_sync:sync", "secret:update", "variable:update"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=role)
+    incoming_spec = WorkspaceSpec(
+        variables={
+            "default/api_token": VariableResourceSpec(
+                id="default/api_token",
+                name="api_token",
+                environment="default",
+            )
+        },
+        secret_metadata={
+            "default/vendor_api": SecretMetadataResourceSpec(
+                id="default/vendor_api",
+                name="vendor_api",
+                environment="default",
+                keys=["TOKEN"],
+            )
+        },
+    )
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=service._files_from_spec(
+            manifest=WorkspaceManifest(),
+            spec=incoming_spec,
+        ),
+    )
+    service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+
+    with (
+        patch(
+            "tracecat.workspace_sync.service.vcs_transport_for_provider",
+            return_value=transport,
+        ),
+        pytest.raises(ScopeDeniedError) as exc_info,
+    ):
+        await service.pull(options=PullOptions(commit_sha="a" * 40))
+
+    assert set(exc_info.value.missing_scopes) == {"secret:create", "variable:create"}
+
+
+@pytest.mark.anyio
+async def test_pull_blocks_entitled_resource_without_entitlement() -> None:
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workspace_sync:sync", "case:update"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=role)
+    service.has_entitlement = AsyncMock(return_value=False)
+    incoming_spec = WorkspaceSpec(
+        case_dropdowns={
+            "resolution_reason": CaseDropdownResourceSpec(
+                id="resolution_reason",
+                name="Resolution reason",
+            )
+        },
+    )
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=service._files_from_spec(
+            manifest=WorkspaceManifest(),
+            spec=incoming_spec,
+        ),
+    )
+    service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+
+    with (
+        patch(
+            "tracecat.workspace_sync.service.vcs_transport_for_provider",
+            return_value=transport,
+        ),
+        pytest.raises(EntitlementRequired) as exc_info,
+    ):
+        await service.pull(options=PullOptions(commit_sha="a" * 40))
+
+    assert exc_info.value.entitlement == "case_addons"
+
+
+@pytest.mark.anyio
+async def test_pull_allows_workflow_case_trigger_without_entitlement(
+    sample_dsl: DSLInput,
+) -> None:
+    role = Role(
+        type="service",
+        service_id="tracecat-api",
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        scopes=frozenset({"workspace_sync:sync", "workflow:read"}),
+    )
+    service = WorkspaceSyncService(session=AsyncMock(), role=role)
+    service.has_entitlement = AsyncMock(return_value=False)
+    service._resource_diffs_for_pull = AsyncMock(return_value=[])
+    service._validate_workflow_import = AsyncMock(return_value=[])
+    incoming_spec = WorkspaceSpec(
+        workflows={
+            "case-workflow": WorkflowResourceSpec(
+                id="case-workflow",
+                alias="case-workflow",
+                case_trigger=RemoteCaseTrigger(
+                    status="online",
+                    event_types=[CaseEventType.CASE_CREATED],
+                    tag_filters=[],
+                ),
+                definition=sample_dsl,
+            )
+        },
+    )
+    transport = AsyncMock()
+    transport.read_files.return_value = VcsTreeSnapshot(
+        commit_sha="a" * 40,
+        tree_sha="tree-sha",
+        files=service._files_from_spec(
+            manifest=WorkspaceManifest(),
+            spec=incoming_spec,
+        ),
+    )
+    service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="tracecat", repo="sync")
+    )
+
+    with patch(
+        "tracecat.workspace_sync.service.vcs_transport_for_provider",
+        return_value=transport,
+    ):
+        result = await service.pull(
+            options=PullOptions(commit_sha="a" * 40, dry_run=True)
+        )
+
+    assert result.success is True
+    assert result.resource_counts is not None
+    assert result.resource_counts[SyncResourceType.WORKFLOW].found == 1
+    assert result.resource_counts[SyncResourceType.WORKFLOW].imported == 0
+
+
+@pytest.mark.anyio
+async def test_full_export_skips_unentitled_resource_types() -> None:
+    service = WorkspaceSyncService(
+        session=AsyncMock(),
+        role=Role(
+            type="service",
+            service_id="tracecat-api",
+            workspace_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            scopes=frozenset({"workspace_sync:sync"}),
+        ),
+    )
+    service.has_entitlement = AsyncMock(return_value=False)
+
+    resource_types = await service._entitled_non_workflow_types(
+        full_workspace_export=True,
+        selection=None,
+    )
+
+    assert SyncResourceType.CASE_DROPDOWN not in resource_types
+    assert SyncResourceType.CASE_DURATION not in resource_types
+    assert SyncResourceType.CASE_FIELD in resource_types
+
+
+@pytest.mark.anyio
+async def test_selected_export_blocks_unentitled_resource_type() -> None:
+    service = WorkspaceSyncService(
+        session=AsyncMock(),
+        role=Role(
+            type="service",
+            service_id="tracecat-api",
+            workspace_id=uuid.uuid4(),
+            organization_id=uuid.uuid4(),
+            scopes=frozenset({"workspace_sync:sync"}),
+        ),
+    )
+    service.has_entitlement = AsyncMock(return_value=False)
+
+    with pytest.raises(EntitlementRequired) as exc_info:
+        await service._entitled_non_workflow_types(
+            full_workspace_export=False,
+            selection={SyncResourceType.CASE_DROPDOWN: set()},
+        )
+
+    assert exc_info.value.entitlement == "case_addons"
+
+
+@pytest.mark.anyio
+async def test_selected_workflow_export_includes_workflow_id_children(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    parent_id = WorkflowUUID.new_uuid4()
+    child_id = WorkflowUUID.new_uuid4()
+    parent = cast(Any, SimpleNamespace(id=parent_id, alias=None))
+    child = cast(Any, SimpleNamespace(id=child_id, alias=None))
+    parent_dsl = DSLInput(
+        title="Parent",
+        description="Calls a child workflow by id",
+        entrypoint=DSLEntrypoint(ref="run_child", expects={}),
+        actions=[
+            ActionStatement(
+                ref="run_child",
+                action="core.workflow.execute",
+                args={"workflow_id": child_id.short()},
+            )
+        ],
+    )
+
+    async def get_workflow_dsl(workflow: Any, **_: Any) -> DSLInput:
+        return parent_dsl if workflow.id == parent_id else sample_dsl
+
+    get_workflow_dsl_mock = AsyncMock(side_effect=get_workflow_dsl)
+    with (
+        patch.object(
+            workspace_sync_service,
+            "_list_projectable_workflows",
+            AsyncMock(return_value=[parent, child]),
+        ),
+        patch.object(
+            workspace_sync_service,
+            "_get_workflow_dsl",
+            get_workflow_dsl_mock,
+        ),
+    ):
+        closure = await workspace_sync_service._projectable_workflow_closure(
+            {SyncResourceType.WORKFLOW: {parent_id}}
+        )
+
+    assert [workflow.id for workflow in closure.workflows] == [parent_id, child_id]
+    assert closure.dsl_by_id == {parent_id: parent_dsl, child_id: sample_dsl}
+    assert get_workflow_dsl_mock.await_count == 2
+
+
+def test_workflow_spec_to_remote_rewrites_child_workflow_id_references() -> None:
+    source_parent_id = WorkflowUUID.new_uuid4()
+    source_child_id = WorkflowUUID.new_uuid4()
+    local_parent_id = WorkflowUUID.new_uuid4()
+    local_child_id = WorkflowUUID.new_uuid4()
+    spec = WorkflowResourceSpec(
+        id=source_parent_id.short(),
+        alias="parent",
+        definition=DSLInput(
+            title="Parent",
+            description="Calls a child workflow by source id",
+            entrypoint=DSLEntrypoint(ref="run_child", expects={}),
+            actions=[
+                ActionStatement(
+                    ref="run_child",
+                    action="core.workflow.execute",
+                    args={"workflow_id": source_child_id.short()},
+                )
+            ],
+        ),
+    )
+
+    remote = workflow_spec_to_remote(
+        spec,
+        local_workflow_id=local_parent_id,
+        local_workflow_ids={
+            source_parent_id.short(): local_parent_id,
+            source_child_id.short(): local_child_id,
+        },
+    )
+
+    assert remote.definition.actions[0].args["workflow_id"] == local_child_id.short()
+    assert spec.definition.actions[0].args["workflow_id"] == source_child_id.short()
+
+
+def test_workflow_spec_export_rewrites_local_child_workflow_id_references() -> None:
+    local_child_id = WorkflowUUID.new_uuid4()
+    spec = WorkflowResourceSpec(
+        id="parent",
+        alias="parent",
+        definition=DSLInput(
+            title="Parent",
+            description="Calls a child workflow by local id",
+            entrypoint=DSLEntrypoint(ref="run_child", expects={}),
+            actions=[
+                ActionStatement(
+                    ref="run_child",
+                    action="core.workflow.execute",
+                    args={"workflow_id": local_child_id.short()},
+                )
+            ],
+        ),
+    )
+
+    exported = workflow_spec_with_source_workflow_ids(
+        spec,
+        source_workflow_ids={local_child_id: "child"},
+    )
+
+    assert exported.definition.actions[0].args["workflow_id"] == "child"
+    assert spec.definition.actions[0].args["workflow_id"] == local_child_id.short()
+
+
+@pytest.mark.anyio
+async def test_export_workspace_commits_mapping_changes(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    projection = WorkspaceProjection(
+        manifest=WorkspaceManifest(),
+        spec=WorkspaceSpec(),
+        files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+    )
+    transport = AsyncMock()
+    transport.write_files.return_value = CommitInfo(
+        status=PushStatus.COMMITTED,
+        sha="b" * 40,
+        ref="sync/workspace",
+        base_ref="main",
+        pr_url=None,
+        pr_number=None,
+        pr_reused=False,
+        message="Committed workspace sync changes.",
+    )
+    workspace_sync_service._workspace_git_url = AsyncMock(
+        return_value=GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+    )
+    workspace_sync_service.project_workspace = AsyncMock(return_value=projection)
+
+    with patch(
+        "tracecat.workspace_sync.service.vcs_transport_for_provider",
+        return_value=transport,
+    ):
+        result = await workspace_sync_service.export_workspace(
+            WorkspaceSyncExportRequest(
+                message="Push workspace",
+                branch="sync/workspace",
+                create_pr=True,
+            )
+        )
+
+    assert result.files == [MANIFEST_FILENAME]
+    cast(AsyncMock, workspace_sync_service.session.commit).assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_gitlab_export_uses_gitlab_transport_and_mapping_context(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    projection = WorkspaceProjection(
+        manifest=WorkspaceManifest(),
+        spec=WorkspaceSpec(),
+        files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+    )
+    transport = AsyncMock()
+    transport.write_files.return_value = CommitInfo(
+        status=PushStatus.COMMITTED,
+        sha="c" * 40,
+        ref="sync/workspace",
+        base_ref="main",
+        pr_url=None,
+        pr_number=None,
+        pr_reused=False,
+        message="Committed workspace sync changes.",
+    )
+    providers_seen: list[VcsProvider] = []
+    service = WorkspaceSyncService(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+        provider=VcsProvider.GITLAB,
+    )
+
+    async def workspace_git_url() -> GitUrl:
+        providers_seen.append(service._mapping_provider)
+        return GitUrl(
+            host="gitlab.example.test",
+            org="TracecatHQ/platform",
+            repo="sync",
+        )
+
+    async def project_workspace(**_kwargs: Any) -> WorkspaceProjection:
+        # The provider is fixed at construction, so mapping reads stay on GitLab.
+        assert service._mapping_provider is VcsProvider.GITLAB
+        return projection
+
+    def transport_factory(
+        provider: VcsProvider,
+        *,
+        session: Any,
+        role: Any,
+    ) -> Any:
+        del session, role
+        providers_seen.append(provider)
+        return transport
+
+    service._workspace_git_url = workspace_git_url
+    service.project_workspace = project_workspace
+    service._transport_factory = transport_factory
+
+    result = await service.export_workspace(
+        WorkspaceSyncExportRequest(
+            message="Push workspace",
+            branch="sync/workspace",
+            create_pr=True,
+        )
+    )
+
+    assert result.files == [MANIFEST_FILENAME]
+    assert providers_seen == [VcsProvider.GITLAB, VcsProvider.GITLAB]
+    assert service._mapping_provider is VcsProvider.GITLAB
+
+
+@pytest.mark.anyio
+async def test_for_workspace_rejects_malformed_git_provider(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    workspace = SimpleNamespace(settings={"git_provider": "gitlab-self-managed"})
+    workspace_service = AsyncMock()
+    workspace_service.get_workspace.return_value = workspace
+
+    with patch(
+        "tracecat.workspace_sync.service.WorkspaceService",
+        return_value=workspace_service,
+    ):
+        with pytest.raises(TracecatSettingsError) as exc_info:
+            await WorkspaceSyncService.for_workspace(
+                session=workspace_sync_service.session,
+                role=workspace_sync_service.role,
+            )
+
+    assert "Unsupported Git provider configured" in str(exc_info.value)
+    workspace_service.get_workspace.assert_awaited_once_with(
+        workspace_sync_service.role.workspace_id
+    )
+
+
+@pytest.mark.anyio
+async def test_full_export_deletes_stale_sync_files(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    fake_vcs = FakeVcsServer()
+    git_url = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+    await _seed_fake_sync_branch(
+        fake_vcs,
+        git_url=git_url,
+        branch="sync/workspace",
+    )
+    service = WorkspaceSyncService(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+        transport_factory=fake_vcs.transport_factory,
+    )
+    service._workspace_git_url = AsyncMock(return_value=git_url)
+    service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(),
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+        )
+    )
+
+    result = await service.export_workspace(
+        WorkspaceSyncExportRequest(
+            message="Push full workspace",
+            branch="sync/workspace",
+            create_pr=False,
+        )
+    )
+
+    assert result.commit.status is PushStatus.COMMITTED
+    assert result.commit.sha is not None
+    files = fake_vcs.repo_files(git_url, ref=result.commit.sha)
+    assert "workflows/stale/definition.yml" not in files
+    assert files["README.md"] == "# keep me\n"
+
+
+@pytest.mark.anyio
+async def test_selected_export_preserves_unselected_sync_files(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    fake_vcs = FakeVcsServer()
+    git_url = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+    await _seed_fake_sync_branch(
+        fake_vcs,
+        git_url=git_url,
+        branch="sync/workspace",
+    )
+    service = WorkspaceSyncService(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+        transport_factory=fake_vcs.transport_factory,
+    )
+    service._workspace_git_url = AsyncMock(return_value=git_url)
+    service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(),
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+        )
+    )
+
+    result = await service.export_workspace(
+        WorkspaceSyncExportRequest(
+            message="Push selected tables",
+            branch="sync/workspace",
+            create_pr=False,
+            resources=[ResourceRef(resource_type=SyncResourceType.TABLE)],
+        )
+    )
+
+    assert result.commit.status is PushStatus.NO_OP
+    files = fake_vcs.repo_files(git_url, ref="sync/workspace")
+    assert "workflows/stale/definition.yml" in files
+
+
+@pytest.mark.anyio
+async def test_type_wide_export_deletes_stale_files_for_selected_resource_type(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    fake_vcs = FakeVcsServer()
+    git_url = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+    seed_transport = fake_vcs.transport_factory(
+        VcsProvider.GITHUB,
+        session=AsyncMock(),
+        role=AsyncMock(),
+    )
+    await seed_transport.write_files(
+        url=git_url,
+        files={
+            MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+            "tables/stale/table.yml": "version: 1\n",
+            "workflows/stale/definition.yml": "version: 1\n",
+        },
+        message="Seed sync branch",
+        branch="sync/workspace",
+        create_pr=False,
+    )
+    service = WorkspaceSyncService(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+        transport_factory=fake_vcs.transport_factory,
+    )
+    service._workspace_git_url = AsyncMock(return_value=git_url)
+    service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(),
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+        )
+    )
+
+    result = await service.export_workspace(
+        WorkspaceSyncExportRequest(
+            message="Push selected tables",
+            branch="sync/workspace",
+            create_pr=False,
+            resources=[ResourceRef(resource_type=SyncResourceType.TABLE)],
+        )
+    )
+
+    assert result.commit.status is PushStatus.COMMITTED
+    assert result.commit.sha is not None
+    files = fake_vcs.repo_files(git_url, ref=result.commit.sha)
+    assert "tables/stale/table.yml" not in files
+    assert "workflows/stale/definition.yml" in files
+
+
+@pytest.mark.anyio
+async def test_selected_export_deletes_stale_companion_files_under_selected_resource(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    fake_vcs = FakeVcsServer()
+    git_url = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+    seed_transport = fake_vcs.transport_factory(
+        VcsProvider.GITHUB,
+        session=AsyncMock(),
+        role=AsyncMock(),
+    )
+    await seed_transport.write_files(
+        url=git_url,
+        files={
+            MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+            "skills/qa-enrichment-skill/skill.yml": "version: 1\n",
+            "skills/qa-enrichment-skill/versions/1.yml": "old version\n",
+            "skills/unselected-skill/skill.yml": "version: 1\n",
+        },
+        message="Seed sync branch",
+        branch="sync/workspace",
+        create_pr=False,
+    )
+    service = WorkspaceSyncService(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+        transport_factory=fake_vcs.transport_factory,
+    )
+    service._workspace_git_url = AsyncMock(return_value=git_url)
+    service.project_workspace = AsyncMock(
+        return_value=WorkspaceProjection(
+            manifest=WorkspaceManifest(),
+            spec=WorkspaceSpec(
+                skills={
+                    "qa-enrichment-skill": SkillResourceSpec(
+                        id="qa-enrichment-skill",
+                        slug="qa-enrichment-skill",
+                        name="QA enrichment skill",
+                    )
+                }
+            ),
+            files={
+                MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+                "skills/qa-enrichment-skill/skill.yml": "version: 1\nname: current\n",
+            },
+        )
+    )
+
+    result = await service.export_workspace(
+        WorkspaceSyncExportRequest(
+            message="Push selected skill",
+            branch="sync/workspace",
+            create_pr=False,
+            resources=[ResourceRef(resource_type=SyncResourceType.SKILL)],
+        )
+    )
+
+    assert result.commit.status is PushStatus.COMMITTED
+    assert result.commit.sha is not None
+    files = fake_vcs.repo_files(git_url, ref=result.commit.sha)
+    assert "skills/qa-enrichment-skill/versions/1.yml" not in files
+    assert "skills/unselected-skill/skill.yml" in files
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [None, 404, 403, 500])
+async def test_github_branch_lookup_preserves_api_failures(
+    workspace_sync_service: WorkspaceSyncService, status: int | None
+) -> None:
+    repo = Mock()
+    if status is not None:
+        repo.get_branch.side_effect = GithubException(status, {"message": "Synthetic"})
+    client = Mock()
+    client.get_repo.return_value = repo
+    transport = GitHubWorkspaceSyncTransport(
+        session=workspace_sync_service.session, role=workspace_sync_service.role
+    )
+    with patch(
+        "tracecat.workspace_sync.transport.GitHubAppService.get_github_client_for_repo",
+        AsyncMock(return_value=client),
+    ):
+        if status in (403, 500):
+            with pytest.raises(GitHubAppError):
+                await transport.branch_exists(
+                    url=GitUrl(host="github.com", org="example", repo="sync"),
+                    branch="sync/example",
+                )
+        else:
+            assert await transport.branch_exists(
+                url=GitUrl(host="github.com", org="example", repo="sync"),
+                branch="sync/example",
+            ) is (status is None)
+    repo.get_branch.assert_called_once_with("sync/example")
+    repo.get_branches.assert_not_called()
+    client.close.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_github_write_files_noop_skips_pr_for_branch_without_commits(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    files = {MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())}
+    repo = _FakeGitHubRepo(
+        files=files,
+        branch_exists=False,
+        ahead_by=0,
+    )
+
+    result = await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files=files,
+    )
+
+    assert result.status is PushStatus.NO_OP
+    assert result.pr_url is None
+    assert repo.created_refs == []
+    assert repo.compare_calls == []
+    assert repo.call_counts["get_contents"] == 0
+    assert repo.call_counts["create_git_blob"] == 0
+    assert repo.call_counts["get_git_tree"] == 1
+    assert repo.call_counts["create_git_tree"] == 0
+    assert repo.call_counts["ref.edit"] == 0
+    repo.create_pull.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_github_write_files_noop_reuses_existing_pr_for_branch_with_commits(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    files = {MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())}
+    repo = _FakeGitHubRepo(
+        files=files,
+        branch_exists=True,
+        ahead_by=1,
+        existing_pr=SimpleNamespace(
+            html_url="https://github.com/TracecatHQ/sync/pull/7",
+            number=7,
+        ),
+    )
+
+    result = await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files=files,
+    )
+
+    assert result.status is PushStatus.NO_OP
+    assert result.pr_url == "https://github.com/TracecatHQ/sync/pull/7"
+    assert result.pr_number == 7
+    assert result.pr_reused is True
+    assert repo.compare_calls == [("main", "sync/agents-1")]
+
+
+@pytest.mark.anyio
+async def test_github_write_files_rejects_pr_for_base_branch(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    files = {MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())}
+    repo = _FakeGitHubRepo(
+        files={},
+        branch_exists=True,
+        ahead_by=0,
+    )
+
+    with pytest.raises(TracecatValidationError, match="non-base branch"):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files=files,
+            branch="main",
+        )
+
+    assert repo.blobs == []
+    assert repo.trees == []
+    assert repo.commits == []
+    repo.create_pull.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_github_write_files_uses_tree_sha_for_stale_path_scan(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    files = {MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())}
+    repo = _FakeGitHubRepo(
+        files={
+            MANIFEST_FILENAME: "{}\n",
+            "workflows/stale/definition.yml": "version: 1\n",
+        },
+        branch_exists=True,
+        ahead_by=0,
+    )
+
+    result = await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files=files,
+        create_pr=False,
+        delete_missing_paths_under=("workflows",),
+    )
+
+    assert result.status is PushStatus.COMMITTED
+    assert repo.get_git_tree_calls == [f"tree-{'a' * 40}"]
+    assert len(repo.trees) == 1
+    assert [
+        cast(Any, element)._identity["path"] for element in repo.trees[0].elements
+    ] == [MANIFEST_FILENAME, "workflows/stale/definition.yml"]
+    assert repo.final_files == files
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_sha"),
+    [
+        pytest.param(
+            "",
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+            id="empty",
+        ),
+        pytest.param(
+            "hello\n",
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+            id="ascii",
+        ),
+        pytest.param(
+            "café ☕\n",
+            "df113425d6f29a3f8cfb2ca897bebf8703e56d20",
+            id="multibyte_utf8",
+        ),
+    ],
+)
+def test_git_blob_sha_matches_git_hash_object(content: str, expected_sha: str) -> None:
+    assert _git_blob_sha(content) == expected_sha
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("unchanged_file_count", "expected_tree_entry_count"),
+    [
+        pytest.param(0, 807, id="all_files_changed"),
+        pytest.param(657, 150, id="only_150_files_changed"),
+    ],
+)
+async def test_github_write_files_builds_complete_tree_delta_for_large_projection(
+    workspace_sync_service: WorkspaceSyncService,
+    unchanged_file_count: int,
+    expected_tree_entry_count: int,
+) -> None:
+    files = {
+        f"workflows/generated-{index:04d}/definition.yml": (
+            f"version: 1\nid: generated-{index:04d}\n"
+        )
+        for index in range(806)
+    }
+    files[MANIFEST_FILENAME] = canonical_json_text(WorkspaceManifest())
+    unchanged_paths = set(sorted(files)[:unchanged_file_count])
+    repo = _FakeGitHubRepo(
+        files={path: files[path] for path in unchanged_paths},
+        branch_exists=True,
+        ahead_by=0,
+    )
+
+    result = await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files=files,
+        create_pr=False,
+    )
+
+    expected_changed_paths = set(files) - unchanged_paths
+    assert result.status is PushStatus.COMMITTED
+    assert len(files) == 807
+    assert len(expected_changed_paths) == expected_tree_entry_count
+    assert repo.call_counts["get_contents"] == 0
+    assert repo.call_counts["create_git_blob"] == 0
+    assert repo.call_counts["get_git_tree"] == 1
+    assert repo.call_counts["create_git_tree"] == ceil(
+        expected_tree_entry_count / _GITHUB_TREE_CHUNK_SIZE
+    )
+    assert repo.call_counts["ref.edit"] == 1
+    assert len(repo.trees) == ceil(expected_tree_entry_count / _GITHUB_TREE_CHUNK_SIZE)
+    inline_entries = [
+        cast(Any, element)._identity for tree in repo.trees for element in tree.elements
+    ]
+    assert {entry["path"] for entry in inline_entries} == expected_changed_paths
+    assert [entry["path"] for entry in inline_entries] == sorted(expected_changed_paths)
+    assert all("content" in entry and "sha" not in entry for entry in inline_entries)
+    assert unchanged_paths.isdisjoint(entry["path"] for entry in inline_entries)
+    assert repo.final_files == files
+
+
+@pytest.mark.anyio
+async def test_github_write_files_truncated_tree_rewrites_all_and_skips_deletions(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    sync_logger = Mock()
+    files = {
+        MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+        "workflows/current/definition.yml": "version: 1\n",
+    }
+    stale_path = "workflows/stale/definition.yml"
+    repo = _FakeGitHubRepo(
+        files={**files, stale_path: "version: 1\n"},
+        branch_exists=True,
+        ahead_by=0,
+        tree_truncated=True,
+    )
+
+    result = await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files=files,
+        create_pr=False,
+        delete_missing_paths_under=("workflows",),
+        logger=sync_logger,
+    )
+
+    assert result.status is PushStatus.COMMITTED
+    assert repo.call_counts["get_git_tree"] == 1
+    assert repo.call_counts["create_git_tree"] == 1
+    identities = [cast(Any, element)._identity for element in repo.trees[0].elements]
+    assert {identity["path"] for identity in identities} == set(files)
+    assert all(
+        "content" in identity and "sha" not in identity for identity in identities
+    )
+    assert repo.final_files == {**files, stale_path: "version: 1\n"}
+    sync_logger.warning.assert_called_once()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status", "message", "branch_exists", "retried_call"),
+    [
+        pytest.param(403, "Request blocked", True, "create_git_tree", id="tree-403"),
+        pytest.param(429, "Too many requests", True, "create_git_tree", id="tree-429"),
+        pytest.param(
+            403, "Request blocked", False, "create_git_ref", id="branch-creation-403"
+        ),
+    ],
+)
+async def test_github_write_files_retries_with_retry_after(
+    workspace_sync_service: WorkspaceSyncService,
+    status: int,
+    message: str,
+    branch_exists: bool,
+    retried_call: str,
+) -> None:
+    retry_error = GithubException(
+        status=status,
+        data={"message": message},
+        headers={"Retry-After": "0.25"},
+    )
+    repo = _FakeGitHubRepo(
+        files={},
+        branch_exists=branch_exists,
+        ahead_by=0,
+        create_git_tree_errors=(
+            [retry_error] if retried_call == "create_git_tree" else None
+        ),
+        create_git_ref_errors=[retry_error]
+        if retried_call == "create_git_ref"
+        else None,
+    )
+
+    with patch(
+        "tracecat.workspace_sync.transport.asyncio.sleep", new_callable=AsyncMock
+    ) as sleep:
+        result = await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+            create_pr=False,
+        )
+
+    assert result.status is PushStatus.COMMITTED
+    sleep.assert_awaited_once_with(0.25)
+    assert repo.call_counts[retried_call] == 2
+    if not branch_exists:
+        assert len(repo.created_refs) == 1
+    # A new branch is created at the final commit without a second ref update.
+    assert repo.call_counts["ref.edit"] == int(branch_exists)
+
+
+@pytest.mark.anyio
+async def test_github_write_files_reraises_nonpositive_retry_after(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    retry_error = GithubException(
+        status=403,
+        data={"message": "Request blocked"},
+        headers={"Retry-After": "0"},
+    )
+    repo = _FakeGitHubRepo(
+        files={},
+        branch_exists=True,
+        ahead_by=0,
+        create_git_tree_errors=[retry_error],
+    )
+
+    with (
+        patch(
+            "tracecat.workspace_sync.transport.asyncio.sleep", new_callable=AsyncMock
+        ) as sleep,
+        pytest.raises(GitHubAppError),
+    ):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+            create_pr=False,
+        )
+
+    sleep.assert_not_awaited()
+    assert repo.call_counts["create_git_tree"] == 1
+    assert repo.call_counts["ref.edit"] == 0
+
+
+@pytest.mark.anyio
+async def test_github_write_files_splits_tree_chunks_by_payload_size(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    files = {
+        MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+        "workflows/a/definition.yml": "a" * 300,
+        "workflows/b/definition.yml": "b" * 300,
+        "workflows/c/definition.yml": "c" * 300,
+    }
+    repo = _FakeGitHubRepo(files={}, branch_exists=True, ahead_by=0)
+
+    # Every element stays under the 700-byte cap individually (manifest ~525,
+    # workflow entries ~387 serialized), but no two fit a chunk together, so
+    # the packer must emit one chunk per element despite the 128-entry limit.
+    with patch("tracecat.workspace_sync.transport._GITHUB_TREE_CHUNK_MAX_BYTES", 700):
+        result = await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files=files,
+            create_pr=False,
+        )
+
+    assert result.status is PushStatus.COMMITTED
+    assert repo.call_counts["create_git_blob"] == 0
+    assert repo.call_counts["create_git_tree"] == 4
+    assert all(len(tree.elements) == 1 for tree in repo.trees)
+    assert repo.final_files == files
+
+
+@pytest.mark.anyio
+async def test_github_write_files_uploads_oversized_entries_as_blobs(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    files = {
+        MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+        "workflows/big/definition.yml": "x" * 2000,
+        "workflows/small/definition.yml": "version: 1\n",
+    }
+    repo = _FakeGitHubRepo(files={}, branch_exists=True, ahead_by=0)
+
+    # Only the big file's inline entry serializes past the 1000-byte cap
+    # (manifest ~525, small ~103), so it alone must ship through the blob
+    # endpoint and appear in the tree as a SHA reference.
+    with patch("tracecat.workspace_sync.transport._GITHUB_TREE_CHUNK_MAX_BYTES", 1000):
+        result = await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files=files,
+            create_pr=False,
+        )
+
+    assert result.status is PushStatus.COMMITTED
+    assert repo.call_counts["create_git_blob"] == 1
+    assert repo.blobs == [("x" * 2000, "utf-8")]
+    identities = [
+        cast(Any, element)._identity for tree in repo.trees for element in tree.elements
+    ]
+    big_identity = next(
+        identity
+        for identity in identities
+        if identity["path"] == "workflows/big/definition.yml"
+    )
+    assert "content" not in big_identity
+    assert big_identity["sha"] == "blob-1"
+    assert repo.final_files == files
+
+
+@pytest.mark.anyio
+async def test_github_write_files_logs_pygithub_payload_size_per_chunk(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    sync_logger = Mock()
+    repo = _FakeGitHubRepo(files={}, branch_exists=True, ahead_by=0)
+    files = {
+        MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+        **{
+            f"workflows/generated-{index:04d}/definition.yml": "version: 1\n"
+            for index in range(_GITHUB_TREE_CHUNK_SIZE)
+        },
+    }
+
+    await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files=files,
+        create_pr=False,
+        logger=sync_logger,
+    )
+
+    tree_log = next(
+        call
+        for call in sync_logger.info.call_args_list
+        if call.args and call.args[0] == "Creating GitHub workspace sync tree"
+    )
+    # PyGithub's Requester serializes with json.dumps default separators; the
+    # logged size must match that framing, not a compact serialization.
+    expected_payload_sizes = [
+        len(
+            json.dumps(
+                {
+                    "base_tree": f"tree-{'a' * 40}",
+                    "tree": [cast(Any, element)._identity for element in tree.elements],
+                }
+            ).encode("utf-8")
+        )
+        for tree in repo.trees
+    ]
+    assert tree_log.kwargs["max_tree_payload_size_bytes"] == max(expected_payload_sizes)
+    chunk_logs = [
+        call
+        for call in sync_logger.info.call_args_list
+        if call.args and call.args[0] == "Created GitHub workspace sync tree chunk"
+    ]
+    assert [call.kwargs["tree_payload_size_bytes"] for call in chunk_logs] == (
+        expected_payload_sizes
+    )
+
+
+@pytest.mark.anyio
+async def test_github_write_files_retry_budget_exhaustion_reraises(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    retry_errors = [
+        GithubException(
+            status=403,
+            data={"message": "Request blocked"},
+            headers={"Retry-After": "0.6"},
+        )
+        for _ in range(3)
+    ]
+    repo = _FakeGitHubRepo(
+        files={},
+        branch_exists=True,
+        ahead_by=0,
+        create_git_tree_errors=retry_errors,
+    )
+
+    with (
+        patch("tracecat.workspace_sync.transport._GITHUB_RETRY_BUDGET_SECONDS", 1.0),
+        patch(
+            "tracecat.workspace_sync.transport.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as sleep,
+        pytest.raises(GitHubAppError),
+    ):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+            create_pr=False,
+        )
+
+    # The first Retry-After (0.6) fits the 1.0 budget; the second (0.6) exceeds
+    # the remaining 0.4 and re-raises without a truncated sleep or early retry.
+    assert [call.args[0] for call in sleep.await_args_list] == pytest.approx([0.6])
+    assert repo.call_counts["create_git_tree"] == 2
+    assert repo.call_counts["create_git_commit"] == 0
+    assert repo.call_counts["ref.edit"] == 0
+
+
+@pytest.mark.anyio
+async def test_github_write_files_logs_rate_limit_response_headers(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    sync_logger = Mock()
+    repo = _FakeGitHubRepo(
+        files={},
+        branch_exists=True,
+        ahead_by=0,
+        get_git_tree_error=GithubException(
+            status=403,
+            data={"message": "Request blocked"},
+            headers={
+                "X-GitHub-Request-Id": "request-id",
+                "Retry-After": "60",
+                "X-RateLimit-Remaining": "4999",
+                "X-RateLimit-Resource": "core",
+            },
+        ),
+    )
+
+    with pytest.raises(GitHubAppError):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest())},
+            logger=sync_logger,
+        )
+
+    error_log = sync_logger.error.call_args
+    assert error_log.args == ("GitHub workspace sync request failed",)
+    assert error_log.kwargs["stage"] == "read_target_tree"
+    assert error_log.kwargs["github_endpoint"].endswith("/git/trees/{sha}")
+    assert error_log.kwargs["github_status"] == 403
+    assert error_log.kwargs["github_request_id"] == "request-id"
+    assert error_log.kwargs["github_retry_after"] == "60"
+    assert error_log.kwargs["github_rate_limit_headers"] == {
+        "x-ratelimit-remaining": "4999",
+        "x-ratelimit-resource": "core",
+    }
+
+
+@pytest.mark.anyio
+async def test_github_read_files_uses_commit_tree_sha(
+    workspace_sync_service: WorkspaceSyncService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This fake covers the blob API; archive behavior has separate fixtures.
+    monkeypatch.setattr("tracecat.feature_flags.config.TRACECAT__FEATURE_FLAGS", set())
+    repo = _FakeGitHubReadRepo()
+    gh = Mock()
+    gh.get_repo.return_value = repo
+    gh_service = AsyncMock()
+    gh_service.get_github_client_for_repo.return_value = gh
+
+    transport = GitHubWorkspaceSyncTransport(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+    )
+    with patch(
+        "tracecat.workspace_sync.transport.GitHubAppService",
+        return_value=gh_service,
+    ):
+        snapshot = await transport.read_files(
+            url=GitUrl(host="github.com", org="TracecatHQ", repo="sync"),
+            ref="c" * 40,
+        )
+
+    # The git/trees endpoint must receive the commit's tree SHA, not the commit
+    # SHA, or GitHub 404s the read.
+    assert repo.get_git_tree_calls == ["t" * 40]
+    assert snapshot.commit_sha == "c" * 40
+    assert snapshot.tree_sha == "t" * 40
+    assert MANIFEST_FILENAME in snapshot.files
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("listed", "expected"),
+    [
+        # The default sorts past the limit, so it is added first.
+        (("a", "b", "c"), [("main", True), ("a", False)]),
+        # An empty repository has no branch to report, default included.
+        ((), []),
+    ],
+)
+async def test_github_list_branches_includes_default_beyond_limit(
+    workspace_sync_service: WorkspaceSyncService,
+    listed: tuple[str, ...],
+    expected: list[tuple[str, bool]],
+) -> None:
+    repo = Mock()
+    repo.default_branch = "main"
+    # Mock(name=...) names the mock itself, so set the attribute instead.
+    repo.get_branches.return_value = [SimpleNamespace(name=name) for name in listed]
+    gh = Mock()
+    gh.get_repo.return_value = repo
+    gh_service = AsyncMock()
+    gh_service.get_github_client_for_repo.return_value = gh
+
+    transport = GitHubWorkspaceSyncTransport(
+        session=workspace_sync_service.session,
+        role=workspace_sync_service.role,
+    )
+    with patch(
+        "tracecat.workspace_sync.transport.GitHubAppService",
+        return_value=gh_service,
+    ):
+        branches = await transport.list_branches(
+            url=GitUrl(host="github.com", org="TracecatHQ", repo="sync"),
+            limit=2,
+        )
+
+    assert [(b.name, b.is_default) for b in branches] == expected
+
+
+_TAG_URL = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+
+
+def _gh_commit(oid: str, date: str) -> dict[str, Any]:
+    return {"__typename": "Commit", "oid": oid, "committedDate": date}
+
+
+def _gh_refs_page(
+    nodes: list[dict[str, Any]], *, end_cursor: str | None = None
+) -> dict[str, Any]:
+    page_info = {"hasNextPage": end_cursor is not None, "endCursor": end_cursor}
+    return {"data": {"repository": {"refs": {"pageInfo": page_info, "nodes": nodes}}}}
+
+
+def _github_graphql_service(gh: Mock) -> AsyncMock:
+    gh_service = AsyncMock()
+    gh_service.get_github_client_for_repo.return_value = gh
+    return gh_service
+
+
+@pytest.mark.anyio
+async def test_github_list_tags_pages_one_graphql_query_per_page(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    gh = Mock()
+    gh.requester.graphql_query.side_effect = [
+        (
+            {},
+            _gh_refs_page(
+                [
+                    # Annotated: dated by the tagger.
+                    {
+                        "name": "v3",
+                        "target": {
+                            "__typename": "Tag",
+                            "tagger": {"date": "2026-03-02T00:00:00Z"},
+                            "target": _gh_commit("c" * 40, "2026-03-01T00:00:00Z"),
+                        },
+                    },
+                    # Annotated with no tagger: falls back to the commit date.
+                    {
+                        "name": "v2",
+                        "target": {
+                            "__typename": "Tag",
+                            "tagger": None,
+                            "target": _gh_commit("b" * 40, "2026-02-01T00:00:00Z"),
+                        },
+                    },
+                ],
+                end_cursor="Y3Vyc29yOjI=",
+            ),
+        ),
+        (
+            {},
+            _gh_refs_page(
+                [
+                    {
+                        "name": "v1",
+                        "target": _gh_commit("a" * 40, "2026-01-01T00:00:00Z"),
+                    },
+                    # A tag on a tree, and a chain deeper than the query
+                    # follows (its innermost target has no fields), are skipped.
+                    {"name": "tree", "target": {"__typename": "Tree"}},
+                    {
+                        "name": "too-deep",
+                        "target": {
+                            "__typename": "Tag",
+                            "tagger": {"date": "2026"},
+                            "target": {"__typename": "Tag"},
+                        },
+                    },
+                ]
+            ),
+        ),
+    ]
+    transport = GitHubWorkspaceSyncTransport(
+        session=workspace_sync_service.session, role=workspace_sync_service.role
+    )
+
+    with patch(
+        "tracecat.workspace_sync.transport.GitHubAppService",
+        return_value=_github_graphql_service(gh),
+    ):
+        first, cursor = await transport.list_tags(url=_TAG_URL, limit=2)
+        second, last_cursor = await transport.list_tags(
+            url=_TAG_URL, limit=2, cursor=cursor
+        )
+
+    assert [(t.name, t.commit_sha, t.date) for t in [*first, *second]] == [
+        ("v3", "c" * 40, "2026-03-02T00:00:00Z"),
+        ("v2", "b" * 40, "2026-02-01T00:00:00Z"),
+        ("v1", "a" * 40, "2026-01-01T00:00:00Z"),
+    ]
+    assert (cursor, last_cursor) == ("Y3Vyc29yOjI=", None)
+    calls = gh.requester.graphql_query.call_args_list
+    assert [call.args[1] for call in calls] == [
+        {"owner": "TracecatHQ", "name": "sync", "first": 2, "after": None},
+        {"owner": "TracecatHQ", "name": "sync", "first": 2, "after": "Y3Vyc29yOjI="},
+    ]
+    assert "orderBy: {field: TAG_COMMIT_DATE, direction: DESC}" in calls[0].args[0]
+    assert gh.close.call_count == 2
+
+
+@pytest.mark.anyio
+async def test_github_list_tags_follows_a_two_level_tag_chain(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    chained = {
+        "name": "release",
+        "target": {
+            "__typename": "Tag",
+            "tagger": {"date": "2026-05-02T00:00:00Z"},
+            "target": {
+                "__typename": "Tag",
+                "tagger": {"date": "2026-05-01T00:00:00Z"},
+                "target": _gh_commit("e" * 40, "2026-04-01T00:00:00Z"),
+            },
+        },
+    }
+    gh = Mock()
+    gh.requester.graphql_query.return_value = ({}, _gh_refs_page([chained]))
+    transport = GitHubWorkspaceSyncTransport(
+        session=workspace_sync_service.session, role=workspace_sync_service.role
+    )
+
+    with patch(
+        "tracecat.workspace_sync.transport.GitHubAppService",
+        return_value=_github_graphql_service(gh),
+    ):
+        tags, _cursor = await transport.list_tags(url=_TAG_URL)
+
+    # Peeled to the commit, dated by the outermost tagger.
+    assert [(t.name, t.commit_sha, t.date) for t in tags] == [
+        ("release", "e" * 40, "2026-05-02T00:00:00Z")
+    ]
+    query = gh.requester.graphql_query.call_args.args[0]
+    assert query.count("... on Tag") == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (GithubException(502, "bad gateway"), 502),
+        # Primary GraphQL limits arrive as HTTP 200 + RATE_LIMITED; PyGithub
+        # raises them as 400, which must not look like a bad request.
+        (
+            GithubException(
+                400, {"errors": [{"type": "RATE_LIMITED", "message": "limited"}]}
+            ),
+            429,
+        ),
+        # Secondary limits arrive as 403s.
+        (RateLimitExceededException(403, {"message": "secondary rate limit"}), 429),
+    ],
+)
+async def test_github_list_tags_reports_upstream_status(
+    workspace_sync_service: WorkspaceSyncService,
+    error: GithubException,
+    expected_status: int,
+) -> None:
+    gh = Mock()
+    gh.requester.graphql_query.side_effect = error
+    transport = GitHubWorkspaceSyncTransport(
+        session=workspace_sync_service.session, role=workspace_sync_service.role
+    )
+    with (
+        patch(
+            "tracecat.workspace_sync.transport.GitHubAppService",
+            return_value=_github_graphql_service(gh),
+        ),
+        pytest.raises(GitHubAppError) as exc,
+    ):
+        await transport.list_tags(url=_TAG_URL)
+    assert exc.value.status_code == expected_status
+
+
+_ARCHIVE_URL = "https://codeload.github.com/TracecatHQ/sync/legacy.tar.gz/archive"
+_ARCHIVE_GIT_URL = GitUrl(host="github.com", org="TracecatHQ", repo="sync")
+
+
+def _archive_repo_files() -> dict[str, bytes]:
+    manifest = canonical_json_text(WorkspaceManifest()).encode()
+    return {
+        MANIFEST_FILENAME: manifest,
+        "workflows/a/definition.yml": b"title: a\n",
+        "workflows/b/definition.yml": b"title: b\n",
+        "workflows/c/logo.bin": b"\xff\xfe\x00",
+        "README.md": b"# unmanaged\n",
+    }
+
+
+def _tarball(members: dict[str, bytes], *, prefix: str = "TracecatHQ-sync-c") -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        root = tarfile.TarInfo(prefix)
+        root.type = tarfile.DIRTYPE
+        tar.addfile(root)
+        for path, content in members.items():
+            info = tarfile.TarInfo(f"{prefix}/{path}")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+class _FakeGitHubArchiveRepo:
+    """GitHub repo fake that serves the same commit via blobs and a tarball."""
+
+    def __init__(
+        self,
+        files: dict[str, bytes],
+        *,
+        archive_link_error: GithubException | None = None,
+    ) -> None:
+        self._files = files
+        self._shas = {
+            path: _git_blob_sha_bytes(content) for path, content in files.items()
+        }
+        self._contents_by_sha = {
+            self._shas[path]: content for path, content in files.items()
+        }
+        self._archive_link_error = archive_link_error
+        self.blob_calls: list[str] = []
+        self.archive_link_calls: list[tuple[str, str]] = []
+
+    def get_commit(self, ref: str):
+        return SimpleNamespace(
+            sha="c" * 40,
+            commit=SimpleNamespace(tree=SimpleNamespace(sha="t" * 40)),
+        )
+
+    def get_git_tree(self, *, sha: str, recursive: bool):
+        return SimpleNamespace(
+            tree=[
+                SimpleNamespace(path=path, sha=blob_sha, type="blob")
+                for path, blob_sha in sorted(self._shas.items())
+            ]
+        )
+
+    def get_git_blob(self, sha: str):
+        self.blob_calls.append(sha)
+        content = self._contents_by_sha[sha]
+        return SimpleNamespace(content=base64.b64encode(content).decode())
+
+    def get_archive_link(self, archive_format: str, ref: str) -> str:
+        self.archive_link_calls.append((archive_format, ref))
+        if self._archive_link_error is not None:
+            raise self._archive_link_error
+        return _ARCHIVE_URL
+
+
+async def _read_with_archive_repo(
+    repo: _FakeGitHubArchiveRepo,
+    service: WorkspaceSyncService,
+) -> VcsTreeSnapshot:
+    gh = Mock()
+    gh.get_repo.return_value = repo
+    gh_service = AsyncMock()
+    gh_service.get_github_client_for_repo.return_value = gh
+    transport = GitHubWorkspaceSyncTransport(session=service.session, role=service.role)
+    with patch(
+        "tracecat.workspace_sync.transport.GitHubAppService",
+        return_value=gh_service,
+    ):
+        return await transport.read_files(url=_ARCHIVE_GIT_URL, ref="main")
+
+
+@pytest.fixture
+def github_archive_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "tracecat.feature_flags.config.TRACECAT__FEATURE_FLAGS",
+        {FeatureFlag.WORKSPACE_SYNC_GITHUB_ARCHIVE},
+    )
+
+
+@pytest.mark.anyio
+async def test_github_read_files_skips_archive_when_flag_disabled(
+    workspace_sync_service: WorkspaceSyncService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("tracecat.feature_flags.config.TRACECAT__FEATURE_FLAGS", set())
+    repo = _FakeGitHubArchiveRepo(_archive_repo_files())
+
+    snapshot = await _read_with_archive_repo(repo, workspace_sync_service)
+
+    assert repo.archive_link_calls == []
+    assert len(repo.blob_calls) == 4
+    assert set(snapshot.files) == {
+        MANIFEST_FILENAME,
+        "workflows/a/definition.yml",
+        "workflows/b/definition.yml",
+    }
+
+
+@pytest.mark.anyio
+async def test_github_read_files_archive_matches_blob_reads(
+    workspace_sync_service: WorkspaceSyncService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _archive_repo_files()
+    monkeypatch.setattr("tracecat.feature_flags.config.TRACECAT__FEATURE_FLAGS", set())
+    blob_repo = _FakeGitHubArchiveRepo(files)
+    blob_snapshot = await _read_with_archive_repo(blob_repo, workspace_sync_service)
+
+    monkeypatch.setattr(
+        "tracecat.feature_flags.config.TRACECAT__FEATURE_FLAGS",
+        {FeatureFlag.WORKSPACE_SYNC_GITHUB_ARCHIVE},
+    )
+    archive_repo = _FakeGitHubArchiveRepo(files)
+    with respx.mock(assert_all_called=True) as router:
+        router.get(_ARCHIVE_URL).mock(
+            return_value=httpx.Response(200, content=_tarball(files))
+        )
+        archive_snapshot = await _read_with_archive_repo(
+            archive_repo, workspace_sync_service
+        )
+
+    assert archive_snapshot == blob_snapshot
+    assert archive_repo.archive_link_calls == [("tarball", "c" * 40)]
+    assert archive_repo.blob_calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("github_archive_enabled")
+async def test_github_read_files_falls_back_per_path_for_unverified_members(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    files = _archive_repo_files()
+    archive_members = dict(files)
+    # export-subst rewrites content; export-ignore drops the member entirely.
+    archive_members["workflows/a/definition.yml"] = b"title: substituted\n"
+    del archive_members["workflows/b/definition.yml"]
+    repo = _FakeGitHubArchiveRepo(files)
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get(_ARCHIVE_URL).mock(
+            return_value=httpx.Response(200, content=_tarball(archive_members))
+        )
+        snapshot = await _read_with_archive_repo(repo, workspace_sync_service)
+
+    assert snapshot.files["workflows/a/definition.yml"] == "title: a\n"
+    assert snapshot.files["workflows/b/definition.yml"] == "title: b\n"
+    assert sorted(repo.blob_calls) == sorted(
+        _git_blob_sha_bytes(files[path])
+        for path in ("workflows/a/definition.yml", "workflows/b/definition.yml")
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("github_archive_enabled")
+@pytest.mark.parametrize(
+    "archive_response",
+    [
+        httpx.Response(404),
+        httpx.Response(200, content=b"not a tarball"),
+    ],
+    ids=["http-error", "corrupt-archive"],
+)
+async def test_github_read_files_falls_back_to_blobs_when_archive_unusable(
+    workspace_sync_service: WorkspaceSyncService,
+    archive_response: httpx.Response,
+) -> None:
+    repo = _FakeGitHubArchiveRepo(_archive_repo_files())
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get(_ARCHIVE_URL).mock(return_value=archive_response)
+        snapshot = await _read_with_archive_repo(repo, workspace_sync_service)
+
+    assert len(repo.blob_calls) == 4
+    assert snapshot.files["workflows/a/definition.yml"] == "title: a\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("github_archive_enabled")
+async def test_github_archive_http_error_does_not_log_download_credentials(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    repo = _FakeGitHubArchiveRepo(_archive_repo_files())
+    token = "synthetic-secret"
+    archive_url = f"{_ARCHIVE_URL}?token={token}"
+    logs = io.StringIO()
+    sink_id = logger.add(logs, format="{message} {extra}", level="WARNING")
+    try:
+        with (
+            patch.object(repo, "get_archive_link", return_value=archive_url),
+            respx.mock(assert_all_called=True) as router,
+        ):
+            router.get(archive_url).mock(return_value=httpx.Response(503))
+            snapshot = await _read_with_archive_repo(repo, workspace_sync_service)
+    finally:
+        logger.remove(sink_id)
+
+    assert len(repo.blob_calls) == 4
+    assert snapshot.files["workflows/a/definition.yml"] == "title: a\n"
+    captured_logs = logs.getvalue()
+    assert "falling back to blob reads" in captured_logs
+    assert "HTTPStatusError" in captured_logs
+    assert token not in captured_logs
+    assert archive_url not in captured_logs
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("github_archive_enabled")
+async def test_github_read_files_falls_back_when_archive_link_fails(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    repo = _FakeGitHubArchiveRepo(
+        _archive_repo_files(),
+        archive_link_error=GithubException(status=403, data={"message": "nope"}),
+    )
+
+    snapshot = await _read_with_archive_repo(repo, workspace_sync_service)
+
+    assert len(repo.blob_calls) == 4
+    assert snapshot.files["workflows/b/definition.yml"] == "title: b\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("github_archive_enabled")
+async def test_github_read_files_falls_back_when_archive_exceeds_size_cap(
+    workspace_sync_service: WorkspaceSyncService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tracecat.workspace_sync.transport._GITHUB_ARCHIVE_MAX_BYTES", 8
+    )
+    files = _archive_repo_files()
+    repo = _FakeGitHubArchiveRepo(files)
+
+    with respx.mock(assert_all_called=True) as router:
+        router.get(_ARCHIVE_URL).mock(
+            return_value=httpx.Response(200, content=_tarball(files))
+        )
+        snapshot = await _read_with_archive_repo(repo, workspace_sync_service)
+
+    assert len(repo.blob_calls) == 4
+    assert MANIFEST_FILENAME in snapshot.files
+
+
+def _legacy_workflow_yaml(source_id: str, *, title: str) -> str:
+    return f"""
+id: {source_id}
+alias: legacy-workflow
+definition:
+  title: {title}
+  description: Legacy workspace sync format
+  entrypoint:
+    ref: start
+    expects: {{}}
+  actions:
+    - ref: start
+      action: core.transform.passthrough
+      args:
+        value: legacy
+"""
+
+
+def _workspace_files(spec: WorkflowResourceSpec) -> dict[str, str]:
+    return {
+        MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+        workflow_source_path(spec.id): serialize_workflow_spec(spec),
+    }
+
+
+async def _seed_fake_sync_branch(
+    fake_vcs: FakeVcsServer,
+    *,
+    git_url: GitUrl,
+    branch: str,
+) -> None:
+    seed_transport = fake_vcs.transport_factory(
+        VcsProvider.GITHUB,
+        session=AsyncMock(),
+        role=AsyncMock(),
+    )
+    await seed_transport.write_files(
+        url=git_url,
+        files={
+            MANIFEST_FILENAME: canonical_json_text(WorkspaceManifest()),
+            "workflows/stale/definition.yml": "version: 1\n",
+            "README.md": "# keep me\n",
+        },
+        message="Seed sync branch",
+        branch=branch,
+        create_pr=False,
+    )
+
+
+async def _write_files_with_fake_repo(
+    repo: _FakeGitHubRepo,
+    *,
+    service: WorkspaceSyncService,
+    files: dict[str, str],
+    branch: str = "sync/agents-1",
+    create_pr: bool = True,
+    expected_commit_sha: str | None = None,
+    branch_start_ref: str | None = None,
+    delete_missing_paths_under: tuple[str, ...] = (),
+    logger: Mock | None = None,
+    operation_id: uuid.UUID | None = None,
+):
+    gh = Mock()
+    gh.get_repo.return_value = repo
+    gh.requester.graphql_named_mutation.side_effect = repo.graphql_named_mutation
+
+    gh_service = AsyncMock()
+    gh_service.get_github_client_for_repo.return_value = gh
+
+    transport = GitHubWorkspaceSyncTransport(
+        session=service.session,
+        role=service.role,
+    )
+    if logger is not None:
+        transport.logger = logger
+    with patch(
+        "tracecat.workspace_sync.transport.GitHubAppService",
+        return_value=gh_service,
+    ):
+        return await transport.write_files(
+            url=GitUrl(host="github.com", org="TracecatHQ", repo="sync"),
+            files=files,
+            message="Push limerick agent",
+            branch=branch,
+            create_pr=create_pr,
+            expected_commit_sha=expected_commit_sha,
+            branch_start_ref=branch_start_ref,
+            operation_id=operation_id,
+            delete_missing_paths_under=delete_missing_paths_under,
+        )
+
+
+class _FakeGitHubRepo:
+    default_branch = "main"
+    node_id = "synthetic-repository-id"
+
+    def __init__(
+        self,
+        *,
+        files: dict[str, str],
+        branch_exists: bool,
+        ahead_by: int,
+        existing_pr: object | None = None,
+        get_git_tree_error: GithubException | None = None,
+        create_git_tree_errors: list[GithubException] | None = None,
+        create_git_ref_errors: list[GithubException] | None = None,
+        tree_truncated: bool = False,
+    ) -> None:
+        self._files = dict(files)
+        self._branch_exists = branch_exists
+        self._head_sha = "a" * 40
+        self.guarded_ref_updates: list[dict[str, Any]] = []
+        self._ahead_by = ahead_by
+        self._existing_pr = existing_pr
+        self._get_git_tree_error = get_git_tree_error
+        self._create_git_tree_errors = list(create_git_tree_errors or ())
+        self._create_git_ref_errors = list(create_git_ref_errors or ())
+        self._blob_contents: dict[str, str] = {}
+        self._tree_truncated = tree_truncated
+        self.created_refs: list[tuple[str, str]] = []
+        self.compare_calls: list[tuple[str, str]] = []
+        self.call_counts: Counter[str] = Counter()
+        self.create_pull = Mock(
+            return_value=SimpleNamespace(
+                html_url="https://github.com/TracecatHQ/sync/pull/8",
+                number=8,
+            )
+        )
+        self.blobs: list[tuple[str, str]] = []
+        self.trees: list[SimpleNamespace] = []
+        self.commits: list[object] = []
+        self.get_git_tree_calls: list[str] = []
+        self._tree_files: dict[str, dict[str, str]] = {}
+        self._commits_by_sha: dict[str, SimpleNamespace] = {}
+        self._ref = _FakeGitRef(self, "heads/sync/agents-1")
+
+    @property
+    def final_files(self) -> dict[str, str]:
+        return dict(self._files)
+
+    def get_branch(self, name: str):
+        self.call_counts["get_branch"] += 1
+        if name == "main" or self._branch_exists:
+            return SimpleNamespace(
+                commit=SimpleNamespace(
+                    sha="a" * 40 if name == "main" else self._head_sha
+                )
+            )
+        raise GithubException(status=404, data={"message": "Not Found"})
+
+    def create_git_ref(self, *, ref: str, sha: str) -> None:
+        self.call_counts["create_git_ref"] += 1
+        if self._create_git_ref_errors:
+            raise self._create_git_ref_errors.pop(0)
+        if self._branch_exists:
+            raise GithubException(
+                status=422, data={"message": "Reference already exists"}
+            )
+        self.created_refs.append((ref, sha))
+        self._head_sha = sha
+        self._branch_exists = True
+        if commit := self._commits_by_sha.get(sha):
+            self._files = dict(self._tree_files[commit.tree.sha])
+
+    def graphql_named_mutation(
+        self, name: str, inputs: dict[str, Any], output_schema: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        assert name == "updateRefs"
+        assert output_schema == "clientMutationId"
+        assert inputs["repositoryId"] == self.node_id
+        update = inputs["refUpdates"][0]
+        assert update["force"] is False
+        self.guarded_ref_updates.append(update)
+        current = self._head_sha if self._branch_exists else "0" * 40
+        if current != update["beforeOid"]:
+            raise GithubException(400, {"errors": [{"type": "UNPROCESSABLE"}]})
+        if self._branch_exists:
+            self._ref.edit(sha=update["afterOid"])
+        else:
+            self.create_git_ref(ref=update["name"], sha=update["afterOid"])
+        return {}, {"clientMutationId": None}
+
+    def get_contents(self, path: str, *, ref: str):
+        self.call_counts["get_contents"] += 1
+        if path not in self._files:
+            raise GithubException(status=404, data={"message": "Not Found"})
+        encoded = base64.b64encode(self._files[path].encode()).decode()
+        return SimpleNamespace(content=encoded)
+
+    def compare(self, base: str, head: str):
+        self.call_counts["compare"] += 1
+        self.compare_calls.append((base, head))
+        return SimpleNamespace(ahead_by=self._ahead_by)
+
+    def get_git_commit(self, sha: str):
+        self.call_counts["get_git_commit"] += 1
+        tree_sha = f"tree-{sha}"
+        self._tree_files.setdefault(tree_sha, dict(self._files))
+        return SimpleNamespace(sha=sha, tree=SimpleNamespace(sha=tree_sha))
+
+    def get_git_tree(self, *, sha: str, recursive: bool):
+        self.call_counts["get_git_tree"] += 1
+        self.get_git_tree_calls.append(sha)
+        if self._get_git_tree_error is not None:
+            raise self._get_git_tree_error
+        tree_files = self._tree_files.get(sha, self._files)
+        return SimpleNamespace(
+            tree=[
+                SimpleNamespace(path=path, sha=_git_blob_sha(content), type="blob")
+                for path, content in sorted(tree_files.items())
+            ],
+            truncated=self._tree_truncated,
+        )
+
+    def create_git_blob(self, content: str, encoding: str):
+        self.call_counts["create_git_blob"] += 1
+        self.blobs.append((content, encoding))
+        sha = f"blob-{len(self.blobs)}"
+        self._blob_contents[sha] = content
+        return SimpleNamespace(sha=sha)
+
+    def create_git_tree(self, elements: list[object], *, base_tree: object):
+        self.call_counts["create_git_tree"] += 1
+        if self._create_git_tree_errors:
+            raise self._create_git_tree_errors.pop(0)
+        base_tree_sha = cast(Any, base_tree).sha
+        tree_files = dict(self._tree_files[base_tree_sha])
+        for element in elements:
+            identity = cast(Any, element)._identity
+            path = identity["path"]
+            if "content" in identity:
+                assert "sha" not in identity
+                tree_files[path] = identity["content"]
+            elif identity["sha"] is None:
+                tree_files.pop(path, None)
+            else:
+                tree_files[path] = self._blob_contents[identity["sha"]]
+        tree = SimpleNamespace(
+            sha=f"tree-{len(self.trees) + 1}",
+            elements=elements,
+            base_tree=base_tree,
+        )
+        self._tree_files[tree.sha] = tree_files
+        self.trees.append(tree)
+        return tree
+
+    def create_git_commit(self, message: str, tree: object, parents: list[object]):
+        self.call_counts["create_git_commit"] += 1
+        commit = SimpleNamespace(
+            sha=f"commit-{len(self.commits) + 1}",
+            message=message,
+            tree=tree,
+            parents=parents,
+        )
+        self.commits.append(commit)
+        self._commits_by_sha[commit.sha] = commit
+        return commit
+
+    def get_git_ref(self, ref: str):
+        self.call_counts["get_git_ref"] += 1
+        self._ref.ref = ref
+        return self._ref
+
+    def get_pulls(self, *, state: str, head: str, base: str):
+        self.call_counts["get_pulls"] += 1
+        if self._existing_pr is None:
+            return iter(())
+        return iter((self._existing_pr,))
+
+
+class _FakeGitRef:
+    def __init__(self, repo: _FakeGitHubRepo, ref: str) -> None:
+        self._repo = repo
+        self.ref = ref
+        self.edits: list[str] = []
+
+    def edit(self, *, sha: str) -> None:
+        self._repo.call_counts["ref.edit"] += 1
+        self.edits.append(sha)
+        self._repo._head_sha = sha
+        commit = self._repo._commits_by_sha[sha]
+        self._repo._files = dict(self._repo._tree_files[cast(Any, commit.tree).sha])
+
+
+class _FakeGitHubReadRepo:
+    """Minimal GitHub repo whose commit SHA and root tree SHA differ."""
+
+    def __init__(self) -> None:
+        self.get_git_tree_calls: list[str] = []
+
+    def get_commit(self, ref: str):
+        return SimpleNamespace(
+            sha="c" * 40,
+            commit=SimpleNamespace(tree=SimpleNamespace(sha="t" * 40)),
+        )
+
+    def get_git_tree(self, *, sha: str, recursive: bool):
+        self.get_git_tree_calls.append(sha)
+        return SimpleNamespace(
+            tree=[
+                SimpleNamespace(
+                    path=MANIFEST_FILENAME,
+                    sha="blob-manifest",
+                    type="blob",
+                )
+            ]
+        )
+
+    def get_git_blob(self, sha: str):
+        content = canonical_json_text(WorkspaceManifest())
+        return SimpleNamespace(content=base64.b64encode(content.encode()).decode())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("selection_kind", ["all", "selected", "type"])
+async def test_export_closure_collects_named_errors_before_mapping_writes(
+    workspace_sync_service: WorkspaceSyncService,
+    selection_kind: str,
+) -> None:
+    """Duplicate titles retain distinct identities; every invalid root is reported."""
+    workflows = [
+        cast(Any, SimpleNamespace(id=uuid.uuid4(), alias=None, title="Example review"))
+        for _ in range(2)
+    ]
+
+    async def invalid(workflow: Any) -> DSLInput:
+        raise WorkflowExportValidationError(
+            [
+                WorkflowExportDiagnostic(
+                    workflow_id=workflow.id,
+                    workflow_title=workflow.title,
+                    stage="definition",
+                    code="no_actions",
+                    message="Add an action before pushing.",
+                )
+            ]
+        )
+
+    workspace_sync_service._list_projectable_workflows = AsyncMock(
+        return_value=workflows
+    )
+    workspace_sync_service._get_workflow_dsl = AsyncMock(side_effect=invalid)
+    workspace_sync_service._source_id_for_workflow = AsyncMock()
+    selection = (
+        None
+        if selection_kind == "all"
+        else {
+            SyncResourceType.WORKFLOW: {workflow.id for workflow in workflows}
+            if selection_kind == "selected"
+            else set()
+        }
+    )
+    with pytest.raises(WorkflowExportValidationError) as raised:
+        await workspace_sync_service._projectable_workflow_closure(selection)
+    assert {item.workflow_id for item in raised.value.diagnostics} == {
+        workflow.id for workflow in workflows
+    }
+    assert workspace_sync_service._get_workflow_dsl.await_count == 2
+    workspace_sync_service._source_id_for_workflow.assert_not_awaited()
+    cast(AsyncMock, workspace_sync_service.session.commit).assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_export_closure_reports_invalid_child_workflow(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+) -> None:
+    parent_id, child_id = uuid.uuid4(), uuid.uuid4()
+    parent = cast(Any, SimpleNamespace(id=parent_id, alias="parent", title="Parent"))
+    child = cast(Any, SimpleNamespace(id=child_id, alias="child", title="Child"))
+    parent_dsl = sample_dsl.model_copy(
+        update={
+            "actions": [
+                ActionStatement(
+                    ref="call",
+                    action="core.workflow.execute",
+                    args={"workflow_alias": "child"},
+                )
+            ]
+        }
+    )
+
+    async def resolve(workflow: Any) -> DSLInput:
+        if workflow.id == parent_id:
+            return parent_dsl
+        raise WorkflowExportValidationError(
+            [
+                WorkflowExportDiagnostic(
+                    workflow_id=child_id,
+                    workflow_title="Child",
+                    stage="definition",
+                    code="no_actions",
+                    message="Add an action before pushing.",
+                )
+            ]
+        )
+
+    workspace_sync_service._list_projectable_workflows = AsyncMock(
+        return_value=[parent, child]
+    )
+    workspace_sync_service._get_workflow_dsl = AsyncMock(side_effect=resolve)
+    with pytest.raises(WorkflowExportValidationError) as raised:
+        await workspace_sync_service._projectable_workflow_closure(
+            {SyncResourceType.WORKFLOW: {parent_id}}
+        )
+    assert raised.value.diagnostics[0].workflow_id == child_id
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reference", ["alias", "id"])
+@pytest.mark.parametrize("validate_export", [True, False])
+async def test_export_closure_reports_missing_child_without_exposing_its_identity(
+    workspace_sync_service: WorkspaceSyncService,
+    sample_dsl: DSLInput,
+    reference: str,
+    validate_export: bool,
+) -> None:
+    parent_id = uuid.uuid4()
+    missing_id = WorkflowUUID.new_uuid4()
+    parent = cast(
+        Any, SimpleNamespace(id=parent_id, alias="parent", title="Synthetic parent")
+    )
+    dsl = sample_dsl.model_copy(
+        update={
+            "actions": [
+                ActionStatement(
+                    ref="call",
+                    action="core.workflow.execute",
+                    args={"workflow_alias": "synthetic-missing"}
+                    if reference == "alias"
+                    else {"workflow_id": missing_id.short()},
+                )
+            ]
+        }
+    )
+    workspace_sync_service._list_projectable_workflows = AsyncMock(
+        return_value=[parent]
+    )
+    workspace_sync_service._get_workflow_dsl = AsyncMock(return_value=dsl)
+    cast(AsyncMock, workspace_sync_service.session.scalar).return_value = None
+    if not validate_export:
+        # Pull comparison projections keep the existing unresolved-reference policy.
+        closure = await workspace_sync_service._projectable_workflow_closure(
+            {SyncResourceType.WORKFLOW: {parent_id}}, validate_export=False
+        )
+        assert closure.workflows == [parent]
+        assert closure.dsl_by_id == {parent_id: dsl}
+        return
+    with pytest.raises(WorkflowExportValidationError) as raised:
+        await workspace_sync_service._projectable_workflow_closure(
+            {SyncResourceType.WORKFLOW: {parent_id}}
+        )
+    [diagnostic] = raised.value.diagnostics
+    assert diagnostic.workflow_id == parent_id
+    assert diagnostic.stage == "dependency"
+    assert diagnostic.code == "missing_child_workflow"
+    assert diagnostic.source_path is None
+    assert str(missing_id) not in str(raised.value)
+    assert str(missing_id.short()) not in str(raised.value)
+    assert "synthetic-missing" not in str(raised.value)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("moved", [False, True])
+async def test_guarded_github_ref_rejection_checks_current_branch(
+    workspace_sync_service: WorkspaceSyncService, moved: bool
+) -> None:
+    repo = _FakeGitHubRepo(files={}, branch_exists=True, ahead_by=0)
+
+    def reject_update(*, sha: str) -> None:
+        if moved:
+            repo.get_branch = Mock(
+                return_value=SimpleNamespace(commit=SimpleNamespace(sha="b" * 40))
+            )
+        raise GithubException(status=422, data={"message": "Publication rejected"})
+
+    repo._ref.edit = Mock(side_effect=reject_update)
+    error = SyncCommitConflictError if moved else GitHubAppError
+    with pytest.raises(error):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={"workflows/example.yml": "new"},
+            create_pr=False,
+            expected_commit_sha="a" * 40,
+        )
+    repo._ref.edit.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_guarded_github_publish_rejects_ancestor_reset_atomically(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    repo = _FakeGitHubRepo(
+        files={"README.md": "reviewed"}, branch_exists=True, ahead_by=0
+    )
+    publish = repo.graphql_named_mutation
+    ancestor = "b" * 40
+
+    def reset_before_publish(name, inputs, output_schema):
+        # This race happens at publication, after every client-side head read.
+        # A REST fast-forward edit would accept our commit, whose parent is the
+        # reviewed head; updateRefs must reject the exact-head mismatch.
+        repo._head_sha = ancestor
+        return publish(name, inputs, output_schema)
+
+    with (
+        patch.object(repo, "graphql_named_mutation", side_effect=reset_before_publish),
+        pytest.raises(SyncCommitConflictError, match="Target branch changed"),
+    ):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={"README.md": "sync"},
+            create_pr=False,
+            expected_commit_sha="a" * 40,
+        )
+    assert repo._head_sha == ancestor
+    assert repo.final_files == {"README.md": "reviewed"}
+    assert repo.call_counts["ref.edit"] == 0
+    assert repo.guarded_ref_updates == [
+        {
+            "name": "refs/heads/sync/agents-1",
+            "beforeOid": "a" * 40,
+            "afterOid": "commit-1",
+            "force": False,
+        }
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("existing_target", [False, True])
+async def test_guarded_github_publish_uses_exact_before_oid(
+    workspace_sync_service: WorkspaceSyncService,
+    existing_target: bool,
+) -> None:
+    repo = _FakeGitHubRepo(files={}, branch_exists=existing_target, ahead_by=0)
+    result = await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files={"README.md": "sync"},
+        create_pr=False,
+        expected_commit_sha="a" * 40,
+    )
+    assert result.status is PushStatus.COMMITTED
+    assert repo.guarded_ref_updates == [
+        {
+            "name": "refs/heads/sync/agents-1",
+            "beforeOid": "a" * 40 if existing_target else "0" * 40,
+            "afterOid": result.sha,
+            "force": False,
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_guarded_github_publish_recovers_retried_lost_ack(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    repo = _FakeGitHubRepo(files={}, branch_exists=True, ahead_by=0)
+    publish = repo.graphql_named_mutation
+    attempts = 0
+
+    def publish_then_lose_ack(name, inputs, output_schema):
+        nonlocal attempts
+        attempts += 1
+        result = publish(name, inputs, output_schema)
+        if attempts == 1:
+            raise GithubException(429, {}, {"Retry-After": "0.001"})
+        return result
+
+    with patch.object(
+        repo, "graphql_named_mutation", side_effect=publish_then_lose_ack
+    ):
+        result = await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={"README.md": "sync"},
+            create_pr=False,
+            expected_commit_sha="a" * 40,
+        )
+    assert attempts == 2
+    assert result.status is PushStatus.COMMITTED
+    assert result.sha == repo._head_sha
+    assert repo.call_counts["ref.edit"] == 1
+    assert len(repo.commits) == 1
+
+
+@pytest.mark.anyio
+async def test_github_stale_base_does_not_create_target_branch(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    repo = _FakeGitHubRepo(files={}, branch_exists=False, ahead_by=0)
+    with pytest.raises(TracecatValidationError, match="Base branch changed"):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={"workflows/new.yml": "new"},
+            expected_commit_sha="b" * 40,
+        )
+    assert repo.created_refs == []
+    assert repo.commits == []
+
+
+@pytest.mark.anyio
+async def test_github_new_branch_uses_reviewed_ref_separately_from_pr_base(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    repo = _FakeGitHubRepo(files={}, branch_exists=False, ahead_by=1)
+    original_get_branch = repo.get_branch
+
+    def get_branch(name: str):
+        if name == "main":
+            return SimpleNamespace(commit=SimpleNamespace(sha="b" * 40))
+        if name == "reviewed-base":
+            return SimpleNamespace(commit=SimpleNamespace(sha="a" * 40))
+        return original_get_branch(name)
+
+    with (
+        patch.object(repo, "get_branch", side_effect=get_branch),
+        patch.object(
+            GitHubWorkspaceSyncTransport,
+            "_sync_request_body",
+            new=AsyncMock(return_value="Sync QA"),
+        ),
+    ):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={"workflows/new.yml": "new"},
+            expected_commit_sha="a" * 40,
+            branch_start_ref="reviewed-base",
+        )
+    assert repo.created_refs == [("refs/heads/sync/agents-1", "commit-1")]
+    assert cast(Any, repo.commits[0]).parents[0].sha == "a" * 40
+    assert repo.create_pull.call_args.kwargs["base"] == "main"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "failed_call", ["get_git_tree", "create_git_tree", "create_git_commit"]
+)
+async def test_github_new_branch_failure_before_publication_is_retryable(
+    workspace_sync_service: WorkspaceSyncService, failed_call: str
+) -> None:
+    repo = _FakeGitHubRepo(files={}, branch_exists=False, ahead_by=0)
+    files = {"workflows/new.yml": "new"}
+    with (
+        patch.object(
+            repo,
+            failed_call,
+            side_effect=GithubException(status=503, data={"message": "Unavailable"}),
+        ),
+        pytest.raises(GitHubAppError),
+    ):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files=files,
+            create_pr=False,
+            expected_commit_sha="a" * 40,
+        )
+    assert not repo._branch_exists
+    assert repo.created_refs == []
+    result = await _write_files_with_fake_repo(
+        repo,
+        service=workspace_sync_service,
+        files=files,
+        create_pr=False,
+        expected_commit_sha="a" * 40,
+    )
+    assert result.status is PushStatus.COMMITTED
+    assert repo.created_refs == [("refs/heads/sync/agents-1", result.sha)]
+    assert repo.final_files == files
+    assert repo.call_counts["ref.edit"] == 0
+
+
+@pytest.mark.anyio
+async def test_github_new_branch_race_does_not_overwrite_competing_ref(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    repo = _FakeGitHubRepo(files={}, branch_exists=False, ahead_by=0)
+    create_ref = repo.create_git_ref
+
+    def competing_create(*, ref: str, sha: str) -> None:
+        repo._branch_exists = True
+        create_ref(ref=ref, sha=sha)
+
+    with (
+        patch.object(repo, "create_git_ref", side_effect=competing_create),
+        pytest.raises(SyncCommitConflictError),
+    ):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files={"workflows/new.yml": "new"},
+            create_pr=False,
+            expected_commit_sha="a" * 40,
+        )
+    assert repo.final_files == {}
+    assert repo.created_refs == []
+    assert repo.call_counts["ref.edit"] == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["lost_ack", "pull_request"])
+async def test_github_new_branch_postpublication_failure_keeps_operation_receipt(
+    workspace_sync_service: WorkspaceSyncService,
+    failure: str,
+) -> None:
+    from tracecat.workspace_sync.transport import sync_commit_message
+
+    repo = _FakeGitHubRepo(files={}, branch_exists=False, ahead_by=1)
+    operation_id = uuid.uuid4()
+    files = {"workflows/new.yml": "new"}
+    create_ref = repo.create_git_ref
+    error = GithubException(status=503, data={"message": "Unavailable"})
+
+    def lost_ack(*, ref: str, sha: str) -> None:
+        create_ref(ref=ref, sha=sha)
+        raise error
+
+    with (
+        patch.object(
+            repo,
+            "create_git_ref",
+            side_effect=lost_ack if failure == "lost_ack" else create_ref,
+        ),
+        patch.object(
+            GitHubWorkspaceSyncTransport, "_upsert_pull_request", side_effect=error
+        ),
+        pytest.raises(GitHubAppError),
+    ):
+        await _write_files_with_fake_repo(
+            repo,
+            service=workspace_sync_service,
+            files=files,
+            expected_commit_sha="a" * 40,
+            operation_id=operation_id,
+        )
+    assert repo.created_refs == [("refs/heads/sync/agents-1", "commit-1")]
+    assert repo.final_files == files
+    assert cast(Any, repo.commits[0]).message == sync_commit_message(
+        "Push limerick agent", operation_id
+    )
+    assert repo.call_counts["ref.edit"] == 0
+
+
+@pytest.mark.anyio
+async def test_sync_import_rolls_back_preparation_failure(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    rollback = AsyncMock()
+    workspace_sync_service.session.rollback = rollback
+    snapshot = WorkspaceRemoteSnapshot(
+        commit_sha="a" * 40, files={}, spec=WorkspaceSpec()
+    )
+    workspace_sync_service._prepare_snapshot_for_import = AsyncMock(
+        return_value=PreparedSnapshot(snapshot, [], [], [], [], [])
+    )
+    workspace_sync_service.import_prepared_snapshot = AsyncMock(
+        side_effect=RuntimeError("Synthetic preparation failure")
+    )
+    result = await workspace_sync_service._import_snapshot(
+        snapshot, sync_schedules=False
+    )
+    assert not result.success
+    assert result.diagnostics[0].error_type == "transaction"
+    rollback.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_parse_diagnostics_stop_preview_before_partial_spec_processing(
+    workspace_sync_service: WorkspaceSyncService,
+) -> None:
+    snapshot = WorkspaceRemoteSnapshot(
+        commit_sha="a" * 40,
+        files={"variables/default/example.yml": "partial snapshot"},
+        spec=WorkspaceSpec(
+            variables={
+                "default/example": VariableResourceSpec(
+                    id="default/example", name="example", environment="default"
+                )
+            }
+        ),
+    )
+    diagnostic = PullDiagnostic(
+        workflow_path="workflows/invalid.yml",
+        workflow_title=None,
+        error_type="parse",
+        message="Invalid document",
+        details={},
+    )
+    with (
+        patch.object(
+            workspace_sync_service, "_require_spec_entitlements", new=AsyncMock()
+        ) as entitlements,
+        patch.object(workspace_sync_service, "_require_pull_scopes") as scopes,
+        patch.object(
+            workspace_sync_service, "_prepare_snapshot_for_import", new=AsyncMock()
+        ) as correlate,
+    ):
+        result = await workspace_sync_service.prepare_pull_preview(
+            snapshot, sync_schedules=False, parse_diagnostics=[diagnostic]
+        )
+        entitlements.assert_not_awaited()
+        scopes.assert_not_called()
+        correlate.assert_not_awaited()
+        assert result.snapshot is snapshot
+        assert not result.preview.success
+        assert result.preview.diagnostics == [diagnostic]
+        assert result.preview.resource_counts is not None
+        assert result.preview.resource_counts["variable"].found == 1
+        assert result.preview.resource_counts["variable"].imported == 0
+        assert result.preview.resource_diffs is None
+        assert result.preview.catalog_mapping_requirements is None
+        assert result.preview.mcp_integration_mapping_requirements is None
+
+        # Parsed snapshots must still pass authorization before correlation.
+        entitlements.side_effect = EntitlementRequired("Synthetic denial")
+        with pytest.raises(EntitlementRequired):
+            await workspace_sync_service.prepare_pull_preview(
+                snapshot, sync_schedules=False
+            )
+        entitlements.assert_awaited_once_with(snapshot.spec)
+        correlate.assert_not_awaited()

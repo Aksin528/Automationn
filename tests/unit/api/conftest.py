@@ -7,10 +7,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _pytest.fixtures import FixtureRequest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tracecat.api.app import app
-from tracecat.auth.credentials import AuthenticatedUserOnly, SuperuserRole
+from tracecat.api.app import app as api_app
+from tracecat.auth.credentials import (
+    AuthenticatedUserOnly,
+    SuperuserRole,
+    SuperuserStepUpRole,
+)
 from tracecat.auth.dependencies import (
     ExecutorWorkspaceRole,
     OrgActorRole,
@@ -32,12 +37,14 @@ from tracecat.authz.scopes import (
 from tracecat.contexts import ctx_role
 from tracecat.db.engine import get_async_session, get_async_session_bypass_rls
 from tracecat.db.models import Workspace
+from tracecat.executor.action_gateway.app import create_app as create_action_gateway_app
 from tracecat.service_accounts.router import WorkspaceUserOnlyInPath
 from tracecat.workspaces.router import (
     WorkspaceUserInPath,
 )
 
 _FALLBACK_ROLE: Role | None = None
+_ACTION_GATEWAY_APP = create_action_gateway_app()
 
 
 def override_role_dependency() -> Role:
@@ -61,9 +68,11 @@ async def _inject_test_role_middleware(request, call_next):
         ctx_role.reset(token)
 
 
-@pytest.fixture
-def client(request: FixtureRequest) -> Generator[TestClient, None, None]:
-    """Create FastAPI test client.
+def _test_client(
+    app: FastAPI,
+    request: FixtureRequest,
+) -> Generator[TestClient, None, None]:
+    """Create a role-aware FastAPI test client for the requested app.
 
     Uses the existing app instance and relies on ctx_role context
     from test_role/test_admin_role fixtures for authentication.
@@ -87,6 +96,7 @@ def client(request: FixtureRequest) -> Generator[TestClient, None, None]:
         WorkspaceServiceAccountRole,
         ExecutorWorkspaceRole,
         SuperuserRole,
+        SuperuserStepUpRole,
         AuthenticatedUserOnly,
         OrgActorRole,
         OrganizationServiceAccountRole,
@@ -117,6 +127,20 @@ def client(request: FixtureRequest) -> Generator[TestClient, None, None]:
     yield client
     # Clean up overrides
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(request: FixtureRequest) -> Generator[TestClient, None, None]:
+    """Create a test client for the public API app."""
+    yield from _test_client(api_app, request)
+
+
+@pytest.fixture
+def action_gateway_client(
+    request: FixtureRequest,
+) -> Generator[TestClient, None, None]:
+    """Create a test client for executor-only Action Gateway routes."""
+    yield from _test_client(_ACTION_GATEWAY_APP, request)
 
 
 @pytest.fixture

@@ -4,14 +4,12 @@ import {
   CalendarSearchIcon,
   FileInputIcon,
   type LucideIcon,
-  MessagesSquare,
   ShapesIcon,
   WorkflowIcon,
 } from "lucide-react"
 import type { ReactNode } from "react"
 import { $TriggerType, type TriggerType } from "@/client"
 import { ActionEventPane } from "@/components/builder/events/events-selected-action"
-import { WorkflowInteractions } from "@/components/builder/events/events-sidebar-interactions"
 import {
   WorkflowEvents,
   WorkflowEventsHeader,
@@ -38,7 +36,6 @@ export type EventsSidebarTabs =
   | "workflow-events"
   | "action-input"
   | "action-result"
-  | "action-interaction"
 
 /** A single tab in the workflow events viewer. */
 export interface EventsTabItem {
@@ -73,12 +70,21 @@ export function EventsLoading({ message }: { message: string }) {
  * matching the user's selected trigger types. Shared by the builder events
  * sidebar and the embedded workflow artifact so their loading, error, and empty
  * states stay in sync.
+ *
+ * Pass ``pollIntervalMs`` to poll the latest-execution list while mounted, so a
+ * run started outside this view (e.g. a chat agent calling
+ * ``core.workflow.execute``) is discovered and shown live without an explicit
+ * cache invalidation tying the run back to this panel.
  */
-export function useResolvedLastExecution(): ResolvedLastExecution {
+export function useResolvedLastExecution(
+  pollIntervalMs?: number
+): ResolvedLastExecution {
   const { workflowId } = useWorkflow()
   const { currentExecutionId } = useWorkflowBuilder()
   const [selectedTriggerTypes] = useLocalStorage<TriggerType[]>(
-    "selected-trigger-types",
+    // v2: `form` joined the trigger types. A stored v1 selection predates it
+    // and would hide form runs, so everyone starts again from all types.
+    "selected-trigger-types-v2",
     [...AVAILABLE_TRIGGER_TYPES]
   )
 
@@ -87,6 +93,8 @@ export function useResolvedLastExecution(): ResolvedLastExecution {
       // Prefer the direct execution id (e.g. a run just triggered) over the query.
       workflowId: currentExecutionId ? undefined : workflowId,
       triggerTypes: selectedTriggerTypes,
+      // Only poll for discovery when a direct run isn't already pinned.
+      refetchInterval: currentExecutionId ? undefined : pollIntervalMs,
     })
 
   const executionId = currentExecutionId || lastExecution?.id
@@ -137,17 +145,14 @@ function NoWorkflowRuns() {
 }
 
 /**
- * Build the tab descriptors (Events / Input / Result / Interaction) for a
- * workflow execution. The interaction tab is only included when interactions
- * are enabled, and the header switches to its compact form when `embedded`.
+ * Build the tab descriptors (Events / Input / Result) for a workflow
+ * execution. The header switches to its compact form when `embedded`.
  */
 export function buildEventsTabItems({
   execution,
-  interactionsEnabled,
   embedded = false,
 }: {
   execution: WorkflowExecutionReadCompact
-  interactionsEnabled: boolean
   embedded?: boolean
 }): EventsTabItem[] {
   const tabItems: EventsTabItem[] = [
@@ -158,9 +163,6 @@ export function buildEventsTabItems({
       content: (
         <>
           <WorkflowEventsHeader execution={execution} embedded={embedded} />
-          {interactionsEnabled && (
-            <WorkflowInteractions execution={execution} />
-          )}
           <WorkflowEvents events={execution.events} status={execution.status} />
         </>
       ),
@@ -178,13 +180,5 @@ export function buildEventsTabItems({
       content: <ActionEventPane execution={execution} type="result" />,
     },
   ]
-  if (interactionsEnabled) {
-    tabItems.push({
-      value: "action-interaction",
-      label: "Interaction",
-      icon: MessagesSquare,
-      content: <ActionEventPane execution={execution} type="interaction" />,
-    })
-  }
   return tabItems
 }

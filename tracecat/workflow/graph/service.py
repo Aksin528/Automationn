@@ -3,6 +3,8 @@
 Implements the canonical graph API with optimistic concurrency.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -11,11 +13,20 @@ from sqlalchemy import column, delete, func, literal, select, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import selectinload
 
+from tracecat.agent.types import clamp_agent_timeout_seconds
+from tracecat.audit.enums import AuditEventStatus
+from tracecat.audit.logger import AuditEventDetails, audit_log
 from tracecat.db.models import Action, Workflow
+from tracecat.dsl.common import UpstreamEdgeDataValidator
+from tracecat.dsl.enums import PlatformAction
 from tracecat.dsl.view import RFGraph
 from tracecat.identifiers import WorkflowID
 from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.service import BaseWorkspaceService
+from tracecat.workflow.management.layout import (
+    WorkflowActionLayoutInput,
+    auto_generate_layout,
+)
 from tracecat.workflow.management.schemas import (
     AddEdgePayload,
     AddNodePayload,
@@ -32,6 +43,14 @@ from tracecat.workflow.management.schemas import (
 type EdgeSourceType = Literal["trigger", "udf"]
 type EdgeHandle = Literal["success", "error"]
 
+_STRUCTURAL_OPERATION_TYPES = {
+    "add_node",
+    "update_node",
+    "delete_node",
+    "add_edge",
+    "delete_edge",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class EdgeDedupKey:
@@ -40,18 +59,60 @@ class EdgeDedupKey:
     source_handle: EdgeHandle | None
 
 
+def _normalize_agent_control_flow(
+    action_type: str, control_flow: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist agent timeouts already normalized so stored always equals
+    executed, regardless of which write surface supplied the value. Absent
+    or malformed timeouts get the deployment default; explicit values clamp
+    to the deployment bounds. Non-agent actions pass through untouched."""
+    if not PlatformAction.is_agent(action_type):
+        return control_flow
+    retry_policy = dict(control_flow.get("retry_policy") or {})
+    timeout = retry_policy.get("timeout")
+    retry_policy["timeout"] = clamp_agent_timeout_seconds(
+        timeout if isinstance(timeout, int) and not isinstance(timeout, bool) else None
+    )
+    return {**control_flow, "retry_policy": retry_policy}
+
+
 class WorkflowGraphService(BaseWorkspaceService):
     """Service for graph operations on workflows."""
 
     service_name = "workflow_graph"
 
-    _STRUCTURAL_OPS = {
-        "add_node",
-        "update_node",
-        "delete_node",
-        "add_edge",
-        "delete_edge",
-    }
+    _STRUCTURAL_OPS = _STRUCTURAL_OPERATION_TYPES
+
+    def _graph_audit_details(
+        self,
+        workflow_id: WorkflowID,
+        base_version: int,
+        operations: list[GraphOperation],
+    ) -> AuditEventDetails:
+        changed_fields = sorted(
+            {
+                (
+                    "definition"
+                    if operation.type in _STRUCTURAL_OPERATION_TYPES
+                    else "layout"
+                )
+                for operation in operations
+            }
+        )
+        return AuditEventDetails(data={"changed_fields": changed_fields})
+
+    # Gradual form: a named signature fails pyright's name check; _graph_audit_details keeps P pinned.
+    @staticmethod
+    def _graph_audit_result(
+        result: GraphResponse | None, *args: Any, **kwargs: Any
+    ) -> AuditEventDetails:
+        return AuditEventDetails(
+            status=(
+                AuditEventStatus.SUCCESS
+                if result is not None
+                else AuditEventStatus.FAILURE
+            )
+        )
 
     async def get_graph(self, workflow_id: WorkflowID) -> GraphResponse | None:
         """Get the canonical graph projection from Actions.
@@ -90,6 +151,12 @@ class WorkflowGraphService(BaseWorkspaceService):
             },
         )
 
+    @audit_log(
+        resource_type="workflow",
+        action="update",
+        attempt_metadata=_graph_audit_details,
+        terminal_metadata=_graph_audit_result,
+    )
     async def apply_operations(
         self,
         workflow_id: WorkflowID,
@@ -101,7 +168,6 @@ class WorkflowGraphService(BaseWorkspaceService):
         Returns 409 if base_version doesn't match current graph_version.
         """
         workflow_uuid = WorkflowUUID.new(workflow_id)
-
         # Load workflow with FOR UPDATE lock
         stmt = (
             select(Workflow)
@@ -117,6 +183,25 @@ class WorkflowGraphService(BaseWorkspaceService):
 
         if workflow is None:
             return None
+        return await self.apply_operations_to_locked_workflow(
+            workflow,
+            base_version=base_version,
+            operations=operations,
+        )
+
+    async def apply_operations_to_locked_workflow(
+        self,
+        workflow: Workflow,
+        *,
+        base_version: int,
+        operations: list[GraphOperation],
+    ) -> GraphResponse:
+        """Apply operations to a workflow locked by the caller.
+
+        This compositional entry point does not perform another lookup or emit
+        an independent audit event. The caller owns the workflow lock and the
+        surrounding operation's audit lifecycle.
+        """
 
         # Check version for optimistic concurrency
         if workflow.graph_version != base_version:
@@ -199,6 +284,8 @@ class WorkflowGraphService(BaseWorkspaceService):
                 await self._update_viewport(
                     workflow, UpdateViewportPayload(**op.payload)
                 )
+            case "auto_layout":
+                await self._auto_layout(workflow)
             case _:
                 raise ValueError(f"Unknown operation type: {op.type}")
 
@@ -206,7 +293,7 @@ class WorkflowGraphService(BaseWorkspaceService):
     def _is_structural(cls, op: GraphOperation) -> bool:
         """Return True if the operation mutates graph semantics.
 
-        Layout-only operations (move/update trigger position) do not
+        Layout-only operations (move, trigger position, auto-layout) do not
         increment graph_version.
         """
 
@@ -214,6 +301,9 @@ class WorkflowGraphService(BaseWorkspaceService):
 
     async def _add_node(self, workflow: Workflow, payload: AddNodePayload) -> None:
         """Add a new action node."""
+        control_flow = _normalize_agent_control_flow(
+            payload.type, dict(payload.control_flow or {})
+        )
         action = Action(
             workspace_id=self.workspace_id,
             workflow_id=workflow.id,
@@ -221,7 +311,7 @@ class WorkflowGraphService(BaseWorkspaceService):
             title=payload.title,
             description=payload.description or "",
             inputs=payload.inputs or "",
-            control_flow=payload.control_flow or {},
+            control_flow=control_flow,
             position_x=payload.position_x,
             position_y=payload.position_y,
             upstream_edges=[],  # New nodes start as entrypoints
@@ -246,6 +336,19 @@ class WorkflowGraphService(BaseWorkspaceService):
 
         if not update_values:
             return
+
+        if "control_flow" in update_values:
+            action_type = await self.session.scalar(
+                select(Action.type).where(
+                    Action.workspace_id == self.workspace_id,
+                    Action.workflow_id == workflow.id,
+                    Action.id == payload.action_id,
+                )
+            )
+            if action_type is not None:
+                update_values["control_flow"] = _normalize_agent_control_flow(
+                    action_type, update_values["control_flow"]
+                )
 
         stmt = (
             update(Action)
@@ -451,6 +554,48 @@ class WorkflowGraphService(BaseWorkspaceService):
                 .values(position_x=x, position_y=y)
             )
             await self.session.execute(stmt)
+
+    @staticmethod
+    def _layout_input(action: Action) -> WorkflowActionLayoutInput:
+        depends_on: list[str] = []
+        for edge_data in action.upstream_edges or []:
+            edge = UpstreamEdgeDataValidator.validate_python(edge_data)
+            if edge.get("source_type", "udf") != "udf":
+                continue
+            source_id = edge["source_id"]
+            if edge.get("source_handle") == "error":
+                depends_on.append(f"{source_id}.error")
+            else:
+                depends_on.append(source_id)
+        return {"ref": str(action.id), "depends_on": depends_on}
+
+    async def _auto_layout(self, workflow: Workflow) -> None:
+        """Re-position the trigger and every action with the shared auto-layout.
+
+        Actions are re-read from the database so nodes and edges changed by
+        earlier operations in the same batch are included.
+        """
+        await self.session.flush()
+        result = await self.session.execute(
+            select(Action)
+            .where(
+                Action.workspace_id == self.workspace_id,
+                Action.workflow_id == workflow.id,
+            )
+            .execution_options(populate_existing=True)
+        )
+        actions = result.scalars().all()
+        actions_by_id = {str(action.id): action for action in actions}
+        layout = auto_generate_layout(
+            [self._layout_input(action) for action in actions]
+        )
+        for position in layout["actions"]:
+            action = actions_by_id[position["ref"]]
+            action.position_x = position["x"]
+            action.position_y = position["y"]
+        workflow.trigger_position_x = layout["trigger"]["x"]
+        workflow.trigger_position_y = layout["trigger"]["y"]
+        self.session.add(workflow)
 
     async def _update_trigger_position(
         self, workflow: Workflow, payload: UpdateTriggerPositionPayload

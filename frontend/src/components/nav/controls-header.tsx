@@ -1,12 +1,12 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
 import { formatDistanceToNow } from "date-fns"
 import {
   AlertTriangle,
   Check,
   ChevronDown,
   ClockPlus,
+  ExternalLinkIcon,
   FileText,
   FileUpIcon,
   Flag,
@@ -14,6 +14,7 @@ import {
   FolderIcon,
   KeyRound,
   ListIcon,
+  ListTreeIcon,
   LockKeyhole,
   MessageSquare,
   MousePointerClickIcon,
@@ -22,6 +23,7 @@ import {
   Plus,
   TagsIcon,
   Trash2,
+  UngroupIcon,
   User,
   X,
 } from "lucide-react"
@@ -29,10 +31,10 @@ import dynamic from "next/dynamic"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import {
-  Fragment,
   type ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useState,
 } from "react"
 import {
@@ -42,6 +44,7 @@ import {
   casesGetCase,
   casesUpdateCase,
 } from "@/client"
+import { AgentPresetDetailHeaderActions } from "@/components/agents/agent-preset-detail-actions"
 import {
   AgentsCatalogViewMode,
   AgentsCatalogViewToggle,
@@ -53,6 +56,7 @@ import { AddCaseDropdown } from "@/components/cases/add-case-dropdown"
 import { AddCaseDuration } from "@/components/cases/add-case-duration"
 import { AddCaseTag } from "@/components/cases/add-case-tag"
 import { AddCustomField } from "@/components/cases/add-custom-field"
+import { CaseAgentRunsAction } from "@/components/cases/case-agent-runs-action"
 import {
   PRIORITIES,
   SEVERITIES,
@@ -63,6 +67,8 @@ import { CreateCaseDialog } from "@/components/cases/case-create-dialog"
 import { CaseDurationMetrics } from "@/components/cases/case-duration-metrics"
 import { UNASSIGNED } from "@/components/cases/case-panel-selectors"
 import { useCaseSelection } from "@/components/cases/case-selection-context"
+import { CasePickerDialog } from "@/components/cases/case-sub-cases"
+import { CaseVersionHistory } from "@/components/cases/case-version-history"
 import {
   CasesViewMode,
   CasesViewToggle,
@@ -74,23 +80,29 @@ import {
   WorkflowsCatalogViewToggle,
 } from "@/components/dashboard/workflows-catalog-view-toggle"
 import { DynamicLucideIcon } from "@/components/dynamic-lucide-icon"
+import { FormViewToggle } from "@/components/forms/form-view-toggle"
+import { CreateFormDialog } from "@/components/forms/forms-dashboard"
 import { CreateCustomProviderDialog } from "@/components/integrations/create-custom-provider-dialog"
 import { Spinner } from "@/components/loading/spinner"
-import {
-  MembersViewMode,
-  MembersViewToggle,
-} from "@/components/members/members-view-toggle"
-import { CreateGroupButton } from "@/components/rbac/create-group-button"
-import { CreateRoleButton } from "@/components/rbac/create-role-button"
-import { RegistryActionsControls } from "@/components/registry/workspace-actions-controls"
+import { FolderPathBreadcrumb } from "@/components/nav/folder-path-breadcrumb"
 import { CreateSkillButton } from "@/components/skills/create-skill-button"
+import { SkillLibrarySkillActions } from "@/components/skills/skill-library-skill-view"
+import {
+  SkillsCatalogViewMode,
+  SkillsCatalogViewToggle,
+} from "@/components/skills/skills-catalog-view-toggle"
+import { SkillFolderCreateDialog } from "@/components/skills/skills-dashboard"
 import { SkillsDetailActions } from "@/components/skills/skills-detail-actions"
 import { TableSelectionActionsBar } from "@/components/tables/ag-grid-bulk-actions"
 import { CreateTableDialog } from "@/components/tables/table-create-dialog"
 import { TableImportTableDialog } from "@/components/tables/table-import-table-dialog"
 import { TableInsertButton } from "@/components/tables/table-insert-button"
-import { TableLinkRowsToCaseCommand } from "@/components/tables/table-link-rows-to-case-command"
+import { TableSearchBadge } from "@/components/tables/table-search-badge"
+import { TableSearchProvider } from "@/components/tables/table-search-context"
 import { CreateTagDialog } from "@/components/tags/create-tag-dialog"
+import { CreateTunnelButton } from "@/components/tunnels/workspace-tunnels"
+import { useQueryClient } from "@/lib/query"
+import { groupLibraryProviders } from "@/lib/skill-library"
 
 const SimpleEditor = dynamic(
   () =>
@@ -122,6 +134,7 @@ import { Button } from "@/components/ui/button"
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group"
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
   DialogFooter,
@@ -142,22 +155,33 @@ import {
 import { Kbd } from "@/components/ui/kbd"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Switch } from "@/components/ui/switch"
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
+import { WorkspaceResourceSyncActions } from "@/components/workspace-sync/resource-sync-actions"
 import { AddWorkspaceMember } from "@/components/workspaces/add-workspace-member"
 import {
   NewVariableDialog,
   NewVariableDialogTrigger,
 } from "@/components/workspaces/add-workspace-variable"
 import { CreateCredentialDialog } from "@/components/workspaces/create-credential-dialog"
-import { useAgentPreset, useAgentTagCatalog } from "@/hooks/use-agent-presets"
+import {
+  useAgentFolders,
+  useAgentPreset,
+  useAgentTagCatalog,
+} from "@/hooks/use-agent-presets"
 import { useEntitlements } from "@/hooks/use-entitlements"
+import { useFormDetail, useUpdateForm } from "@/hooks/use-forms"
+import { useFormsAccess } from "@/hooks/use-forms-access"
+import { useSkillLibrary } from "@/hooks/use-skill-library"
+import { useSkillTagCatalog } from "@/hooks/use-skill-tags"
 import { useSkill } from "@/hooks/use-skills"
 import { useWorkspaceDetails, useWorkspaceMembers } from "@/hooks/use-workspace"
+import { getFormErrorDetail } from "@/lib/forms/errors"
 import {
   useCaseDropdownDefinitions,
   useCaseDurationDefinitions,
@@ -178,16 +202,6 @@ interface PageConfig {
 interface ControlsHeaderProps {
   /** Callback to toggle the chat sidebar */
   onToggleChat?: () => void
-}
-
-const CASE_STATUS_TINTS: Record<CaseStatus, string> = {
-  new: "bg-yellow-500/[0.03] dark:bg-yellow-500/[0.08]",
-  in_progress: "bg-blue-500/[0.03] dark:bg-blue-500/[0.08]",
-  on_hold: "bg-orange-500/[0.03] dark:bg-orange-500/[0.08]",
-  resolved: "bg-green-500/[0.03] dark:bg-green-500/[0.08]",
-  closed: "bg-violet-500/[0.03] dark:bg-violet-500/[0.08]",
-  other: "bg-muted/5 dark:bg-muted/[0.12]",
-  unknown: "bg-muted/5 dark:bg-muted/[0.12]",
 }
 
 const CHAT_TOGGLE_KEY = "c"
@@ -212,6 +226,11 @@ function WorkflowsActions() {
         workflowsHref={workflowsHref}
         tagsHref={tagsHref}
       />
+      <WorkspaceResourceSyncActions
+        label="workflows"
+        branchSlug="workflows"
+        resources={["workflow"]}
+      />
       {catalogView === WorkflowsCatalogViewMode.Tags ? (
         <AddWorkflowTag />
       ) : (
@@ -231,59 +250,12 @@ function WorkflowsBreadcrumb({
   workspaceId: string
   path: string | null
 }) {
-  const normalizePath = (folderPath: string | null) => {
-    if (!folderPath || folderPath === "/") return "/"
-    const pathWithLeadingSlash = folderPath.startsWith("/")
-      ? folderPath
-      : `/${folderPath}`
-    return pathWithLeadingSlash.endsWith("/") && pathWithLeadingSlash !== "/"
-      ? pathWithLeadingSlash.slice(0, -1)
-      : pathWithLeadingSlash
-  }
-
-  const normalizedPath = normalizePath(path)
-  const segments = normalizedPath.split("/").filter(Boolean)
-  const baseHref = `/workspaces/${workspaceId}/workflows`
-  const getFolderHref = (folderPath: string) => {
-    if (folderPath === "/") return `${baseHref}?view=folders&path=%2F`
-    return `${baseHref}?view=folders&path=${encodeURIComponent(folderPath)}`
-  }
-
   return (
-    <Breadcrumb>
-      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
-        <BreadcrumbItem>
-          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
-            <Link href={baseHref}>Workflows</Link>
-          </BreadcrumbLink>
-        </BreadcrumbItem>
-        {segments.map((segment, index) => {
-          const folderPath = `/${segments.slice(0, index + 1).join("/")}`
-          const isLast = index === segments.length - 1
-          return (
-            <Fragment key={folderPath}>
-              <BreadcrumbSeparator className="shrink-0">
-                <span className="text-muted-foreground">/</span>
-              </BreadcrumbSeparator>
-              <BreadcrumbItem>
-                {isLast ? (
-                  <BreadcrumbPage className="font-semibold">
-                    {segment}
-                  </BreadcrumbPage>
-                ) : (
-                  <BreadcrumbLink
-                    asChild
-                    className="font-semibold hover:no-underline"
-                  >
-                    <Link href={getFolderHref(folderPath)}>{segment}</Link>
-                  </BreadcrumbLink>
-                )}
-              </BreadcrumbItem>
-            </Fragment>
-          )
-        })}
-      </BreadcrumbList>
-    </Breadcrumb>
+    <FolderPathBreadcrumb
+      rootLabel="Workflows"
+      rootHref={`/workspaces/${workspaceId}/workflows`}
+      folderPath={path}
+    />
   )
 }
 
@@ -294,11 +266,16 @@ function TablesActions() {
 
   return (
     <>
+      <WorkspaceResourceSyncActions
+        label="tables"
+        branchSlug="tables"
+        resources={["table"]}
+      />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="outline" size="sm" className="h-7 bg-background">
             <Plus className="mr-1 h-3.5 w-3.5" />
-            New table
+            Create
             <ChevronDown className="ml-1 h-3.5 w-3.5" />
           </Button>
         </DropdownMenuTrigger>
@@ -313,7 +290,7 @@ function TablesActions() {
           <DropdownMenuItem onSelect={() => setActiveDialog("create")}>
             <Plus className="size-4 text-foreground/80" />
             <div className="flex flex-col text-xs">
-              <span>Create table</span>
+              <span>Table</span>
               <span className="text-xs text-muted-foreground">
                 Define columns manually
               </span>
@@ -403,9 +380,127 @@ function IntegrationsActions() {
 }
 
 function SkillsActions() {
+  const pathname = usePathname()
+  const workspaceId = useWorkspaceId()
+  const searchParams = useSearchParams()
+  const canCreateSkill = useScopeCheck("agent:create")
+  const { hasEntitlement } = useEntitlements()
+  const organizationEnabled = hasEntitlement("agent_addons")
+  const [createTagDialogOpen, setCreateTagDialogOpen] = useState(false)
+  const [folderDialogOpen, setFolderDialogOpen] = useState(false)
+  let catalogView = SkillsCatalogViewMode.Skills
+  if (pathname?.includes("/skills/tags")) {
+    catalogView = SkillsCatalogViewMode.Tags
+  } else if (pathname?.includes("/skills/library")) {
+    catalogView = SkillsCatalogViewMode.Library
+  }
+  const skillsHref = `/workspaces/${workspaceId}/skills`
+  const tagsHref = `/workspaces/${workspaceId}/skills/tags`
+  const libraryHref = `/workspaces/${workspaceId}/skills/library`
+  const isFoldersView =
+    organizationEnabled && searchParams?.get("view") !== "list"
+  const currentPath = normalizeAgentActionPath(
+    searchParams?.get("path") ?? null
+  )
+  const canUseSkillActions = canCreateSkill === true
+
+  let skillActionControls: ReactNode = null
+  if (canUseSkillActions) {
+    if (catalogView === SkillsCatalogViewMode.Tags) {
+      if (organizationEnabled) {
+        skillActionControls = (
+          <AddSkillTag
+            open={createTagDialogOpen}
+            onOpenChange={setCreateTagDialogOpen}
+          />
+        )
+      }
+    } else if (catalogView === SkillsCatalogViewMode.Skills) {
+      skillActionControls = (
+        <>
+          <CreateSkillButton
+            currentPath={isFoldersView ? currentPath : null}
+            showFolder={isFoldersView}
+            onCreateFolder={() => setFolderDialogOpen(true)}
+          />
+          {organizationEnabled ? (
+            <SkillFolderCreateDialog
+              open={folderDialogOpen}
+              onOpenChange={setFolderDialogOpen}
+              currentPath={currentPath}
+            />
+          ) : null}
+        </>
+      )
+    } else if (catalogView === SkillsCatalogViewMode.Library) {
+      // Library skills are installed per row; keep a disabled placeholder so
+      // the header doesn't shift when switching tabs.
+      skillActionControls = (
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 bg-background"
+          disabled
+        >
+          <Plus className="mr-1 h-3.5 w-3.5" />
+          Create
+          <ChevronDown className="ml-1 h-3.5 w-3.5" />
+        </Button>
+      )
+    }
+  }
+
   return (
     <>
-      <CreateSkillButton />
+      <SkillsCatalogViewToggle
+        view={catalogView}
+        skillsHref={skillsHref}
+        tagsHref={organizationEnabled ? tagsHref : undefined}
+        libraryHref={libraryHref}
+      />
+      <WorkspaceResourceSyncActions
+        label="skills"
+        branchSlug="skills"
+        resources={["skill"]}
+      />
+      {skillActionControls}
+    </>
+  )
+}
+
+function AddSkillTag({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const workspaceId = useWorkspaceId()
+  const { skillTags, createSkillTag } = useSkillTagCatalog(workspaceId, {
+    enabled: open,
+  })
+
+  return (
+    <>
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-7 bg-background"
+        onClick={() => onOpenChange(true)}
+      >
+        <Plus className="mr-1 h-3.5 w-3.5" />
+        Create tag
+      </Button>
+      <CreateTagDialog
+        open={open}
+        onOpenChange={onOpenChange}
+        existingTags={skillTags}
+        onCreateTag={async (params) => {
+          await createSkillTag(params)
+        }}
+        title="Create tag"
+        description="Enter a name for your new skill tag."
+      />
     </>
   )
 }
@@ -421,7 +516,11 @@ function BreadcrumbEntityPage({
     return <Skeleton className={skeletonClassName} />
   }
 
-  return <BreadcrumbPage className="font-semibold">{label}</BreadcrumbPage>
+  return (
+    <BreadcrumbPage className="font-semibold text-muted-foreground">
+      {label}
+    </BreadcrumbPage>
+  )
 }
 
 function SkillsBreadcrumb({
@@ -455,6 +554,100 @@ function SkillsBreadcrumb({
   )
 }
 
+function SkillLibraryProviderBreadcrumb({
+  workspaceId,
+  providerSlug,
+  skillSlug,
+}: {
+  workspaceId: string
+  /** Omitted on the library index, where Library is the current page. */
+  providerSlug?: string
+  /** Set on a skill preview; the provider crumb then links to its page. */
+  skillSlug?: string
+}) {
+  const canRead = useScopeCheck("agent:read") === true
+  const { librarySkills } = useSkillLibrary(workspaceId, { enabled: canRead })
+  const provider = useMemo(
+    () =>
+      groupLibraryProviders(librarySkills ?? []).find((candidate) =>
+        skillSlug
+          ? candidate.skills.some((skill) => skill.slug === skillSlug)
+          : candidate.slug === providerSlug
+      ),
+    [librarySkills, providerSlug, skillSlug]
+  )
+  // A one-skill entry has no overview page to link back to.
+  const showProviderCrumb =
+    providerSlug !== undefined &&
+    (!skillSlug || (provider?.skills.length ?? 0) > 1)
+
+  return (
+    <Breadcrumb>
+      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
+        <BreadcrumbItem>
+          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
+            <Link href={`/workspaces/${workspaceId}/skills`}>Skills</Link>
+          </BreadcrumbLink>
+        </BreadcrumbItem>
+        <BreadcrumbSeparator className="shrink-0">
+          <span className="text-muted-foreground">/</span>
+        </BreadcrumbSeparator>
+        <BreadcrumbItem className="gap-1.5">
+          {providerSlug === undefined ? (
+            <BreadcrumbPage className="font-semibold text-muted-foreground">
+              Library
+            </BreadcrumbPage>
+          ) : (
+            <BreadcrumbLink asChild className="text-muted-foreground">
+              <Link href={`/workspaces/${workspaceId}/skills/library`}>
+                Library
+              </Link>
+            </BreadcrumbLink>
+          )}
+          <span className="shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium leading-none text-muted-foreground">
+            Beta
+          </span>
+        </BreadcrumbItem>
+        {showProviderCrumb ? (
+          <>
+            <BreadcrumbSeparator className="shrink-0">
+              <span className="text-muted-foreground">/</span>
+            </BreadcrumbSeparator>
+            <BreadcrumbItem>
+              {skillSlug ? (
+                <BreadcrumbLink asChild className="text-muted-foreground">
+                  <Link
+                    href={`/workspaces/${workspaceId}/skills/library/${providerSlug}`}
+                  >
+                    {provider?.name ?? providerSlug}
+                  </Link>
+                </BreadcrumbLink>
+              ) : (
+                <BreadcrumbEntityPage
+                  label={provider?.name}
+                  skeletonClassName="h-4 w-20"
+                />
+              )}
+            </BreadcrumbItem>
+          </>
+        ) : null}
+        {skillSlug ? (
+          <>
+            <BreadcrumbSeparator className="shrink-0">
+              <span className="text-muted-foreground">/</span>
+            </BreadcrumbSeparator>
+            <BreadcrumbItem>
+              <BreadcrumbPage className="font-semibold text-muted-foreground">
+                {skillSlug}
+              </BreadcrumbPage>
+            </BreadcrumbItem>
+          </>
+        ) : null}
+      </BreadcrumbList>
+    </Breadcrumb>
+  )
+}
+
 function normalizeAgentActionPath(rawPath: string | null): string {
   if (!rawPath || rawPath === "/") {
     return "/"
@@ -472,51 +665,32 @@ function AgentFoldersBreadcrumb({
   workspaceId: string
   path: string | null
 }) {
-  const normalizedPath = normalizeAgentActionPath(path)
-  const segments = normalizedPath.split("/").filter(Boolean)
-  const baseHref = `/workspaces/${workspaceId}/agents`
-  const getFolderHref = (folderPath: string) => {
-    if (folderPath === "/") {
-      return `${baseHref}?view=folders&path=%2F`
-    }
-    return `${baseHref}?view=folders&path=${encodeURIComponent(folderPath)}`
-  }
-
+  const { hasEntitlement } = useEntitlements()
+  const organizationEnabled = hasEntitlement("agent_addons")
   return (
-    <Breadcrumb>
-      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
-        <BreadcrumbItem>
-          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
-            <Link href={baseHref}>Agents</Link>
-          </BreadcrumbLink>
-        </BreadcrumbItem>
-        {segments.map((segment, index) => {
-          const folderPath = `/${segments.slice(0, index + 1).join("/")}`
-          const isLast = index === segments.length - 1
-          return (
-            <Fragment key={folderPath}>
-              <BreadcrumbSeparator className="shrink-0">
-                <span className="text-muted-foreground">/</span>
-              </BreadcrumbSeparator>
-              <BreadcrumbItem>
-                {isLast ? (
-                  <BreadcrumbPage className="font-semibold">
-                    {segment}
-                  </BreadcrumbPage>
-                ) : (
-                  <BreadcrumbLink
-                    asChild
-                    className="font-semibold hover:no-underline"
-                  >
-                    <Link href={getFolderHref(folderPath)}>{segment}</Link>
-                  </BreadcrumbLink>
-                )}
-              </BreadcrumbItem>
-            </Fragment>
-          )
-        })}
-      </BreadcrumbList>
-    </Breadcrumb>
+    <FolderPathBreadcrumb
+      rootLabel="Agents"
+      rootHref={`/workspaces/${workspaceId}/agents`}
+      folderPath={organizationEnabled ? path : "/"}
+    />
+  )
+}
+
+function SkillsFoldersBreadcrumb({
+  workspaceId,
+  path,
+}: {
+  workspaceId: string
+  path: string | null
+}) {
+  const { hasEntitlement } = useEntitlements()
+  const organizationEnabled = hasEntitlement("agent_addons")
+  return (
+    <FolderPathBreadcrumb
+      rootLabel="Skills"
+      rootHref={`/workspaces/${workspaceId}/skills`}
+      folderPath={organizationEnabled ? path : "/"}
+    />
   )
 }
 
@@ -524,8 +698,10 @@ function AgentsActions() {
   const pathname = usePathname()
   const workspaceId = useWorkspaceId()
   const searchParams = useSearchParams()
-  const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
   const canCreateAgent = useScopeCheck("agent:create")
+  const { hasEntitlement } = useEntitlements()
+  // Folders and tags are agent add-ons; core preset creation is not.
+  const organizationEnabled = hasEntitlement("agent_addons")
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [createTagDialogOpen, setCreateTagDialogOpen] = useState(false)
   const [folderDialogOpen, setFolderDialogOpen] = useState(false)
@@ -535,23 +711,24 @@ function AgentsActions() {
     : AgentsCatalogViewMode.Agents
   const agentsHref = `/workspaces/${workspaceId}/agents`
   const tagsHref = `/workspaces/${workspaceId}/agents/tags`
-  const isFoldersView = searchParams?.get("view") !== "list"
+  const isFoldersView =
+    organizationEnabled && searchParams?.get("view") !== "list"
   const currentPath = normalizeAgentActionPath(
     searchParams?.get("path") ?? null
   )
-  const agentAddonsEnabled = hasEntitlement("agent_addons")
-  const canUseAgentActions =
-    !entitlementsLoading && agentAddonsEnabled && canCreateAgent === true
+  const canUseAgentActions = canCreateAgent === true
   let agentActionControls: ReactNode = null
 
   if (canUseAgentActions) {
     if (catalogView === AgentsCatalogViewMode.Tags) {
-      agentActionControls = (
-        <AddAgentTag
-          open={createTagDialogOpen}
-          onOpenChange={setCreateTagDialogOpen}
-        />
-      )
+      if (organizationEnabled) {
+        agentActionControls = (
+          <AddAgentTag
+            open={createTagDialogOpen}
+            onOpenChange={setCreateTagDialogOpen}
+          />
+        )
+      }
     } else {
       agentActionControls = (
         <>
@@ -559,7 +736,7 @@ function AgentsActions() {
             <DropdownMenuTrigger asChild>
               <Button variant="outline" size="sm" className="h-7 bg-background">
                 <Plus className="mr-1 h-3.5 w-3.5" />
-                Create new
+                Create
                 <ChevronDown className="ml-1 h-3.5 w-3.5" />
               </Button>
             </DropdownMenuTrigger>
@@ -586,7 +763,7 @@ function AgentsActions() {
                   <div className="flex flex-col text-xs">
                     <span>Folder</span>
                     <span className="text-xs text-muted-foreground">
-                      Create a new folder
+                      Group agents
                     </span>
                   </div>
                 </DropdownMenuItem>
@@ -598,11 +775,13 @@ function AgentsActions() {
             onOpenChange={setCreateDialogOpen}
             currentPath={isFoldersView ? currentPath : null}
           />
-          <AgentFolderCreateDialog
-            open={folderDialogOpen}
-            onOpenChange={setFolderDialogOpen}
-            currentPath={currentPath}
-          />
+          {organizationEnabled ? (
+            <AgentFolderCreateDialog
+              open={folderDialogOpen}
+              onOpenChange={setFolderDialogOpen}
+              currentPath={currentPath}
+            />
+          ) : null}
         </>
       )
     }
@@ -610,10 +789,17 @@ function AgentsActions() {
 
   return (
     <>
-      <AgentsCatalogViewToggle
-        view={catalogView}
-        agentsHref={agentsHref}
-        tagsHref={tagsHref}
+      {organizationEnabled ? (
+        <AgentsCatalogViewToggle
+          view={catalogView}
+          agentsHref={agentsHref}
+          tagsHref={tagsHref}
+        />
+      ) : null}
+      <WorkspaceResourceSyncActions
+        label="agents"
+        branchSlug="agents"
+        resources={["agent_preset"]}
       />
       {agentActionControls}
     </>
@@ -650,7 +836,7 @@ function AddAgentTag({
         onCreateTag={async (params) => {
           await createAgentTag(params)
         }}
-        title="Create new agent tag"
+        title="Create tag"
         description="Enter a name for your new agent tag."
       />
     </>
@@ -690,7 +876,61 @@ function CasesActions() {
   const durationsHref = workspaceId
     ? `/workspaces/${workspaceId}/cases/durations`
     : undefined
-  const syncActions: ReactNode = null
+  let syncActions: ReactNode = null
+  if (view === CasesViewMode.CustomFields) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case custom fields"
+        branchSlug="case-fields"
+        resources={["case_field"]}
+      />
+    )
+  } else if (view === CasesViewMode.Durations) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case durations"
+        branchSlug="case-durations"
+        resources={["case_duration"]}
+      />
+    )
+  } else if (view === CasesViewMode.Tags) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case tags"
+        branchSlug="case-tags"
+        resources={["case_tag"]}
+      />
+    )
+  } else if (view === CasesViewMode.Dropdowns) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case dropdowns"
+        branchSlug="case-dropdowns"
+        resources={["case_dropdown"]}
+      />
+    )
+  } else if (view === CasesViewMode.ClosureRequirements) {
+    // Nothing to push or create here; keep disabled placeholders so the
+    // header doesn't shift when switching tabs.
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="closure requirements"
+        branchSlug="case-closure-requirements"
+        resources={["case_field", "case_dropdown"]}
+        disabled
+      />
+    )
+  } else {
+    // Cases themselves aren't synced; keep Push aligned with the settings tabs.
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="cases"
+        branchSlug="cases"
+        resources={["case_tag", "case_field", "case_dropdown", "case_duration"]}
+        disabled
+      />
+    )
+  }
 
   return (
     <>
@@ -712,7 +952,17 @@ function CasesActions() {
         <AddCaseTag />
       ) : view === CasesViewMode.Dropdowns ? (
         <AddCaseDropdown />
-      ) : view === CasesViewMode.ClosureRequirements ? null : (
+      ) : view === CasesViewMode.ClosureRequirements ? (
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 bg-background"
+          disabled
+        >
+          <Plus className="mr-1 h-3.5 w-3.5" />
+          Create
+        </Button>
+      ) : (
         <>
           <Button
             variant="outline"
@@ -739,6 +989,8 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
     bulkUpdateSelectedCases,
     isDeleting,
     isUpdating,
+    setParentForSelectedCases,
+    isChangingParent,
   } = useCaseSelection()
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false)
   const [selectedTagIds, setSelectedTagIds] = useState<Set<string>>(new Set())
@@ -749,6 +1001,7 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
   const [appendDialogOpen, setAppendDialogOpen] = useState(false)
   const [appendText, setAppendText] = useState("")
   const [isAppending, setIsAppending] = useState(false)
+  const [parentPickerOpen, setParentPickerOpen] = useState(false)
   const workspaceId = useWorkspaceId()
   const queryClient = useQueryClient()
   const { hasEntitlement } = useEntitlements()
@@ -941,8 +1194,10 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
     Boolean(isUpdating) ||
     isApplyingTags ||
     isAddingComments ||
-    isAppending
+    isAppending ||
+    Boolean(isChangingParent)
   const canUpdate = Boolean(bulkUpdateSelectedCases) && !isBusy
+  const canChangeParent = Boolean(setParentForSelectedCases) && !isBusy
   const pluralisedCases = `${selectedCount} case${selectedCount === 1 ? "" : "s"}`
   const canApplyTags = !isBusy && caseTags && caseTags.length > 0
 
@@ -1364,6 +1619,40 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
                 )}
               </DropdownMenuSubContent>
             </DropdownMenuSub>
+            {caseAddonsEnabled && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  disabled={!canChangeParent}
+                  onSelect={(event) => {
+                    event.preventDefault()
+                    setParentPickerOpen(true)
+                  }}
+                >
+                  <span className="flex items-center gap-2">
+                    <ListTreeIcon
+                      className="size-3 text-muted-foreground"
+                      aria-hidden
+                    />
+                    <span>Group case</span>
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={!canChangeParent}
+                  onSelect={async () => {
+                    await setParentForSelectedCases?.(null)
+                  }}
+                >
+                  <span className="flex items-center gap-2">
+                    <UngroupIcon
+                      className="size-3 text-muted-foreground"
+                      aria-hidden
+                    />
+                    <span>Ungroup case</span>
+                  </span>
+                </DropdownMenuItem>
+              </>
+            )}
             <DropdownMenuSeparator />
             <DropdownMenuItem
               disabled={isBusy}
@@ -1414,6 +1703,23 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
           </DropdownMenuContent>
         </DropdownMenu>
       </ButtonGroup>
+      <CasePickerDialog
+        open={Boolean(setParentForSelectedCases) && parentPickerOpen}
+        onOpenChange={setParentPickerOpen}
+        workspaceId={workspaceId}
+        title="Group under parent case"
+        description={`Make ${pluralisedCases} sub-cases of a top-level case. Sub-cases are hidden from the cases list by default and listed on the parent case.`}
+        // Parents must be top-level cases.
+        hierarchy="top_level"
+        isCandidate={(item) => !selectedCaseIds.includes(item.id)}
+        confirmLabel={([parent]) =>
+          parent ? `Group under ${parent.short_id}` : "Select a case"
+        }
+        onConfirm={async ([parent]) => {
+          await setParentForSelectedCases?.(parent)
+          return { close: true }
+        }}
+      />
       <AlertDialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -1450,31 +1756,25 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
           if (!open) setCommentText("")
         }}
       >
-        <DialogContent className="max-w-2xl">
-          <DialogHeader className="text-left">
+        <DialogContent size="sm" className="max-w-2xl">
+          <DialogHeader>
             <DialogTitle>Add comment</DialogTitle>
             <DialogDescription>
               Add a comment to {selectedCount} selected
               {selectedCount === 1 ? " case" : " cases"}.
             </DialogDescription>
           </DialogHeader>
-          <SimpleEditor
-            value={commentText}
-            onChange={setCommentText}
-            placeholder="Enter comment..."
-            className="min-h-[150px]"
-          />
-          <DialogFooter className="flex-row justify-end space-x-2">
+          <DialogBody>
+            <SimpleEditor
+              value={commentText}
+              onChange={setCommentText}
+              placeholder="Enter comment..."
+              className="min-h-[150px]"
+            />
+          </DialogBody>
+          <DialogFooter>
             <Button
-              variant="outline"
-              onClick={() => {
-                setCommentDialogOpen(false)
-                setCommentText("")
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
+              size="sm"
               disabled={!commentText.trim() || isAddingComments}
               onClick={handleBulkAddComment}
             >
@@ -1497,31 +1797,25 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
           if (!open) setAppendText("")
         }}
       >
-        <DialogContent className="max-w-2xl">
-          <DialogHeader className="text-left">
+        <DialogContent size="sm" className="max-w-2xl">
+          <DialogHeader>
             <DialogTitle>Append to description</DialogTitle>
             <DialogDescription>
               Append text to the description of {selectedCount} selected
               {selectedCount === 1 ? " case" : " cases"}.
             </DialogDescription>
           </DialogHeader>
-          <SimpleEditor
-            value={appendText}
-            onChange={setAppendText}
-            placeholder="Enter text to append..."
-            className="min-h-[150px]"
-          />
-          <DialogFooter className="flex-row justify-end space-x-2">
+          <DialogBody>
+            <SimpleEditor
+              value={appendText}
+              onChange={setAppendText}
+              placeholder="Enter text to append..."
+              className="min-h-[150px]"
+            />
+          </DialogBody>
+          <DialogFooter>
             <Button
-              variant="outline"
-              onClick={() => {
-                setAppendDialogOpen(false)
-                setAppendText("")
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
+              size="sm"
               disabled={!appendText.trim() || isAppending}
               onClick={handleBulkAppendDescription}
             >
@@ -1579,36 +1873,14 @@ function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
   )
 }
 
-function MembersActions({ view }: { view: MembersViewMode }) {
+function MembersActions() {
   const { workspace } = useWorkspaceDetails()
-  const workspaceId = useWorkspaceId()
 
   if (!workspace) {
     return null
   }
 
-  // Render the appropriate action button based on the current view
-  const actionButton =
-    view === MembersViewMode.Roles ? (
-      <CreateRoleButton workspaceOnly />
-    ) : view === MembersViewMode.Groups ? (
-      <CreateGroupButton />
-    ) : (
-      <AddWorkspaceMember workspace={workspace} />
-    )
-
-  return (
-    <>
-      <MembersViewToggle
-        view={view}
-        membersHref={`/workspaces/${workspaceId}/members`}
-        rolesHref={`/workspaces/${workspaceId}/members/roles`}
-        groupsHref={`/workspaces/${workspaceId}/members/groups`}
-        rbacScope="workspace:rbac:read"
-      />
-      {actionButton}
-    </>
-  )
+  return <AddWorkspaceMember workspace={workspace} />
 }
 
 function CredentialsActions() {
@@ -1617,6 +1889,11 @@ function CredentialsActions() {
 
   return (
     <>
+      <WorkspaceResourceSyncActions
+        label="credential metadata"
+        branchSlug="credentials"
+        resources={["secret_metadata"]}
+      />
       {canCreateSecrets === true && (
         <>
           <Button
@@ -1626,7 +1903,7 @@ function CredentialsActions() {
             onClick={() => setDialogOpen(true)}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
-            Add credential
+            Create credential
           </Button>
           <CreateCredentialDialog
             open={dialogOpen}
@@ -1730,11 +2007,16 @@ function McpAccessActions() {
 function VariablesActions() {
   return (
     <>
+      <WorkspaceResourceSyncActions
+        label="variables"
+        branchSlug="variables"
+        resources={["variable"]}
+      />
       <NewVariableDialog>
         <NewVariableDialogTrigger asChild>
           <Button variant="outline" size="sm" className="h-7 bg-background">
             <Plus className="mr-1 h-3.5 w-3.5" />
-            Add variable
+            Create variable
           </Button>
         </NewVariableDialogTrigger>
       </NewVariableDialog>
@@ -1838,9 +2120,9 @@ function CaseStatusControl({
     useCaseDurationDefinitions(workspaceId, caseAddonsEnabled)
 
   return (
-    <div className="min-w-0">
+    <div className="flex min-w-0 items-center">
       {caseAddonsEnabled ? (
-        <div className="max-w-[min(48vw,36rem)] overflow-x-auto">
+        <div className="no-scrollbar max-w-[min(48vw,36rem)] overflow-x-auto">
           <CaseDurationMetrics
             durations={caseDurations}
             definitions={caseDurationDefinitions}
@@ -1852,6 +2134,181 @@ function CaseStatusControl({
         </div>
       ) : null}
     </div>
+  )
+}
+
+function CaseDetailActions({
+  caseId,
+  workspaceId,
+}: {
+  caseId: string
+  workspaceId: string
+}) {
+  const { caseData } = useGetCase({ caseId, workspaceId })
+
+  return (
+    <>
+      <CaseStatusControl caseId={caseId} workspaceId={workspaceId} />
+      <CaseAgentRunsAction caseId={caseId} workspaceId={workspaceId} />
+      {caseData ? (
+        <CaseVersionHistory
+          workspaceId={workspaceId}
+          caseId={caseId}
+          caseLabel={caseData.short_id}
+        />
+      ) : null}
+    </>
+  )
+}
+
+/**
+ * Forms list actions: push to Git (forms travel inside the workflow file)
+ * and create a form.
+ */
+function FormsListActions() {
+  const enabled = useFormsAccess() === "enabled"
+  const canCreate = useScopeCheck("form:create") === true
+  // The Create form dialog picks from the workflow list.
+  const canReadWorkflows = useScopeCheck("workflow:read") === true
+  const [createOpen, setCreateOpen] = useState(false)
+
+  if (!enabled) {
+    return null
+  }
+  return (
+    <>
+      <WorkspaceResourceSyncActions
+        label="workflows and forms"
+        branchSlug="forms"
+        resources={["workflow"]}
+      />
+      {canCreate && canReadWorkflows && (
+        <>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 bg-background"
+            onClick={() => setCreateOpen(true)}
+          >
+            <Plus className="mr-1 size-3.5" />
+            Create form
+          </Button>
+          <CreateFormDialog open={createOpen} onOpenChange={setCreateOpen} />
+        </>
+      )}
+    </>
+  )
+}
+
+/** "Forms / <title>" and the switch that puts the form online or offline. */
+function FormBreadcrumb({
+  formId,
+  workspaceId,
+}: {
+  formId: string
+  workspaceId: string
+}) {
+  const enabled = useFormsAccess() === "enabled"
+  const canEdit = useScopeCheck("form:update") === true
+  const { data: form, isLoading: formIsLoading } = useFormDetail(
+    { workspaceId, formId },
+    { enabled }
+  )
+  const { mutateAsync: updateForm, isPending: updateFormIsPending } =
+    useUpdateForm({
+      workspaceId,
+      formId,
+    })
+
+  if (!enabled) {
+    return (
+      <h1 className="text-sm font-semibold text-muted-foreground">Forms</h1>
+    )
+  }
+
+  async function setOnline(next: boolean) {
+    try {
+      await updateForm({ status: next ? "online" : "offline" })
+    } catch (error) {
+      toast({
+        title: next
+          ? "Couldn't put the form online"
+          : "Couldn't take the form offline",
+        description:
+          getFormErrorDetail(error)?.message ?? "Something went wrong.",
+        variant: "destructive",
+      })
+    }
+  }
+
+  const online = form?.status === "online"
+  const label = form
+    ? form.config.title || form.workflow_title
+    : (!formIsLoading && "Form not found") || null
+  return (
+    <div className="flex min-w-0 items-center gap-3">
+      <Breadcrumb className="min-w-0">
+        <BreadcrumbList className="flex min-w-0 flex-nowrap items-center gap-2 overflow-hidden whitespace-nowrap text-sm">
+          <BreadcrumbItem>
+            <BreadcrumbLink
+              asChild
+              className="font-semibold hover:no-underline"
+            >
+              <Link href={`/workspaces/${workspaceId}/forms`}>Forms</Link>
+            </BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator className="shrink-0">
+            <span className="text-muted-foreground">/</span>
+          </BreadcrumbSeparator>
+          <BreadcrumbItem className="min-w-0 [&>span]:truncate">
+            <BreadcrumbEntityPage label={label} skeletonClassName="h-4 w-28" />
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+      {form && (
+        <div className="flex flex-none items-center gap-2 text-xs text-muted-foreground">
+          <Switch
+            checked={online}
+            disabled={!canEdit || updateFormIsPending}
+            aria-label="Form online"
+            onCheckedChange={setOnline}
+          />
+          <span>{online ? "Online" : "Offline"}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Form detail actions: Config / Activity tabs, and open as a requester. */
+function FormDetailActions({
+  formId,
+  workspaceId,
+}: {
+  formId: string
+  workspaceId: string
+}) {
+  const enabled = useFormsAccess() === "enabled"
+  const { data: form } = useFormDetail({ workspaceId, formId }, { enabled })
+
+  if (!enabled || !form) {
+    return null
+  }
+  return (
+    <>
+      <FormViewToggle workspaceId={workspaceId} formId={form.id} />
+      <Button
+        asChild
+        variant="outline"
+        size="sm"
+        className="h-7 gap-1.5 bg-background"
+      >
+        <a href={`/forms/${form.id}`} target="_blank" rel="noopener noreferrer">
+          <ExternalLinkIcon className="size-3.5" />
+          Open
+        </a>
+      </Button>
+    </>
   )
 }
 
@@ -1886,11 +2343,18 @@ function TableBreadcrumb({
   )
 }
 
-function TableDetailsActions() {
+function TableDetailsActions({ tableId }: { tableId: string }) {
   return (
     <>
+      <TableSearchProvider key={tableId} tableId={tableId}>
+        <TableSearchBadge />
+      </TableSearchProvider>
+      <WorkspaceResourceSyncActions
+        label="tables"
+        branchSlug="tables"
+        resources={["table"]}
+      />
       <TableSelectionActionsBar />
-      <TableLinkRowsToCaseCommand />
       <TableInsertButton />
     </>
   )
@@ -1903,27 +2367,26 @@ function AgentPresetBreadcrumb({
   presetId: string
   workspaceId: string
 }) {
+  const { workspace } = useWorkspaceDetails()
   const { preset } = useAgentPreset(workspaceId, presetId)
+  const { hasEntitlement } = useEntitlements()
+  const organizationEnabled = hasEntitlement("agent_addons")
+  const { folders } = useAgentFolders(workspaceId, {
+    enabled: organizationEnabled && Boolean(preset?.folder_id),
+  })
+  const folderPath =
+    organizationEnabled && preset?.folder_id
+      ? folders?.find((folder) => folder.id === preset.folder_id)?.path
+      : null
 
   return (
-    <Breadcrumb>
-      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
-        <BreadcrumbItem>
-          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
-            <Link href={`/workspaces/${workspaceId}/agents`}>Agents</Link>
-          </BreadcrumbLink>
-        </BreadcrumbItem>
-        <BreadcrumbSeparator className="shrink-0">
-          <span className="text-muted-foreground">/</span>
-        </BreadcrumbSeparator>
-        <BreadcrumbItem>
-          <BreadcrumbEntityPage
-            label={preset?.name}
-            skeletonClassName="h-4 w-32"
-          />
-        </BreadcrumbItem>
-      </BreadcrumbList>
-    </Breadcrumb>
+    <FolderPathBreadcrumb
+      rootLabel={workspace?.name ?? <Skeleton className="h-4 w-20" />}
+      rootHref={`/workspaces/${workspaceId}/agents`}
+      folderPath={folderPath}
+      currentPage={preset?.name}
+      currentPageFallback={<Skeleton className="h-4 w-32" />}
+    />
   )
 }
 
@@ -1988,7 +2451,17 @@ function getPageConfig(
             workspaceId={workspaceId}
           />
         ),
-        actions: null,
+        actions: (
+          <AgentPresetDetailHeaderActions
+            syncActions={
+              <WorkspaceResourceSyncActions
+                label="agents"
+                branchSlug="agents"
+                resources={["agent_preset"]}
+              />
+            }
+          />
+        ),
       }
     }
 
@@ -2036,6 +2509,24 @@ function getPageConfig(
     }
   }
 
+  if (pagePath.startsWith("/forms")) {
+    const formMatch = pagePath.match(/^\/forms\/([^/]+)$/)
+    if (formMatch) {
+      const formId = formMatch[1]
+      return {
+        title: <FormBreadcrumb formId={formId} workspaceId={workspaceId} />,
+        actions: (
+          <FormDetailActions formId={formId} workspaceId={workspaceId} />
+        ),
+      }
+    }
+
+    return {
+      title: "Forms",
+      actions: <FormsListActions />,
+    }
+  }
+
   if (pagePath.startsWith("/tables")) {
     // Check if this is a table detail page
     const tableMatch = pagePath.match(/^\/tables\/([^/]+)$/)
@@ -2043,7 +2534,7 @@ function getPageConfig(
       const tableId = tableMatch[1]
       return {
         title: <TableBreadcrumb tableId={tableId} workspaceId={workspaceId} />,
-        actions: <TableDetailsActions />,
+        actions: <TableDetailsActions tableId={tableId} />,
       }
     }
 
@@ -2063,11 +2554,52 @@ function getPageConfig(
   if (pagePath.startsWith("/actions")) {
     return {
       title: "Actions",
-      actions: <RegistryActionsControls />,
     }
   }
 
   if (pagePath.startsWith("/skills")) {
+    if (pagePath === "/skills/library") {
+      return {
+        title: <SkillLibraryProviderBreadcrumb workspaceId={workspaceId} />,
+        actions: <SkillsActions />,
+      }
+    }
+
+    if (pagePath === "/skills/tags") {
+      return {
+        title: "Skills",
+        actions: <SkillsActions />,
+      }
+    }
+
+    const librarySkillMatch = pagePath.match(
+      /^\/skills\/library\/([^/]+)\/([^/]+)$/
+    )
+    if (librarySkillMatch) {
+      return {
+        title: (
+          <SkillLibraryProviderBreadcrumb
+            workspaceId={workspaceId}
+            providerSlug={librarySkillMatch[1]}
+            skillSlug={librarySkillMatch[2]}
+          />
+        ),
+        actions: <SkillLibrarySkillActions slug={librarySkillMatch[2]} />,
+      }
+    }
+
+    const providerMatch = pagePath.match(/^\/skills\/library\/([^/]+)$/)
+    if (providerMatch) {
+      return {
+        title: (
+          <SkillLibraryProviderBreadcrumb
+            workspaceId={workspaceId}
+            providerSlug={providerMatch[1]}
+          />
+        ),
+      }
+    }
+
     const skillMatch = pagePath.match(/^\/skills\/([^/]+)$/)
     if (skillMatch) {
       return {
@@ -2076,13 +2608,26 @@ function getPageConfig(
         ),
         actions: (
           <>
+            <WorkspaceResourceSyncActions
+              label="skills"
+              branchSlug="skills"
+              resources={["skill"]}
+            />
             <SkillsDetailActions />
           </>
         ),
       }
     }
+    const skillsView = searchParams?.get("view") === "list" ? "list" : "folders"
     return {
-      title: "Skills",
+      title: (
+        <SkillsFoldersBreadcrumb
+          workspaceId={workspaceId}
+          path={
+            skillsView === "folders" ? (searchParams?.get("path") ?? "/") : "/"
+          }
+        />
+      ),
       actions: <SkillsActions />,
     }
   }
@@ -2115,6 +2660,13 @@ function getPageConfig(
     }
   }
 
+  if (pagePath === "/tunnels") {
+    return {
+      title: "Tunnels",
+      actions: <CreateTunnelButton />,
+    }
+  }
+
   if (pagePath.startsWith("/variables")) {
     return {
       title: "Variables",
@@ -2125,21 +2677,7 @@ function getPageConfig(
   if (pagePath === "/members") {
     return {
       title: "Members",
-      actions: <MembersActions view={MembersViewMode.Members} />,
-    }
-  }
-
-  if (pagePath === "/members/roles") {
-    return {
-      title: "Roles",
-      actions: <MembersActions view={MembersViewMode.Roles} />,
-    }
-  }
-
-  if (pagePath === "/members/groups") {
-    return {
-      title: "Groups",
-      actions: <MembersActions view={MembersViewMode.Groups} />,
+      actions: <MembersActions />,
     }
   }
 
@@ -2168,10 +2706,6 @@ export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
   const pageConfig = pathname
     ? getPageConfig(pathname, workspaceId, searchParams ?? null)
     : null
-  const { caseData } = useGetCase(
-    { caseId: caseId ?? "", workspaceId },
-    { enabled: Boolean(caseId) }
-  )
 
   useEffect(() => {
     if (!onToggleChat) {
@@ -2233,29 +2767,21 @@ export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
     return null
   }
 
-  // Check if this is a case detail page to show timestamp
-  // Only apply background for case detail pages with status tints.
-  // Non-case pages should be transparent to avoid painting over SidebarInset's rounded corners.
-  const headerBackgroundClass = caseId
-    ? caseData?.status
-      ? CASE_STATUS_TINTS[caseData.status]
-      : "bg-muted/5 dark:bg-muted/[0.12]"
-    : ""
-
   const titleContent =
     typeof pageConfig.title === "string" ? (
-      <h1 className="text-sm font-semibold">{pageConfig.title}</h1>
+      <h1 className="text-sm font-semibold text-muted-foreground">
+        {pageConfig.title}
+      </h1>
     ) : (
       pageConfig.title
     )
 
   return (
-    <header
-      className={cn(
-        "flex h-10 items-center border-b px-3 overflow-hidden transition-colors",
-        headerBackgroundClass
-      )}
-    >
+    // Transparent at every route, cases included: a status-tinted band read as
+    // a colour wash across the top of the app and fought the duration pills
+    // sitting in it. The status already has three homes — the pill in this
+    // header, the Properties rail, and the case list.
+    <header className="flex h-10 items-center overflow-hidden border-b px-3">
       {/* Left section: sidebar toggle + title */}
       <div className="flex items-center gap-3 min-w-0">
         <SidebarTrigger className="h-7 w-7 flex-shrink-0" />
@@ -2283,7 +2809,7 @@ export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
         {pageConfig.actions
           ? pageConfig.actions
           : caseId && (
-              <CaseStatusControl caseId={caseId} workspaceId={workspaceId} />
+              <CaseDetailActions caseId={caseId} workspaceId={workspaceId} />
             )}
 
         {onToggleChat && (

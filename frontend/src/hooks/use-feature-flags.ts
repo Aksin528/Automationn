@@ -1,6 +1,5 @@
-import { useQuery } from "@tanstack/react-query"
-
 import { type FeatureFlag, featureFlagsGetFeatureFlags } from "@/client"
+import { useQuery } from "@/lib/query"
 
 // Hook for components to check feature flags
 export function useFeatureFlag(): {
@@ -22,7 +21,9 @@ export function useFeatureFlag(): {
     refetchOnWindowFocus: false,
   })
 
-  const hasFeatureData = featureFlags !== undefined
+  // React Query keeps the last good flags when a refetch fails, while
+  // `isFeatureEnabled` below answers false; both distrust an errored result.
+  const hasFeatureData = featureFlags !== undefined && !error
 
   return {
     isFeatureEnabled: (flag: FeatureFlag) => {

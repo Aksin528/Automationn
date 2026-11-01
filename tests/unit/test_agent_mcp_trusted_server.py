@@ -1,23 +1,51 @@
+import asyncio
 import uuid
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
+import jwt
 import pytest
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
+from fastmcp.utilities.tests import run_server_async
+from mcp.types import CallToolResult, TextContent
+from pydantic import ValidationError
+from temporalio.exceptions import CancelledError as TemporalCancelledError
 
-from tracecat.agent.common.types import MCPToolDefinition
+from tracecat.agent.common.types import MCPHttpServerConfig, MCPToolDefinition
 from tracecat.agent.mcp import trusted_server
 from tracecat.agent.mcp.metadata import PROXY_TOOL_CALL_ID_KEY, PROXY_TOOL_METADATA_KEY
-from tracecat.agent.mcp.user_client import UserMCPClient
+from tracecat.agent.mcp.stdio_probe import NsjailStdioMCPRunner
+from tracecat.agent.mcp.stdio_probe_types import StdioMCPProbeResult
+from tracecat.agent.mcp.stdio_runner import StdioMCPServer
+from tracecat.agent.mcp.user_client import UserMCPClient, UserMCPDiscoveryResult
 from tracecat.agent.preset.service import AgentPresetService
-from tracecat.agent.tokens import MCPTokenClaims, UserMCPServerClaim
-from tracecat.exceptions import BuiltinRegistryHasNoSelectionError
+from tracecat.agent.preset.types import StdioMCPIntegrationSnapshot
+from tracecat.agent.tokens import (
+    MCPTokenClaims,
+    UserMCPServerClaim,
+    mint_mcp_token,
+    verify_mcp_token,
+)
+from tracecat.auth.secrets import get_service_key
+from tracecat.exceptions import (
+    BuiltinRegistryHasNoSelectionError,
+    TracecatValidationError,
+)
+from tracecat.integrations.schemas import MCPToolSummary
 from tracecat.registry.lock.types import RegistryLock
+
+
+@pytest.fixture(autouse=True)
+def clear_user_mcp_discovery_cache() -> None:
+    trusted_server._USER_MCP_DISCOVERY_CACHE.clear()
 
 
 def _build_claims(
     *,
     allowed_actions: list[str] | None = None,
+    deferred_actions: list[str] | None = None,
     allowed_internal_tools: list[str] | None = None,
     user_mcp_servers: list[UserMCPServerClaim] | None = None,
     registry_lock: RegistryLock | None = None,
@@ -29,6 +57,7 @@ def _build_claims(
         parent_agent_workflow_id="agent/00000000-0000-0000-0000-000000000003",
         parent_agent_run_id="run-123",
         allowed_actions=allowed_actions or ["core.http_request"],
+        deferred_actions=deferred_actions or [],
         allowed_internal_tools=allowed_internal_tools or [],
         user_mcp_servers=user_mcp_servers or [],
         registry_lock=registry_lock,
@@ -77,6 +106,27 @@ async def test_execute_user_mcp_tool_returns_descriptive_error_on_execution_erro
             {},
             claims,
         )
+
+
+@pytest.mark.anyio
+async def test_execute_user_mcp_tool_passes_string_result_through_unwrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flattened text must not be quote-wrapped and re-escaped by json.dumps."""
+    flattened = 'status: "ok"\n\nline two'
+    mock_client = AsyncMock()
+    mock_client.call_tool.return_value = flattened
+    monkeypatch.setattr(trusted_server, "UserMCPClient", lambda _: mock_client)
+    claims = _build_claims(
+        allowed_actions=["core.http_request", "mcp__Jira__getIssue"],
+        user_mcp_servers=[
+            UserMCPServerClaim(name="Jira", url="https://mcp.atlassian.com/v1/mcp")
+        ],
+    )
+
+    result = await trusted_server._execute_user_mcp("Jira", "getIssue", {}, claims)
+
+    assert result == flattened
 
 
 @pytest.mark.anyio
@@ -149,6 +199,7 @@ async def test_execute_user_mcp_tool_uses_claimed_name_for_resolved_config(
             "url": "https://mcp.atlassian.com/v1/mcp",
             "transport": "http",
             "headers": {"Authorization": "Bearer secret"},
+            "id": str(integration_id),
         }
     ]
     assert call_args == {
@@ -228,6 +279,28 @@ async def test_execute_action_tool_uses_registry_lock_from_token(
 
 
 @pytest.mark.anyio
+async def test_execute_action_tool_translates_remote_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        trusted_server,
+        "execute_action",
+        AsyncMock(side_effect=TemporalCancelledError("tool cancelled")),
+    )
+    registry_lock = RegistryLock(
+        origins={"tracecat_registry": "pinned-version"},
+        actions={"core.http_request": "tracecat_registry"},
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await trusted_server._execute_registry_action(
+            "core.http_request",
+            {"url": "https://example.com"},
+            _build_claims(registry_lock=registry_lock),
+        )
+
+
+@pytest.mark.anyio
 async def test_execute_action_tool_surfaces_builtin_registry_sync_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -284,45 +357,9 @@ async def test_build_token_scoped_tools_does_not_advertise_internal_from_actions
         allowed_actions=["internal.builder.get_session"],
         allowed_internal_tools=[],
     )
-    tools = await trusted_server.build_token_scoped_tools(claims)
+    tools = (await trusted_server._build_token_scoped_tools(claims)).tools
 
     assert tools == []
-
-
-@pytest.mark.anyio
-async def test_token_scoped_fastmcp_get_tool_reuses_token_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    claims = _build_claims(allowed_actions=["core.cases.list_cases"])
-    tool = trusted_server._build_scoped_tool(
-        tool_name="core__cases__list_cases",
-        description="List cases",
-        parameters_json_schema={"type": "object"},
-        claims=claims,
-    )
-    build_token_scoped_tools = AsyncMock(return_value=[tool])
-
-    monkeypatch.setattr(
-        trusted_server,
-        "get_http_headers",
-        lambda include: {"authorization": "Bearer token"},
-    )
-    monkeypatch.setattr(
-        trusted_server,
-        "_claims_from_authorization_header",
-        lambda authorization: claims,
-    )
-    monkeypatch.setattr(
-        trusted_server,
-        "build_token_scoped_tools",
-        build_token_scoped_tools,
-    )
-
-    mcp = trusted_server.TokenScopedFastMCP("test")
-
-    assert await mcp.get_tool("core__cases__list_cases") is tool
-    assert await mcp.get_tool("core__cases__list_cases") is tool
-    build_token_scoped_tools.assert_awaited_once_with(claims)
 
 
 @pytest.mark.anyio
@@ -352,7 +389,7 @@ async def test_build_token_scoped_tools_filters_root_catalog(
     )
 
     claims = _build_claims(allowed_actions=["core.cases.list_cases"])
-    tools = await trusted_server.build_token_scoped_tools(claims)
+    tools = (await trusted_server._build_token_scoped_tools(claims)).tools
 
     assert [tool.name for tool in tools] == ["core__cases__list_cases"]
     schema = tools[0].parameters
@@ -408,7 +445,7 @@ async def test_build_token_scoped_tools_uses_registry_lock_catalog(
         allowed_actions=["core.cases.list_cases"],
         registry_lock=lock,
     )
-    tools = await trusted_server.build_token_scoped_tools(claims)
+    tools = (await trusted_server._build_token_scoped_tools(claims)).tools
 
     assert [tool.name for tool in tools] == ["core__cases__list_cases"]
     schema = tools[0].parameters
@@ -439,23 +476,26 @@ async def test_build_token_scoped_tools_filters_subagent_catalog(
         def __init__(self, configs: list[dict[str, Any]]) -> None:
             self.configs = configs
 
-        async def discover_tools(self) -> dict[str, MCPToolDefinition]:
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
             assert [config["name"] for config in self.configs] == ["Jira"]
-            return {
-                "mcp__Jira__getIssue": MCPToolDefinition(
-                    name="mcp__Jira__getIssue",
-                    description="Get issue",
-                    parameters_json_schema={
-                        "type": "object",
-                        "properties": {"issueKey": {"type": "string"}},
-                    },
-                ),
-                "mcp__Jira__listProjects": MCPToolDefinition(
-                    name="mcp__Jira__listProjects",
-                    description="List projects",
-                    parameters_json_schema={"type": "object"},
-                ),
-            }
+            return UserMCPDiscoveryResult(
+                definitions={
+                    "mcp__Jira__getIssue": MCPToolDefinition(
+                        name="mcp__Jira__getIssue",
+                        description="Get issue",
+                        parameters_json_schema={
+                            "type": "object",
+                            "properties": {"issueKey": {"type": "string"}},
+                        },
+                    ),
+                    "mcp__Jira__listProjects": MCPToolDefinition(
+                        name="mcp__Jira__listProjects",
+                        description="List projects",
+                        parameters_json_schema={"type": "object"},
+                    ),
+                },
+                failed_servers={},
+            )
 
     monkeypatch.setattr(
         trusted_server,
@@ -475,13 +515,564 @@ async def test_build_token_scoped_tools_filters_subagent_catalog(
         ],
     )
 
-    tools = await trusted_server.build_token_scoped_tools(claims)
+    tools = (await trusted_server._build_token_scoped_tools(claims)).tools
 
     assert [tool.name for tool in tools] == [
         "core__cases__list_cases",
         "internal__builder__get_session",
         "mcp__Jira__getIssue",
     ]
+
+
+@pytest.mark.anyio
+async def test_user_mcp_discovery_cache_is_scoped_by_claimed_server_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    integration_id = uuid.UUID("00000000-0000-0000-0000-000000000004")
+
+    async def fake_fetch_tool_definitions(
+        action_names: list[str],
+    ) -> dict[str, MCPToolDefinition]:
+        assert action_names == []
+        return {}
+
+    class _PresetServiceContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def resolve_mcp_integration_refs(self, integration_ids):
+            assert integration_ids == [str(integration_id)]
+            return [
+                {
+                    "type": "http",
+                    "name": "Stored server name",
+                    "url": "https://mcp.example.com/v1",
+                    "transport": "http",
+                    "id": str(integration_id),
+                }
+            ]
+
+        async def resolve_mcp_integration_secrets(self, resolved_integration_id):
+            assert resolved_integration_id == integration_id
+            return {}
+
+    discovered_config_names: list[list[str]] = []
+
+    class _FakeUserMCPClient:
+        parse_user_mcp_tool_name = staticmethod(UserMCPClient.parse_user_mcp_tool_name)
+
+        def __init__(self, configs: list[dict[str, Any]]) -> None:
+            self.configs = configs
+            discovered_config_names.append([config["name"] for config in configs])
+
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
+            assert len(self.configs) == 1
+            server_name = self.configs[0]["name"]
+            tool_name = f"mcp__{server_name}__getIssue"
+            return UserMCPDiscoveryResult(
+                definitions={
+                    tool_name: MCPToolDefinition(
+                        name=tool_name,
+                        description=f"Get issue from {server_name}",
+                        parameters_json_schema={"type": "object"},
+                    )
+                },
+                failed_servers={},
+            )
+
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions",
+        fake_fetch_tool_definitions,
+    )
+    monkeypatch.setattr(
+        AgentPresetService,
+        "with_session",
+        lambda role=None: _PresetServiceContext(),
+    )
+    monkeypatch.setattr(trusted_server, "UserMCPClient", _FakeUserMCPClient)
+
+    def claims_for_server(server_name: str) -> MCPTokenClaims:
+        return _build_claims(
+            allowed_actions=[f"mcp__{server_name}__getIssue"],
+            user_mcp_servers=[UserMCPServerClaim(name=server_name, id=integration_id)],
+        )
+
+    jira_tools = (
+        await trusted_server._build_token_scoped_tools(claims_for_server("Jira"))
+    ).tools
+    linear_tools = (
+        await trusted_server._build_token_scoped_tools(claims_for_server("Linear"))
+    ).tools
+
+    assert [tool.name for tool in jira_tools] == ["mcp__Jira__getIssue"]
+    assert [tool.name for tool in linear_tools] == ["mcp__Linear__getIssue"]
+    assert discovered_config_names == [["Jira"], ["Linear"]]
+    empty_headers_digest = trusted_server._user_mcp_headers_digest({})
+    assert set(trusted_server._USER_MCP_DISCOVERY_CACHE) == {
+        trusted_server._UserMCPDiscoveryCacheKey(
+            workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+            integration_id=str(integration_id),
+            tunnel_id=None,
+            server_name="Jira",
+            url="https://mcp.example.com/v1",
+            transport="http",
+            timeout=None,
+            headers_digest=empty_headers_digest,
+        ),
+        trusted_server._UserMCPDiscoveryCacheKey(
+            workspace_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+            integration_id=str(integration_id),
+            tunnel_id=None,
+            server_name="Linear",
+            url="https://mcp.example.com/v1",
+            transport="http",
+            timeout=None,
+            headers_digest=empty_headers_digest,
+        ),
+    }
+
+
+@pytest.mark.anyio
+async def test_user_mcp_discovery_cache_is_scoped_by_workspace_and_tunnel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two workspaces whose integrations share a name, URL and credentials but
+    reach different servers through their own tunnels never share schemas."""
+    other_workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000009")
+    integration_id = uuid.UUID("00000000-0000-0000-0000-000000000004")
+    tunnel_by_workspace = {
+        uuid.UUID("00000000-0000-0000-0000-000000000001"): str(uuid.uuid4()),
+        other_workspace_id: str(uuid.uuid4()),
+    }
+
+    async def fake_fetch_tool_definitions(
+        action_names: list[str],
+    ) -> dict[str, MCPToolDefinition]:
+        return {}
+
+    class _PresetServiceContext:
+        def __init__(self, role) -> None:
+            self.role = role
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def resolve_mcp_integration_refs(self, integration_ids):
+            return [
+                {
+                    "type": "http",
+                    "name": "jira",
+                    "url": "https://jira.internal/mcp",
+                    "id": str(integration_id),
+                    "tunnel_id": tunnel_by_workspace[self.role.workspace_id],
+                }
+            ]
+
+        async def resolve_mcp_integration_secrets(self, resolved_integration_id):
+            return {}
+
+    async def fake_resolve_proxy(*, workspace_id, tunnel_id, **_: Any) -> str:
+        return f"http://token@gateway-{tunnel_id}:8080"
+
+    discovered_proxies: list[str] = []
+
+    class _FakeUserMCPClient:
+        parse_user_mcp_tool_name = staticmethod(UserMCPClient.parse_user_mcp_tool_name)
+
+        def __init__(self, configs: list[dict[str, Any]]) -> None:
+            self.configs = configs
+
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
+            proxy = self.configs[0]["tunnel_proxy"]
+            discovered_proxies.append(proxy)
+            return UserMCPDiscoveryResult(
+                definitions={
+                    "mcp__jira__getIssue": MCPToolDefinition(
+                        name="mcp__jira__getIssue",
+                        description=f"Schema behind {proxy}",
+                        parameters_json_schema={"type": "object"},
+                    )
+                },
+                failed_servers={},
+            )
+
+    monkeypatch.setattr(
+        trusted_server, "fetch_tool_definitions", fake_fetch_tool_definitions
+    )
+    monkeypatch.setattr(
+        AgentPresetService,
+        "with_session",
+        lambda role=None: _PresetServiceContext(role),
+    )
+    monkeypatch.setattr(trusted_server, "resolve_mcp_tunnel_proxy", fake_resolve_proxy)
+    monkeypatch.setattr(trusted_server, "UserMCPClient", _FakeUserMCPClient)
+
+    claims = _build_claims(
+        allowed_actions=["mcp__jira__getIssue"],
+        user_mcp_servers=[UserMCPServerClaim(name="jira", id=integration_id)],
+    )
+    other_claims = claims.model_copy(update={"workspace_id": other_workspace_id})
+
+    first = (await trusted_server._build_token_scoped_tools(claims)).tools
+    second = (await trusted_server._build_token_scoped_tools(other_claims)).tools
+
+    assert len(discovered_proxies) == 2
+    assert [tool.description for tool in first] == [
+        f"Schema behind {discovered_proxies[0]}"
+    ]
+    assert [tool.description for tool in second] == [
+        f"Schema behind {discovered_proxies[1]}"
+    ]
+
+
+@pytest.mark.anyio
+async def test_user_mcp_discovery_cache_legacy_key_includes_header_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_fetch_tool_definitions(
+        action_names: list[str],
+    ) -> dict[str, MCPToolDefinition]:
+        assert action_names == []
+        return {}
+
+    discovered_credentials: list[str] = []
+
+    class _FakeUserMCPClient:
+        parse_user_mcp_tool_name = staticmethod(UserMCPClient.parse_user_mcp_tool_name)
+
+        def __init__(self, configs: list[dict[str, Any]]) -> None:
+            self.configs = configs
+
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
+            assert len(self.configs) == 1
+            headers = self.configs[0].get("headers", {})
+            assert isinstance(headers, dict)
+            credential_name = {
+                "Bearer token-a": "credential-a",
+                "Bearer token-b": "credential-b",
+            }[headers["Authorization"]]
+            discovered_credentials.append(credential_name)
+            return UserMCPDiscoveryResult(
+                definitions={
+                    "mcp__Jira__getIssue": MCPToolDefinition(
+                        name="mcp__Jira__getIssue",
+                        description=f"Get issue for {credential_name}",
+                        parameters_json_schema={"type": "object"},
+                    )
+                },
+                failed_servers={},
+            )
+
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions",
+        fake_fetch_tool_definitions,
+    )
+    monkeypatch.setattr(trusted_server, "UserMCPClient", _FakeUserMCPClient)
+
+    def claims_for_header(authorization: str) -> MCPTokenClaims:
+        return _build_claims(
+            allowed_actions=["mcp__Jira__getIssue"],
+            user_mcp_servers=[
+                UserMCPServerClaim(
+                    name="Jira",
+                    url="https://mcp.example.com/v1",
+                    headers={"Authorization": authorization},
+                )
+            ],
+        )
+
+    first_tools = (
+        await trusted_server._build_token_scoped_tools(
+            claims_for_header("Bearer token-a")
+        )
+    ).tools
+    second_tools = (
+        await trusted_server._build_token_scoped_tools(
+            claims_for_header("Bearer token-b")
+        )
+    ).tools
+
+    assert [tool.description for tool in first_tools] == ["Get issue for credential-a"]
+    assert [tool.description for tool in second_tools] == ["Get issue for credential-b"]
+    assert discovered_credentials == ["credential-a", "credential-b"]
+
+    header_digests: list[str] = []
+    for key in trusted_server._USER_MCP_DISCOVERY_CACHE:
+        assert key.server_name == "Jira"
+        assert key.url == "https://mcp.example.com/v1"
+        header_digests.append(key.headers_digest)
+        assert "Bearer token" not in repr(key)
+    assert len(header_digests) == 2
+    assert len(set(header_digests)) == 2
+
+
+def test_user_mcp_discovery_cache_key_tracks_resolved_config() -> None:
+    def config(**overrides: Any) -> MCPHttpServerConfig:
+        base: dict[str, Any] = {
+            "type": "http",
+            "name": "Jira",
+            "url": "https://mcp.example.com/v1",
+            "transport": "http",
+            "headers": {"Authorization": "Bearer token-a"},
+            "id": "00000000-0000-0000-0000-000000000004",
+        }
+        base.update(overrides)
+        return cast(MCPHttpServerConfig, base)
+
+    workspace_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+    def key_for(
+        cfg: MCPHttpServerConfig, workspace: uuid.UUID = workspace_id
+    ) -> trusted_server._UserMCPDiscoveryCacheKey:
+        return trusted_server._user_mcp_discovery_cache_key(cfg, workspace)
+
+    key = key_for(config())
+    assert key == key_for(config())
+    # Editing an integration's URL or credentials without changing its id
+    # must miss the cache.
+    assert key != key_for(config(url="https://mcp.example.com/v2"))
+    assert key != key_for(config(headers={"Authorization": "Bearer token-b"}))
+    assert key != key_for(config(transport="sse"))
+    assert key != key_for(config(timeout=5))
+    # The same URL and credentials can reach different servers through
+    # different tunnels or workspaces; their schemas must never be shared.
+    assert key != key_for(config(id="00000000-0000-0000-0000-000000000005"))
+    assert key != key_for(config(tunnel_id="00000000-0000-0000-0000-000000000006"))
+    assert key != key_for(config(), uuid.UUID("00000000-0000-0000-0000-000000000002"))
+    assert "Bearer token-a" not in repr(key)
+
+
+@pytest.mark.anyio
+async def test_partial_discovery_failure_is_not_pinned_to_token_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = _build_claims(
+        allowed_actions=["mcp__Alpha__ping", "mcp__Beta__ping"],
+        user_mcp_servers=[
+            UserMCPServerClaim(name="Alpha", url="https://alpha.example.com/mcp"),
+            UserMCPServerClaim(name="Beta", url="https://beta.example.com/mcp"),
+        ],
+    )
+
+    async def fake_fetch_tool_definitions(
+        action_names: list[str],
+    ) -> dict[str, MCPToolDefinition]:
+        assert action_names == []
+        return {}
+
+    beta_failing = [True]
+    client_instantiations: list[list[str]] = []
+
+    class _FakeUserMCPClient:
+        parse_user_mcp_tool_name = staticmethod(UserMCPClient.parse_user_mcp_tool_name)
+
+        def __init__(self, configs: list[dict[str, Any]]) -> None:
+            client_instantiations.append([config["name"] for config in configs])
+            self.configs = configs
+
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
+            definitions: dict[str, MCPToolDefinition] = {}
+            failed_servers: dict[str, str] = {}
+            for config in self.configs:
+                server_name = config["name"]
+                if server_name == "Beta" and beta_failing[0]:
+                    failed_servers["Beta"] = "TransportError"
+                    continue
+                tool_name = f"mcp__{server_name}__ping"
+                definitions[tool_name] = MCPToolDefinition(
+                    name=tool_name,
+                    description=f"Ping {server_name}",
+                    parameters_json_schema={"type": "object"},
+                )
+            return UserMCPDiscoveryResult(
+                definitions=definitions,
+                failed_servers=failed_servers,
+            )
+
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions",
+        fake_fetch_tool_definitions,
+    )
+    monkeypatch.setattr(trusted_server, "UserMCPClient", _FakeUserMCPClient)
+    monkeypatch.setattr(
+        trusted_server,
+        "_authorization_header_from_request",
+        lambda: "Bearer test-token",
+    )
+    monkeypatch.setattr(
+        trusted_server,
+        "_claims_from_authorization_header",
+        lambda authorization: claims,
+    )
+
+    server = trusted_server.TokenScopedFastMCP("test")
+
+    partial = await server._tools_from_request()
+    assert [tool.name for tool in partial] == [
+        "mcp__Alpha__ping",
+        "mcp__Beta__ping",
+    ]
+    unavailable = partial[1]
+    assert unavailable.description is not None
+    assert "Unavailable user MCP tool" in unavailable.description
+    with pytest.raises(
+        ToolError,
+        match=(
+            "User MCP tool 'ping' on server 'Beta' is unavailable: "
+            "MCP discovery failed for server 'Beta' \\(TransportError\\)"
+        ),
+    ):
+        await unavailable.run({})
+
+    beta_failing[0] = False
+    recovered = await server._tools_from_request()
+    assert [tool.name for tool in recovered] == [
+        "mcp__Alpha__ping",
+        "mcp__Beta__ping",
+    ]
+
+    cached = await server._tools_from_request()
+    assert [tool.name for tool in cached] == ["mcp__Alpha__ping", "mcp__Beta__ping"]
+    # The second listing retried only the failed server (Alpha came from the
+    # discovery cache); the third was served from the token cache entirely.
+    assert client_instantiations == [["Alpha", "Beta"], ["Beta"]]
+
+
+@pytest.mark.anyio
+async def test_total_discovery_failure_returns_unavailable_tool_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = _build_claims(
+        allowed_actions=["mcp__Jira__getIssue"],
+        user_mcp_servers=[
+            UserMCPServerClaim(name="Jira", url="https://jira.example.com/mcp"),
+        ],
+    )
+
+    async def fake_fetch_tool_definitions(
+        action_names: list[str],
+    ) -> dict[str, MCPToolDefinition]:
+        assert action_names == []
+        return {}
+
+    jira_failing = [True]
+    client_instantiations: list[list[str]] = []
+
+    class _FakeUserMCPClient:
+        parse_user_mcp_tool_name = staticmethod(UserMCPClient.parse_user_mcp_tool_name)
+
+        def __init__(self, configs: list[dict[str, Any]]) -> None:
+            client_instantiations.append([config["name"] for config in configs])
+            self.configs = configs
+
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
+            if jira_failing[0]:
+                return UserMCPDiscoveryResult(
+                    definitions={},
+                    failed_servers={"Jira": "HTTPStatusError(status_code=503)"},
+                )
+            return UserMCPDiscoveryResult(
+                definitions={
+                    "mcp__Jira__getIssue": MCPToolDefinition(
+                        name="mcp__Jira__getIssue",
+                        description="Get issue",
+                        parameters_json_schema={"type": "object"},
+                    )
+                },
+                failed_servers={},
+            )
+
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions",
+        fake_fetch_tool_definitions,
+    )
+    monkeypatch.setattr(trusted_server, "UserMCPClient", _FakeUserMCPClient)
+    monkeypatch.setattr(
+        trusted_server,
+        "_authorization_header_from_request",
+        lambda: "Bearer test-token",
+    )
+    monkeypatch.setattr(
+        trusted_server,
+        "_claims_from_authorization_header",
+        lambda authorization: claims,
+    )
+
+    server = trusted_server.TokenScopedFastMCP("test")
+
+    degraded = await server._tools_from_request()
+    assert [tool.name for tool in degraded] == ["mcp__Jira__getIssue"]
+    assert degraded[0].description is not None
+    assert "Unavailable user MCP tool" in degraded[0].description
+    with pytest.raises(
+        ToolError,
+        match=(
+            "User MCP tool 'getIssue' on server 'Jira' is unavailable: "
+            "MCP discovery failed for server 'Jira' "
+            "\\(HTTPStatusError\\(status_code=503\\)\\)"
+        ),
+    ):
+        await degraded[0].run({"issueKey": "ISSUE-1"})
+
+    assert await server.get_tool("mcp__Jira__getIssue") is not None
+
+    jira_failing[0] = False
+    recovered = await server._tools_from_request()
+    assert [tool.description for tool in recovered] == ["Get issue"]
+    assert client_instantiations == [["Jira"], ["Jira"], ["Jira"]]
+
+
+@pytest.mark.anyio
+async def test_discovery_skips_servers_without_allowed_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = _build_claims(
+        allowed_actions=["mcp__Alpha__ping"],
+        user_mcp_servers=[
+            UserMCPServerClaim(name="Alpha", url="https://alpha.example.com/mcp"),
+            UserMCPServerClaim(name="Bravo", url="https://bravo.example.com/mcp"),
+        ],
+    )
+
+    class _FakeUserMCPClient:
+        parse_user_mcp_tool_name = staticmethod(UserMCPClient.parse_user_mcp_tool_name)
+
+        def __init__(self, configs: list[dict[str, Any]]) -> None:
+            assert [config["name"] for config in configs] == ["Alpha"], (
+                "servers without allowed tools must not be contacted"
+            )
+            self.configs = configs
+
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
+            return UserMCPDiscoveryResult(
+                definitions={
+                    "mcp__Alpha__ping": MCPToolDefinition(
+                        name="mcp__Alpha__ping",
+                        description="Ping Alpha",
+                        parameters_json_schema={"type": "object"},
+                    )
+                },
+                failed_servers={},
+            )
+
+    monkeypatch.setattr(trusted_server, "UserMCPClient", _FakeUserMCPClient)
+
+    definitions, failed_servers = await trusted_server._discover_allowed_user_mcp_tools(
+        claims
+    )
+
+    assert list(definitions) == ["mcp__Alpha__ping"]
+    assert failed_servers == {}
 
 
 @pytest.mark.parametrize(
@@ -616,3 +1207,718 @@ async def test_token_scoped_mcp_call_requires_bearer_auth(
 
     with pytest.raises(ToolError, match="Authentication failed"):
         await trusted_server.mcp.call_tool("core__cases__list_cases", {})
+
+
+@pytest.mark.anyio
+async def test_build_token_scoped_tools_lists_deferred_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_fetch_tool_definitions(
+        action_names: list[str],
+    ) -> dict[str, MCPToolDefinition]:
+        assert action_names == ["core.cases.list_cases", "core.cases.delete_case"]
+        return {
+            name: MCPToolDefinition(
+                name=name,
+                description=name,
+                parameters_json_schema={"type": "object"},
+            )
+            for name in action_names
+        }
+
+    class _FakeUserMCPClient:
+        parse_user_mcp_tool_name = staticmethod(UserMCPClient.parse_user_mcp_tool_name)
+
+        def __init__(self, configs: list[dict[str, Any]]) -> None:
+            self.configs = configs
+
+        async def discover_tools_detailed(self) -> UserMCPDiscoveryResult:
+            return UserMCPDiscoveryResult(
+                definitions={
+                    name: MCPToolDefinition(
+                        name=name,
+                        description=name,
+                        parameters_json_schema={"type": "object"},
+                    )
+                    for name in (
+                        "mcp__Jira__getIssue",
+                        "mcp__Jira__deleteIssue",
+                        "mcp__Jira__listProjects",
+                    )
+                },
+                failed_servers={},
+            )
+
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions",
+        fake_fetch_tool_definitions,
+    )
+    monkeypatch.setattr(trusted_server, "UserMCPClient", _FakeUserMCPClient)
+
+    claims = _build_claims(
+        allowed_actions=["core.cases.list_cases", "mcp__Jira__getIssue"],
+        deferred_actions=["core.cases.delete_case", "mcp__Jira__deleteIssue"],
+        user_mcp_servers=[
+            UserMCPServerClaim(
+                name="Jira",
+                url="https://mcp.atlassian.com/v1/mcp",
+            )
+        ],
+    )
+
+    build = await trusted_server._build_token_scoped_tools(claims)
+
+    assert [tool.name for tool in build.tools] == [
+        "core__cases__list_cases",
+        "core__cases__delete_case",
+        "mcp__Jira__getIssue",
+        "mcp__Jira__deleteIssue",
+    ]
+    assert build.cacheable
+
+
+@pytest.mark.anyio
+async def test_execute_user_mcp_refuses_deferred_tool_in_registry_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred user MCP tool is refused under its registry-prefixed spelling."""
+    server_name = "Jira"
+    tool_name = "deleteIssue"
+    deferred_name = "mcp__tracecat-registry__mcp__Jira__deleteIssue"
+    monkeypatch.setattr(
+        trusted_server,
+        "UserMCPClient",
+        lambda _: pytest.fail("deferred tools must not reach the user MCP server"),
+    )
+    claims = _build_claims(
+        allowed_actions=[f"mcp__{server_name}__{tool_name}"],
+        deferred_actions=[deferred_name],
+        user_mcp_servers=[
+            UserMCPServerClaim(name=server_name, url="https://mcp.example.test/mcp")
+        ],
+    )
+
+    with pytest.raises(
+        ToolError,
+        match=f"^Tool 'mcp__{server_name}__{tool_name}' requires approval$",
+    ):
+        await trusted_server._execute_user_mcp(server_name, tool_name, {}, claims)
+
+
+def test_claims_reject_dotted_user_mcp_deferred_name() -> None:
+    """The dotted spelling of tool a__b is mcp.example.a.b, which is ambiguous."""
+    with pytest.raises(ValidationError, match="Ambiguous user MCP tool name"):
+        _build_claims(
+            allowed_actions=["mcp__example__a__b"],
+            deferred_actions=["mcp.example.a.b"],
+        )
+
+
+@pytest.mark.anyio
+async def test_token_scoped_mcp_rejects_signed_dotted_user_mcp_deferred_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token deferring the dotted spelling fails verification, so nothing runs."""
+    monkeypatch.setattr("tracecat.config.TRACECAT__SERVICE_KEY", "test-service-key")
+    token = mint_mcp_token(
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        allowed_actions=["mcp__example__a__b"],
+        user_mcp_servers=[
+            UserMCPServerClaim(name="example", url="https://mcp.example.test/mcp")
+        ],
+        registry_lock=RegistryLock(origins={}, actions={}),
+    )
+    # Minting rejects this name, so sign the claims directly.
+    payload = jwt.decode(token, options={"verify_signature": False})
+    payload["deferred_actions"] = ["mcp.example.a.b"]
+    token = jwt.encode(payload, get_service_key(), algorithm="HS256")
+
+    resolve_config = AsyncMock()
+    monkeypatch.setattr(trusted_server, "_resolve_user_mcp_config", resolve_config)
+    monkeypatch.setattr(
+        trusted_server,
+        "get_http_headers",
+        lambda include: {"authorization": f"Bearer {token}"},
+    )
+    mcp = trusted_server.TokenScopedFastMCP("test")
+
+    with pytest.raises(ToolError, match="^Authentication failed$"):
+        await mcp.call_tool("mcp__example__a__b", {})
+    resolve_config.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("called_name", "error"),
+    [
+        ("mcp__example__a__b", "^Tool 'mcp__example__a__b' requires approval$"),
+        ("mcp.example.a.b", "^Ambiguous user MCP tool name 'mcp.example.a.b'"),
+    ],
+)
+async def test_token_scoped_mcp_refuses_cold_deferred_user_mcp_call_over_http(
+    monkeypatch: pytest.MonkeyPatch,
+    called_name: str,
+    error: str,
+) -> None:
+    """A cold tools/call over HTTP refuses a deferred tool before the catalog build.
+
+    The MCP SDK's call handler runs tools/list on a tool cache miss, so the
+    refusal must come before that handler: no user MCP credentials are
+    resolved and no remote discovery runs. The ambiguous dotted spelling is
+    refused at the same point.
+    """
+    monkeypatch.setattr("tracecat.config.TRACECAT__SERVICE_KEY", "test-service-key")
+    token = mint_mcp_token(
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        allowed_actions=[],
+        deferred_actions=["mcp__example__a__b"],
+        user_mcp_servers=[
+            UserMCPServerClaim(name="example", url="https://mcp.example.test/mcp")
+        ],
+        registry_lock=RegistryLock(origins={}, actions={}),
+    )
+    config: MCPHttpServerConfig = {
+        "type": "http",
+        "name": "example",
+        "url": "https://mcp.example.test/mcp",
+    }
+    resolve_config = AsyncMock(return_value=config)
+    discover = AsyncMock(
+        return_value={
+            "mcp__example__a__b": MCPToolDefinition(
+                name="mcp__example__a__b",
+                description="a__b",
+                parameters_json_schema={"type": "object"},
+            )
+        }
+    )
+    monkeypatch.setattr(
+        trusted_server, "fetch_tool_definitions_for_lock", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(trusted_server, "_resolve_user_mcp_config", resolve_config)
+    monkeypatch.setattr(trusted_server, "_get_cached_user_mcp_discovery", discover)
+
+    async with run_server_async(trusted_server.TokenScopedFastMCP("test")) as url:
+        transport = StreamableHttpTransport(
+            url, headers={"Authorization": f"Bearer {token}"}
+        )
+        async with Client(transport) as client:
+            with pytest.raises(ToolError, match=error):
+                await client.call_tool(called_name, {})
+            resolve_config.assert_not_awaited()
+            discover.assert_not_awaited()
+
+            # The same token's listing does reach both, so the mocks are live.
+            assert [tool.name for tool in await client.list_tools()] == [
+                "mcp__example__a__b"
+            ]
+            resolve_config.assert_awaited_once()
+            discover.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_token_scoped_mcp_lists_but_refuses_deferred_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred action is visible to the token holder but never executes."""
+    monkeypatch.setattr("tracecat.config.TRACECAT__SERVICE_KEY", "test-service-key")
+    lock = RegistryLock(
+        origins={"tracecat_registry": "test-version"},
+        actions={
+            "core.cases.list_cases": "tracecat_registry",
+            "core.cases.delete_case": "tracecat_registry",
+        },
+    )
+    token = mint_mcp_token(
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        allowed_actions=["core.cases.list_cases"],
+        deferred_actions=["core.cases.delete_case"],
+        registry_lock=lock,
+    )
+
+    async def fake_fetch_tool_definitions_for_lock(
+        action_names: list[str],
+        registry_lock: RegistryLock,
+        organization_id: uuid.UUID,
+    ) -> dict[str, MCPToolDefinition]:
+        del registry_lock, organization_id
+        return {
+            name: MCPToolDefinition(
+                name=name,
+                description=name,
+                parameters_json_schema={"type": "object"},
+            )
+            for name in action_names
+        }
+
+    execute_action = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions_for_lock",
+        fake_fetch_tool_definitions_for_lock,
+    )
+    monkeypatch.setattr(trusted_server, "execute_action", execute_action)
+    monkeypatch.setattr(
+        trusted_server,
+        "get_http_headers",
+        lambda include: {"authorization": f"Bearer {token}"},
+    )
+    mcp = trusted_server.TokenScopedFastMCP("test")
+
+    assert [tool.name for tool in await mcp.list_tools()] == [
+        "core__cases__list_cases",
+        "core__cases__delete_case",
+    ]
+    with pytest.raises(ToolError, match="requires approval"):
+        await mcp.call_tool("core__cases__delete_case", {})
+    execute_action.assert_not_awaited()
+
+    await mcp.call_tool("core__cases__list_cases", {})
+    execute_action.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_token_scoped_mcp_refuses_deferred_internal_tool_also_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferral wins even in a signed token that also allows the internal tool."""
+    monkeypatch.setattr("tracecat.config.TRACECAT__SERVICE_KEY", "test-service-key")
+    token = mint_mcp_token(
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        allowed_actions=[],
+        allowed_internal_tools=["internal.builder.update_preset"],
+        registry_lock=RegistryLock(origins={}, actions={}),
+    )
+    # Minting rejects this overlap, so sign the claims directly.
+    payload = jwt.decode(token, options={"verify_signature": False})
+    payload["deferred_actions"] = ["internal.builder.update_preset"]
+    token = jwt.encode(payload, get_service_key(), algorithm="HS256")
+
+    async def no_registry_definitions(
+        action_names: list[str],
+        registry_lock: RegistryLock,
+        organization_id: uuid.UUID,
+    ) -> dict[str, MCPToolDefinition]:
+        del action_names, registry_lock, organization_id
+        return {}
+
+    handler = AsyncMock(return_value={"updated": True})
+    monkeypatch.setitem(
+        trusted_server.INTERNAL_TOOL_HANDLERS, "internal.builder.update_preset", handler
+    )
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions_for_lock",
+        no_registry_definitions,
+    )
+    monkeypatch.setattr(
+        trusted_server,
+        "get_http_headers",
+        lambda include: {"authorization": f"Bearer {token}"},
+    )
+    mcp = trusted_server.TokenScopedFastMCP("test")
+
+    assert [tool.name for tool in await mcp.list_tools()] == [
+        "internal__builder__update_preset"
+    ]
+    with pytest.raises(ToolError, match="requires approval"):
+        await mcp.call_tool("internal__builder__update_preset", {})
+    handler.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_token_scoped_mcp_refuses_deferred_action_in_another_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred name matches every spelling of the tool it names."""
+    monkeypatch.setattr("tracecat.config.TRACECAT__SERVICE_KEY", "test-service-key")
+    token = mint_mcp_token(
+        workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        allowed_actions=["core.http_request"],
+        registry_lock=RegistryLock(
+            origins={"tracecat_registry": "test-version"},
+            actions={"core.http_request": "tracecat_registry"},
+        ),
+    )
+    # Minting rejects this overlap, so sign the claims directly.
+    payload = jwt.decode(token, options={"verify_signature": False})
+    payload["deferred_actions"] = ["mcp__tracecat-registry__core__http_request"]
+    token = jwt.encode(payload, get_service_key(), algorithm="HS256")
+
+    async def fake_fetch_tool_definitions_for_lock(
+        action_names: list[str],
+        registry_lock: RegistryLock,
+        organization_id: uuid.UUID,
+    ) -> dict[str, MCPToolDefinition]:
+        del registry_lock, organization_id
+        return {
+            name: MCPToolDefinition(
+                name=name,
+                description=name,
+                parameters_json_schema={"type": "object"},
+            )
+            for name in action_names
+        }
+
+    execute_action = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(
+        trusted_server,
+        "fetch_tool_definitions_for_lock",
+        fake_fetch_tool_definitions_for_lock,
+    )
+    monkeypatch.setattr(trusted_server, "execute_action", execute_action)
+    monkeypatch.setattr(
+        trusted_server,
+        "get_http_headers",
+        lambda include: {"authorization": f"Bearer {token}"},
+    )
+    mcp = trusted_server.TokenScopedFastMCP("test")
+
+    assert [tool.name for tool in await mcp.list_tools()] == ["core__http_request"]
+    with pytest.raises(ToolError, match="requires approval"):
+        await mcp.call_tool("core__http_request", {})
+    # Approved-call execution routes unlisted spellings straight to the executor.
+    with pytest.raises(ToolError, match="requires approval"):
+        await trusted_server.call_token_scoped_tool(
+            "mcp__tracecat-registry__core__http_request",
+            {},
+            verify_mcp_token(token),
+        )
+    execute_action.assert_not_awaited()
+
+
+_STDIO_WORKSPACE_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+_STDIO_INTEGRATION_ID = uuid.UUID("00000000-0000-0000-0000-000000000005")
+_STDIO_READ_SCHEMA = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"],
+}
+
+
+class _StdioPresetService:
+    """Workspace-scoped preset service holding one stdio integration row."""
+
+    def __init__(self, role: Any) -> None:
+        self.workspace_id = role.workspace_id
+
+    async def __aenter__(self) -> "_StdioPresetService":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    def _owns_row(self, integration_id: uuid.UUID) -> bool:
+        return (
+            self.workspace_id == _STDIO_WORKSPACE_ID
+            and integration_id == _STDIO_INTEGRATION_ID
+        )
+
+    async def resolve_mcp_integration_refs(
+        self, integration_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        if not self._owns_row(uuid.UUID(integration_ids[0])):
+            raise TracecatValidationError(
+                "No matching MCP integrations found in the workspace"
+            )
+        return [
+            {
+                "type": "stdio",
+                "name": "files",
+                "command": "npx",
+                "args": ["-y", "example-files-server"],
+                "timeout": 30,
+                "id": str(_STDIO_INTEGRATION_ID),
+            }
+        ]
+
+    async def resolve_stdio_mcp_integration(
+        self, integration_id: uuid.UUID, *, resolve_env: bool
+    ) -> StdioMCPIntegrationSnapshot | None:
+        if not self._owns_row(integration_id):
+            return None
+        return StdioMCPIntegrationSnapshot(
+            config={
+                "type": "stdio",
+                "name": "files",
+                "command": "npx",
+                "args": ["-y", "example-files-server"],
+                "timeout": 30,
+                "id": str(_STDIO_INTEGRATION_ID),
+            },
+            tools={
+                "read": MCPToolSummary(
+                    name="read", description="Read", input_schema=_STDIO_READ_SCHEMA
+                ),
+                "delete": MCPToolSummary(name="delete", enabled=False),
+            },
+            env={"API_TOKEN": "secret"} if resolve_env else None,
+        )
+
+
+class _FakeStdioRunner:
+    def __init__(self, result: CallToolResult | None = None) -> None:
+        self.calls: list[tuple[StdioMCPServer, dict[str, str] | None, str, dict]] = []
+        self.result = result or CallToolResult(
+            content=[TextContent(type="text", text="file contents")]
+        )
+
+    async def list_tools(
+        self, server: StdioMCPServer, env: dict[str, str] | None
+    ) -> StdioMCPProbeResult:
+        raise AssertionError("the trusted server lists stdio tools from the row")
+
+    async def call_tool(
+        self,
+        server: StdioMCPServer,
+        env: dict[str, str] | None,
+        tool: str,
+        args: dict[str, Any],
+    ) -> CallToolResult:
+        self.calls.append((server, env, tool, args))
+        return self.result
+
+
+@pytest.fixture
+def stdio_runner(monkeypatch: pytest.MonkeyPatch) -> _FakeStdioRunner:
+    runner = _FakeStdioRunner()
+    monkeypatch.setattr(AgentPresetService, "with_session", _StdioPresetService)
+    monkeypatch.setattr(trusted_server, "get_stdio_mcp_runner", lambda: runner)
+    monkeypatch.setattr(
+        trusted_server, "fetch_tool_definitions_for_lock", AsyncMock(return_value={})
+    )
+    return runner
+
+
+def _stdio_token(
+    *,
+    workspace_id: uuid.UUID = _STDIO_WORKSPACE_ID,
+    allowed_actions: list[str] | None = None,
+    deferred_actions: list[str] | None = None,
+) -> str:
+    return mint_mcp_token(
+        workspace_id=workspace_id,
+        organization_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        allowed_actions=allowed_actions or [],
+        deferred_actions=deferred_actions or [],
+        user_mcp_servers=[UserMCPServerClaim(name="files", id=_STDIO_INTEGRATION_ID)],
+        registry_lock=RegistryLock(origins={}, actions={}),
+    )
+
+
+@pytest.mark.anyio
+async def test_token_scoped_mcp_lists_and_calls_stdio_tool_through_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    stdio_runner: _FakeStdioRunner,
+) -> None:
+    """A stdio row is listed from its saved tools and called through the runner."""
+    monkeypatch.setattr("tracecat.config.TRACECAT__SERVICE_KEY", "test-service-key")
+    token = _stdio_token(allowed_actions=["mcp__files__read"])
+
+    async with run_server_async(trusted_server.TokenScopedFastMCP("test")) as url:
+        transport = StreamableHttpTransport(
+            url, headers={"Authorization": f"Bearer {token}"}
+        )
+        async with Client(transport) as client:
+            tools = await client.list_tools()
+            result = await client.call_tool("mcp__files__read", {"path": "a.txt"})
+
+    assert [(tool.name, tool.inputSchema) for tool in tools] == [
+        ("mcp__files__read", _STDIO_READ_SCHEMA)
+    ]
+    assert [
+        block.text for block in result.content if isinstance(block, TextContent)
+    ] == ["file contents"]
+    assert stdio_runner.calls == [
+        (
+            StdioMCPServer(
+                workspace_id=_STDIO_WORKSPACE_ID,
+                mcp_integration_id=_STDIO_INTEGRATION_ID,
+                name="files",
+                command="npx",
+                args=("-y", "example-files-server"),
+                timeout=30,
+            ),
+            {"API_TOKEN": "secret"},
+            "read",
+            {"path": "a.txt"},
+        )
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("claims_kwargs", "tool_name", "error"),
+    [
+        pytest.param(
+            {"allowed_actions": ["mcp__files__read"]},
+            "write",
+            "Tool 'mcp__files__write' not authorized",
+            id="not-in-allowed-actions",
+        ),
+        pytest.param(
+            {"deferred_actions": ["mcp__files__read"]},
+            "read",
+            "requires approval",
+            id="awaiting-approval",
+        ),
+        pytest.param(
+            {"allowed_actions": ["mcp__files__delete"]},
+            "delete",
+            "not available on MCP server 'files'",
+            id="disabled-on-row",
+        ),
+        pytest.param(
+            {
+                "allowed_actions": ["mcp__files__read"],
+                "workspace_id": uuid.UUID("00000000-0000-0000-0000-000000000009"),
+            },
+            "read",
+            "is unavailable",
+            id="row-in-another-workspace",
+        ),
+    ],
+)
+async def test_execute_user_mcp_refuses_stdio_call_before_runner(
+    stdio_runner: _FakeStdioRunner,
+    claims_kwargs: dict[str, Any],
+    tool_name: str,
+    error: str,
+) -> None:
+    claims = _build_claims(
+        allowed_actions=claims_kwargs.get("allowed_actions", ["core.http_request"]),
+        deferred_actions=claims_kwargs.get("deferred_actions"),
+        user_mcp_servers=[UserMCPServerClaim(name="files", id=_STDIO_INTEGRATION_ID)],
+    )
+    if workspace_id := claims_kwargs.get("workspace_id"):
+        claims = claims.model_copy(update={"workspace_id": workspace_id})
+
+    with pytest.raises(ToolError, match=error):
+        await trusted_server._execute_user_mcp("files", tool_name, {}, claims)
+
+    assert stdio_runner.calls == []
+
+
+@pytest.mark.anyio
+async def test_execute_user_mcp_raises_stdio_tool_error_result(
+    stdio_runner: _FakeStdioRunner,
+) -> None:
+    stdio_runner.result = CallToolResult(
+        content=[TextContent(type="text", text="no such file")], isError=True
+    )
+
+    with pytest.raises(ToolError, match="no such file"):
+        await trusted_server._execute_user_mcp(
+            "files",
+            "read",
+            {"path": "missing.txt"},
+            _build_claims(
+                allowed_actions=["mcp__files__read"],
+                user_mcp_servers=[
+                    UserMCPServerClaim(name="files", id=_STDIO_INTEGRATION_ID)
+                ],
+            ),
+        )
+
+
+@pytest.mark.anyio
+async def test_execute_user_mcp_reports_builtin_runner_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(AgentPresetService, "with_session", _StdioPresetService)
+    monkeypatch.setattr(
+        trusted_server, "get_stdio_mcp_runner", lambda: NsjailStdioMCPRunner()
+    )
+
+    with pytest.raises(ToolError, match="no stdio MCP runner is installed"):
+        await trusted_server._execute_user_mcp(
+            "files",
+            "read",
+            {"path": "a.txt"},
+            _build_claims(
+                allowed_actions=["mcp__files__read"],
+                user_mcp_servers=[
+                    UserMCPServerClaim(name="files", id=_STDIO_INTEGRATION_ID)
+                ],
+            ),
+        )
+
+
+@pytest.mark.anyio
+async def test_stdio_call_runs_only_what_one_row_read_holds(
+    monkeypatch: pytest.MonkeyPatch,
+    stdio_runner: _FakeStdioRunner,
+) -> None:
+    """An edit landing after the type check can't pair the old command with
+    the new env: command, policy and env all come from one row snapshot."""
+
+    class _EditedMidCall(_StdioPresetService):
+        async def resolve_stdio_mcp_integration(
+            self, integration_id: uuid.UUID, *, resolve_env: bool
+        ) -> StdioMCPIntegrationSnapshot | None:
+            snapshot = await super().resolve_stdio_mcp_integration(
+                integration_id, resolve_env=resolve_env
+            )
+            assert snapshot is not None
+            config = {**snapshot.config, "args": ["-y", "edited-server"]}
+            return StdioMCPIntegrationSnapshot(
+                config=cast(Any, config),
+                tools=snapshot.tools,
+                env={"API_TOKEN": "edited-secret"},
+            )
+
+    monkeypatch.setattr(AgentPresetService, "with_session", _EditedMidCall)
+
+    await trusted_server._execute_user_mcp(
+        "files",
+        "read",
+        {"path": "a.txt"},
+        _build_claims(
+            allowed_actions=["mcp__files__read"],
+            user_mcp_servers=[
+                UserMCPServerClaim(name="files", id=_STDIO_INTEGRATION_ID)
+            ],
+        ),
+    )
+
+    server, env, _tool, _args = stdio_runner.calls[0]
+    assert (server.args, env) == (
+        ("-y", "edited-server"),
+        {"API_TOKEN": "edited-secret"},
+    )
+
+
+def test_stdio_env_never_appears_in_repr() -> None:
+    """Credentials held for a call stay out of reprs, and so out of logs."""
+    env = {"API_TOKEN": "repr-secret"}
+    snapshot = StdioMCPIntegrationSnapshot(
+        config={"type": "stdio", "name": "files", "command": "npx"},
+        tools={},
+        env=env,
+    )
+    target = trusted_server._StdioMCPTarget(
+        server=StdioMCPServer(
+            workspace_id=_STDIO_WORKSPACE_ID,
+            mcp_integration_id=_STDIO_INTEGRATION_ID,
+            name="files",
+            command="npx",
+        ),
+        tools={},
+        env=env,
+    )
+
+    assert "repr-secret" not in repr(snapshot)
+    assert "repr-secret" not in repr(target)
+    assert target.env == env

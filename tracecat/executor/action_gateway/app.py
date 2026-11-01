@@ -5,13 +5,37 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 
-from fastapi import APIRouter, FastAPI, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    Request,
+    Response,
+    status,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
-from pydantic_core import to_jsonable_python
+from sqlalchemy.exc import DBAPIError
 
+from tracecat.api.common import (
+    database_exception_handler,
+    query_overflow_exception_handler,
+    query_timeout_exception_handler,
+    serialize_validation_errors,
+    table_row_exception_handler,
+    without_inputs,
+)
 from tracecat.contexts import ctx_role
+from tracecat.executor.action_gateway.policy import (
+    enforce_agent_script_gateway_access,
+)
 from tracecat.logger import logger
+from tracecat.observability.otel import instrument_fastapi_app
+from tracecat.query.errors import (
+    TracecatQueryOverflowError,
+    TracecatQueryTimeoutError,
+)
+from tracecat.tables.exceptions import TableRowError
 
 router = APIRouter(
     prefix="/internal",
@@ -47,9 +71,13 @@ async def request_logging_middleware(
 
 
 def validation_exception_handler(request: Request, exc: Exception) -> Response:
-    """Handle validation errors for action gateway-served internal routes."""
+    """Handle validation errors for action gateway-served internal routes.
+
+    The rejected input is left out: the executor turns this response into an
+    action error that is kept with the run.
+    """
     errors = (
-        to_jsonable_python(exc.errors(), fallback=str)
+        serialize_validation_errors(without_inputs(exc.errors()))
         if isinstance(exc, RequestValidationError)
         else str(exc)
     )
@@ -123,6 +151,9 @@ def _include_internal_routers(app: FastAPI) -> None:
         comments_router as internal_comments_router,
     )
     from tracecat.cases.internal_router import router as internal_cases_router
+    from tracecat.cases.rows.internal_router import (
+        linked_cases_router as internal_case_linked_cases_router,
+    )
     from tracecat.cases.rows.internal_router import router as internal_case_rows_router
     from tracecat.cases.tag_definitions.internal_router import (
         router as internal_case_tag_definitions_router,
@@ -131,6 +162,7 @@ def _include_internal_routers(app: FastAPI) -> None:
     from tracecat.deduplicate.internal_router import (
         router as internal_deduplicate_router,
     )
+    from tracecat.forms.internal_router import router as internal_forms_router
     from tracecat.tables.internal_router import router as internal_tables_router
     from tracecat.variables.internal_router import router as internal_variables_router
     from tracecat.workflow.executions.internal_router import (
@@ -144,9 +176,11 @@ def _include_internal_routers(app: FastAPI) -> None:
     app.include_router(internal_cases_router)
     app.include_router(internal_deduplicate_router)
     app.include_router(internal_case_rows_router)
+    app.include_router(internal_case_linked_cases_router)
     app.include_router(internal_comments_router)
     app.include_router(internal_case_tags_router)
     app.include_router(internal_case_tag_definitions_router)
+    app.include_router(internal_forms_router)
     app.include_router(internal_tables_router)
     app.include_router(internal_variables_router)
     app.include_router(internal_workflows_router)
@@ -157,18 +191,36 @@ def _add_exception_handlers(app: FastAPI) -> None:
     from fastapi import HTTPException
 
     from tracecat.api.common import (
+        auth_pool_exhausted_exception_handler,
         generic_exception_handler,
         http_exception_handler,
         tracecat_exception_handler,
     )
+    from tracecat.db.exceptions import AuthPoolExhaustedError
     from tracecat.exceptions import (
         EntitlementRequired,
         ScopeDeniedError,
         TracecatException,
     )
+    from tracecat.forms.exceptions import FormError, form_error_handler
 
     app.add_exception_handler(Exception, generic_exception_handler)
+    app.add_exception_handler(
+        AuthPoolExhaustedError,
+        auth_pool_exhausted_exception_handler,
+    )
+    app.add_exception_handler(DBAPIError, database_exception_handler)
     app.add_exception_handler(TracecatException, tracecat_exception_handler)
+    app.add_exception_handler(TableRowError, table_row_exception_handler)
+    app.add_exception_handler(FormError, form_error_handler)
+    app.add_exception_handler(
+        TracecatQueryTimeoutError,
+        query_timeout_exception_handler,
+    )
+    app.add_exception_handler(
+        TracecatQueryOverflowError,
+        query_overflow_exception_handler,
+    )
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(EntitlementRequired, entitlement_exception_handler)
     app.add_exception_handler(ScopeDeniedError, scope_denied_exception_handler)
@@ -177,10 +229,15 @@ def _add_exception_handlers(app: FastAPI) -> None:
 
 def create_app(**kwargs) -> FastAPI:
     """Create the executor-local action gateway app."""
+    dependencies = [
+        *kwargs.pop("dependencies", ()),
+        Depends(enforce_agent_script_gateway_access),
+    ]
     app = FastAPI(
         title="Tracecat Action Gateway",
         version="0",
         default_response_class=ORJSONResponse,
+        dependencies=dependencies,
         **kwargs,
     )
 
@@ -188,4 +245,5 @@ def create_app(**kwargs) -> FastAPI:
     app.include_router(router)
     _include_internal_routers(app)
     _add_exception_handlers(app)
+    instrument_fastapi_app(app, service_name="tracecat-executor")
     return app

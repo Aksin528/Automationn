@@ -11,7 +11,7 @@ from base64 import urlsafe_b64decode
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 import httpx
 from cryptography.fernet import Fernet
@@ -55,6 +55,7 @@ from tracecat.db.engine import (
 )
 from tracecat.db.models import (
     Membership,
+    Organization,
     OrganizationMembership,
     User,
     Workspace,
@@ -322,6 +323,15 @@ def _normalize_subject_claim(value: object) -> str | None:
     if isinstance(value, str) and (subject := value.strip()):
         return subject
     return None
+
+
+def _append_query_params(url: str, params: dict[str, str]) -> str:
+    """Return ``url`` with ``params`` appended to its query string."""
+    parts = urlsplit(url)
+    query = urlencode(
+        [*parse_qsl(parts.query, keep_blank_values=True), *params.items()]
+    )
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 def _merge_fastmcp_token_claims(
@@ -818,6 +828,40 @@ def _create_oidc_auth() -> OIDCProxy:
             )
             return RedirectResponse(url=retry_url)
 
+        async def _forward_access_denied_to_client(
+            self,
+            *,
+            request: Request,
+        ) -> RedirectResponse | None:
+            """Send an upstream ``access_denied`` back to the MCP client.
+
+            FastMCP renders an error page for upstream errors, which leaves the
+            MCP client waiting on its callback. RFC 6749 §4.1.2.1 returns the
+            error to the client's redirect URI with its original ``state``.
+            """
+            if request.query_params.get("error") != "access_denied":
+                return None
+            txn_id = request.query_params.get("state")
+            if not txn_id:
+                return None
+            txn_model = await self._transaction_store.get(key=txn_id)
+            if txn_model is None:
+                return None
+            await self._transaction_store.delete(key=txn_id)
+
+            params = {"error": "access_denied"}
+            if description := request.query_params.get("error_description"):
+                params["error_description"] = description
+            if txn_model.client_state:
+                params["state"] = txn_model.client_state
+            logger.info(
+                "Forwarding MCP OAuth access_denied to client callback",
+                client_id=txn_model.client_id,
+            )
+            return RedirectResponse(
+                url=_append_query_params(txn_model.client_redirect_uri, params)
+            )
+
         async def _extract_upstream_claims(
             self, idp_tokens: dict[str, Any]
         ) -> dict[str, Any] | None:
@@ -901,6 +945,10 @@ def _create_oidc_auth() -> OIDCProxy:
                 request=request
             ):
                 return fallback_response
+            if denied_response := await self._forward_access_denied_to_client(
+                request=request
+            ):
+                return denied_response
 
             response = await super()._handle_idp_callback(request)
             if not isinstance(response, RedirectResponse):
@@ -1236,11 +1284,18 @@ async def list_user_workspaces(
 
         async def _list_direct_membership_rows(
             scoped_org_ids: set[OrganizationID] | None = None,
-        ) -> list[tuple[uuid.UUID, str]]:
+        ) -> list[tuple[uuid.UUID, str, uuid.UUID, str]]:
             member_stmt = (
-                select(Workspace.id, Workspace.name)
+                select(
+                    Workspace.id,
+                    Workspace.name,
+                    Workspace.organization_id,
+                    Organization.slug,
+                )
                 .join(Membership, Membership.workspace_id == Workspace.id)
+                .join(Organization, Organization.id == Workspace.organization_id)
                 .where(Membership.user_id == user.id)
+                .where(Organization.is_active.is_(True))
             )
             if scoped_org_ids:
                 member_stmt = member_stmt.where(
@@ -1249,12 +1304,19 @@ async def list_user_workspaces(
             member_result = await session.execute(member_stmt)
             return sorted(
                 member_result.tuples().all(),
-                key=lambda item: (item[1], str(item[0])),
+                key=lambda item: (item[3], item[1], str(item[0])),
             )
 
         # Resolve the user's organization(s)
-        org_stmt = select(OrganizationMembership.organization_id).where(
-            OrganizationMembership.user_id == user.id
+        org_stmt = (
+            select(OrganizationMembership.organization_id)
+            .join(
+                Organization, Organization.id == OrganizationMembership.organization_id
+            )
+            .where(
+                OrganizationMembership.user_id == user.id,
+                Organization.is_active.is_(True),
+            )
         )
         org_result = await session.execute(org_stmt)
         org_ids = set(org_result.scalars().all())
@@ -1263,10 +1325,18 @@ async def list_user_workspaces(
             org_ids &= set(organization_ids)
             if not org_ids:
                 return [
-                    {"id": str(workspace_id), "name": name}
-                    for workspace_id, name in await _list_direct_membership_rows(
-                        set(organization_ids)
-                    )
+                    {
+                        "id": str(workspace_id),
+                        "name": name,
+                        "org_id": str(organization_id),
+                        "org_slug": organization_slug,
+                    }
+                    for (
+                        workspace_id,
+                        name,
+                        organization_id,
+                        organization_slug,
+                    ) in await _list_direct_membership_rows(set(organization_ids))
                 ]
 
         # Determine org-admin visibility on a per-organization basis.
@@ -1283,42 +1353,92 @@ async def list_user_workspaces(
             if has_scope(scopes, "org:workspace:read"):
                 org_admin_ids.add(oid)
 
-        workspace_map: dict[uuid.UUID, str] = {}
+        workspace_map: dict[uuid.UUID, dict[str, str]] = {}
 
         # For orgs where the user is org-admin/owner, list all workspaces in that org.
         if org_admin_ids:
-            admin_stmt = select(Workspace.id, Workspace.name).where(
-                Workspace.organization_id.in_(org_admin_ids)
+            admin_stmt = (
+                select(
+                    Workspace.id,
+                    Workspace.name,
+                    Workspace.organization_id,
+                    Organization.slug,
+                )
+                .join(Organization, Organization.id == Workspace.organization_id)
+                .where(
+                    Workspace.organization_id.in_(org_admin_ids),
+                    Organization.is_active.is_(True),
+                )
             )
             admin_result = await session.execute(admin_stmt)
-            for workspace_id, workspace_name in admin_result.tuples().all():
-                workspace_map[workspace_id] = workspace_name
+            for (
+                workspace_id,
+                workspace_name,
+                organization_id,
+                organization_slug,
+            ) in admin_result.tuples().all():
+                workspace_map[workspace_id] = {
+                    "id": str(workspace_id),
+                    "name": workspace_name,
+                    "org_id": str(organization_id),
+                    "org_slug": organization_slug,
+                }
 
         # For other orgs, list only direct workspace memberships.
         member_org_ids = org_ids - org_admin_ids
         if member_org_ids:
             member_stmt = (
-                select(Workspace.id, Workspace.name)
+                select(
+                    Workspace.id,
+                    Workspace.name,
+                    Workspace.organization_id,
+                    Organization.slug,
+                )
                 .join(Membership, Membership.workspace_id == Workspace.id)
+                .join(Organization, Organization.id == Workspace.organization_id)
                 .where(
                     Membership.user_id == user.id,
                     Workspace.organization_id.in_(member_org_ids),
+                    Organization.is_active.is_(True),
                 )
             )
             member_result = await session.execute(member_stmt)
-            for workspace_id, workspace_name in member_result.tuples().all():
-                workspace_map[workspace_id] = workspace_name
+            for (
+                workspace_id,
+                workspace_name,
+                organization_id,
+                organization_slug,
+            ) in member_result.tuples().all():
+                workspace_map[workspace_id] = {
+                    "id": str(workspace_id),
+                    "name": workspace_name,
+                    "org_id": str(organization_id),
+                    "org_slug": organization_slug,
+                }
 
         if not org_ids:
-            for workspace_id, workspace_name in await _list_direct_membership_rows():
-                workspace_map[workspace_id] = workspace_name
+            for (
+                workspace_id,
+                workspace_name,
+                organization_id,
+                organization_slug,
+            ) in await _list_direct_membership_rows():
+                workspace_map[workspace_id] = {
+                    "id": str(workspace_id),
+                    "name": workspace_name,
+                    "org_id": str(organization_id),
+                    "org_slug": organization_slug,
+                }
 
         ordered = sorted(
-            workspace_map.items(), key=lambda item: (item[1], str(item[0]))
+            workspace_map.values(),
+            key=lambda item: (
+                item["org_slug"],
+                item["name"],
+                item["id"],
+            ),
         )
-        return [
-            {"id": str(workspace_id), "name": name} for workspace_id, name in ordered
-        ]
+        return ordered
 
 
 async def resolve_role_for_request(workspace_id: WorkspaceID) -> Role:
@@ -1328,20 +1448,27 @@ async def resolve_role_for_request(workspace_id: WorkspaceID) -> Role:
         raise ValueError("Token does not contain an email claim")
     if identity.workspace_ids and workspace_id not in identity.workspace_ids:
         raise ValueError("Token is not scoped to the requested workspace")
+    if identity.organization_ids:
+        workspace_org_id = await resolve_workspace_org(workspace_id)
+        if workspace_org_id not in identity.organization_ids:
+            raise ValueError("Token is not scoped to the requested organization")
     return await resolve_role(identity.email, workspace_id)
 
 
-async def resolve_org_role_for_request() -> Role:
+async def resolve_org_role_for_request(
+    organization_id: OrganizationID | None = None,
+) -> Role:
     """Resolve a role with organization context from the current MCP token.
 
     Looks up the caller's organization memberships and rejects ambiguous
-    multi-org cases. Unlike the HTTP API's ``_resolve_org_for_regular_user``,
-    which falls back to a stable active membership, tokens have an explicit
-    scoping mechanism, so ambiguity is an error here. When the token carries
-    an ``organization_id`` claim or ``org:<uuid>`` scope, that scoping is
-    intersected with the user's memberships before the ambiguity check, so a
-    single-org-scoped token resolves cleanly even when the user belongs to
-    multiple orgs overall.
+    multi-org cases unless the caller passes an explicit org ID. Unlike the
+    HTTP API's ``_resolve_org_for_regular_user``, which falls back to a
+    stable active membership, tokens have an explicit scoping mechanism, so
+    ambiguity is an error here. When the token carries an ``organization_id``
+    claim or ``org:<uuid>`` scope, that scoping is intersected with the
+    user's memberships and any explicit organization before the ambiguity
+    check, so a single-org-scoped token resolves cleanly even when the user
+    belongs to multiple orgs overall.
     """
     identity = get_token_identity()
     if identity.email is None:
@@ -1355,16 +1482,32 @@ async def resolve_org_role_for_request() -> Role:
 
     async with get_async_session_bypass_rls_context_manager() as session:
         result = await session.execute(
-            select(OrganizationMembership.organization_id).where(
-                OrganizationMembership.user_id == user.id
+            select(OrganizationMembership.organization_id)
+            .join(
+                Organization, Organization.id == OrganizationMembership.organization_id
+            )
+            .where(
+                OrganizationMembership.user_id == user.id,
+                Organization.is_active.is_(True),
             )
         )
         org_ids = {row[0] for row in result.all()}
 
     if identity.organization_ids:
         org_ids &= identity.organization_ids
+    if organization_id is not None:
+        if (
+            identity.organization_ids
+            and organization_id not in identity.organization_ids
+        ):
+            raise ValueError("Token is not scoped to the requested organization")
+        org_ids &= {organization_id}
 
     if not org_ids:
+        if organization_id is not None:
+            raise ValueError(
+                f"User {identity.email} has no membership in organization {organization_id}"
+            )
         if identity.organization_ids:
             raise ValueError(
                 f"User {identity.email} has no organization memberships "
@@ -1373,9 +1516,8 @@ async def resolve_org_role_for_request() -> Role:
         raise ValueError(f"User {identity.email} has no organization memberships")
     if len(org_ids) > 1:
         raise ValueError(
-            "Multiple organizations resolved for caller; org-scoped tools "
-            "require a single-org token (set organization_id claim or "
-            "org:<uuid> scope)."
+            "This connection covers multiple organizations; pass org_id "
+            "to choose one (list_workspaces returns each workspace's org_id)."
         )
 
     organization_id = next(iter(org_ids))

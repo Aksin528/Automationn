@@ -1,0 +1,78 @@
+type: action
+definition:
+  title: List fleet policies
+  description: List the compliance policies scoped to a single fleet (team).
+  display_group: Fleet
+  doc_url: https://fleetdm.com/docs/rest-api/rest-api#list-fleet-level-policies
+  namespace: tools.fleetdm
+  name: list_fleet_policies
+  secrets:
+    - name: fleetdm
+      keys: ["FLEETDM_API_TOKEN"]
+  expects:
+    base_url:
+      type: str
+      description: Fleet server base URL (e.g. https://fleet.example.com).
+    fleet_id:
+      type: int
+      description: Numeric Fleet (team) ID.
+    merge_inherited:
+      type: bool | None
+      description: Include global policies inherited by the fleet.
+      default: null
+    query:
+      type: str | None
+      description: Search query keywords. Searchable fields include `name`.
+      default: null
+    page:
+      type: int | None
+      description: Page number of the results to fetch.
+      default: null
+    per_page:
+      type: int | None
+      description: Results per page.
+      default: null
+    order_key:
+      type: str | None
+      description: What to order results by. Allowed fields are `id`, `name`, `team_id`, `created_at`,
+        `updated_at`, `failing_host_count`, and `passing_host_count`.
+      default: null
+    order_direction:
+      type: str | None
+      description: '**Requires `order_key`**. The direction of the order given the order key. Options
+        include `"asc"` and `"desc"`. Default is `"asc"`.'
+      default: null
+    after:
+      type: str | None
+      description: The value to get results after. This needs `order_key` defined, as that's the column
+        that would be used.
+      default: null
+    automation_type:
+      type: str | None
+      description: Filters by automation type. Supported values are "software", "scripts", "calendar",
+        "conditional_access", and "other".
+      default: null
+    platform:
+      type: str | None
+      description: Filters policies by targeted platform. Accepts `"darwin"`, `"windows"`, `"linux"`,
+        or `"chrome"`. Policies that target all platforms (empty `platform` field) are always included.
+      default: null
+  steps:
+    - ref: fleet_policies
+      action: core.http_request
+      args:
+        url: ${{ inputs.base_url }}/api/v1/fleet/fleets/${{ inputs.fleet_id }}/policies
+        method: GET
+        headers:
+          Authorization: Bearer ${{ SECRETS.fleetdm.FLEETDM_API_TOKEN }}
+        params:
+          merge_inherited: ${{ inputs.merge_inherited }}
+          query: ${{ inputs.query }}
+          page: ${{ inputs.page }}
+          per_page: ${{ inputs.per_page }}
+          order_key: ${{ inputs.order_key }}
+          order_direction: ${{ inputs.order_direction }}
+          after: ${{ inputs.after }}
+          automation_type: ${{ inputs.automation_type }}
+          platform: ${{ inputs.platform }}
+  returns: ${{ steps.fleet_policies.result.data }}

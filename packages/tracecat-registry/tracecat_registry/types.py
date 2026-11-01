@@ -7,7 +7,7 @@ and datetimes become ISO format strings.
 
 from uuid import UUID
 from datetime import datetime
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 # ============================================================================
@@ -47,6 +47,7 @@ class CaseFieldRead(TypedDict):
     """Case field with value."""
 
     id: str  # Field name (e.g., 'id', 'created_at', 'custom_field')
+    display_name: str
     type: str
     description: str | None
     nullable: bool
@@ -134,14 +135,44 @@ class CaseRead(TypedDict):
     updated_at: datetime
 
 
+class CaseParentRead(TypedDict):
+    """Summary of a case's parent."""
+
+    id: UUID
+    short_id: str
+    summary: str
+
+
+class CaseDurationRead(TypedDict):
+    """Optional materialized case duration."""
+
+    id: UUID
+    case_id: UUID
+    definition_id: UUID
+    start_event_id: UUID | None
+    end_event_id: UUID | None
+    started_at: datetime | None
+    ended_at: datetime | None
+    duration: str | None
+
+
+class CaseSearchMatchRead(TypedDict):
+    """Plain-text lexical match metadata beside the case's source fields."""
+
+    score: float | None
+    matched_columns: list[Literal["summary", "description", "id", "short_id"]]
+    excerpts: list[str]
+
+
 class CaseReadMinimal(TypedDict):
     """Minimal case information returned by search operations.
 
-    Contains core case fields without description, payload, or custom fields.
+    Contains core case fields plus independently requested detail projections.
     """
 
     id: UUID
     short_id: str
+    search_match: NotRequired[CaseSearchMatchRead | None]
     summary: str
     priority: str
     severity: str
@@ -154,6 +185,11 @@ class CaseReadMinimal(TypedDict):
     updated_at: datetime
     num_tasks_completed: int
     num_tasks_total: int
+    parent: NotRequired[CaseParentRead | None]
+    num_sub_cases: NotRequired[int]
+    durations: NotRequired[list[CaseDurationRead] | None]
+    field_values: NotRequired[dict[str, Any] | None]
+    payload: NotRequired[dict[str, Any] | None]
 
 
 class CaseListResponse(TypedDict):
@@ -660,6 +696,15 @@ class TableRead(TypedDict):
     columns: list[TableColumnRead]
 
 
+class AggregateResponse(TypedDict):
+    """Flat aggregation groups and whether additional groups were omitted."""
+
+    # Group keys are caller-defined aliases, so fixed TypedDict fields cannot
+    # describe them. Dates, timestamps, and exact decimal keys arrive as strings.
+    groups: list[dict[str, str | bool | int | float | None]]
+    truncated: bool
+
+
 class TableSearchResponse(TypedDict):
     """Cursor-paginated table row search response."""
 
@@ -723,3 +768,112 @@ class AgentPresetRead(TypedDict):
     current_version_id: UUID | None
     created_at: datetime
     updated_at: datetime
+
+
+# ============================================================================
+# Workflow Execution Types
+# ============================================================================
+
+
+class WorkflowExecutionSummaryRead(TypedDict):
+    """Summary of a single workflow execution."""
+
+    id: str
+    run_id: str
+    status: str | None
+    start_time: str
+    close_time: str | None
+    trigger_type: str | None
+    execution_type: str | None
+
+
+class WorkflowExecutionPageRead(TypedDict):
+    """Cursor-paginated page of workflow execution summaries."""
+
+    items: list[WorkflowExecutionSummaryRead]
+    next_cursor: str | None
+    prev_cursor: str | None
+    has_more: bool
+    has_previous: bool
+
+
+class WorkflowExecutionEventErrorRead(TypedDict):
+    """Action-level error in a workflow execution event."""
+
+    message: str
+    cause: Any | None
+
+
+class WorkflowExecutionEventRead(TypedDict):
+    """Compact per-action event in a workflow execution timeline."""
+
+    action_ref: str | None
+    action_name: str | None
+    status: str
+    schedule_time: str
+    start_time: str | None
+    close_time: str | None
+    error: WorkflowExecutionEventErrorRead | None
+    result: Any | None
+    result_truncated: str | None
+
+
+class WorkflowExecutionStatusRead(TypedDict):
+    """Status of a workflow execution.
+
+    The event-timeline fields are non-null only when requested with
+    ``include_events=True``.
+    """
+
+    workflow_execution_id: str
+    status: str
+    start_time: str | None
+    close_time: str | None
+    result: Any | None
+    error: str | None
+    trigger_type: str | None
+    execution_type: str | None
+    history_length: int | None
+    events: list[WorkflowExecutionEventRead] | None
+
+
+class SemanticSearchMatch(TypedDict):
+    """Bounded original text; start/end are half-open Unicode character offsets."""
+
+    column_id: str
+    column_name: str
+    text: str
+    start: int
+    end: int
+    shortened: bool
+
+
+class SemanticSearchResult(TypedDict):
+    """One distinct row; score is cosine similarity, not confidence."""
+
+    row_id: str
+    score: float
+    match: SemanticSearchMatch
+    indexed_revision: int
+
+
+class SemanticSearchIndex(TypedDict):
+    """Current coverage; partial results never contain partly embedded rows."""
+
+    state: str
+    pending: int
+    failed: int
+    empty: int
+    ready: int
+    backfill_complete: bool
+    partial: bool
+
+
+class SemanticSearchPage(TypedDict):
+    """A page from a five-minute window of at most 100 distinct rows."""
+
+    items: list[SemanticSearchResult]
+    next_cursor: str | None
+    has_more: bool
+    capped: bool
+    index: SemanticSearchIndex

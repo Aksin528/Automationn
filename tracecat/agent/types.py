@@ -1,99 +1,79 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
-from typing import (
-    TYPE_CHECKING,
-    Annotated,
-    Any,
-    Literal,
-    Protocol,
-    runtime_checkable,
-)
+from typing import Annotated, Any, Literal
 
 import pydantic
 from claude_agent_sdk.types import Message as ClaudeSDKMessage
-from pydantic import Discriminator, TypeAdapter
+from pydantic import Discriminator, TypeAdapter, model_validator
 
 from tracecat.agent.common.stream_types import ToolCallContent
-from tracecat.agent.common.types import MCPServerConfig
+from tracecat.agent.common.types import (
+    MCPServerConfig,
+    read_reasoning_effort_as_enable_thinking,
+)
+from tracecat.agent.constants import (
+    AGENT_TIMEOUT_SECONDS_DEFAULT,
+    AGENT_TIMEOUT_SECONDS_FLOOR,
+)
 from tracecat.agent.skill.types import ResolvedSkillRef
 from tracecat.agent.subagents import AgentSubagentsConfig
-from tracecat.config import TRACECAT__AGENT_MAX_RETRIES
+from tracecat.config import (
+    TRACECAT__AGENT_MAX_RETRIES,
+    TRACECAT__AGENT_SANDBOX_TIMEOUT,
+)
 
-if TYPE_CHECKING:
-    from pydantic_ai.messages import ModelMessage
-    from pydantic_ai.tools import Tool as _PATool
+CustomToolList = list[Any]
 
-    from tracecat.agent.stream.writers import StreamWriter
 
-    CustomToolList = list[_PATool[Any]]
-else:
-    # Runtime fallbacks for types only used in annotations
-    ModelMessage = Any
-    CustomToolList = list[Any]
+def clamp_agent_timeout_seconds(timeout_seconds: int | None) -> int:
+    """Clamp an agent timeout to the deployment bounds.
+
+    ``None`` inherits the hardcoded default; explicit values clamp to
+    [floor, ceiling]. A lower ceiling caps both. Never rejects.
+    """
+    ceiling = TRACECAT__AGENT_SANDBOX_TIMEOUT
+    if timeout_seconds is None:
+        return min(AGENT_TIMEOUT_SECONDS_DEFAULT, ceiling)
+    floor = min(AGENT_TIMEOUT_SECONDS_FLOOR, ceiling)
+    return min(max(timeout_seconds, floor), ceiling)
+
+
+def granted_tool_tunnels(
+    tool_tunnels: Mapping[str, str] | None, granted: Collection[str] | None
+) -> dict[str, str] | None:
+    """Keep only the tool tunnels of tools the agent has.
+
+    Tool grants change through actions, skills, namespace filters and run-time
+    action overrides, so a preset's saved map can name a tool the agent no
+    longer has. That tunnel has no effect, and keeping it would fail the tool
+    build.
+    """
+    allowed = set(granted or ())
+    kept = {
+        name: tunnel for name, tunnel in (tool_tunnels or {}).items() if name in allowed
+    }
+    return kept or None
 
 
 class StreamKey(str):
     def __new__(
         cls,
-        workspace_id: uuid.UUID | str,
-        session_id: uuid.UUID | str,
+        *,
+        workspace_id: uuid.UUID,
+        session_id: uuid.UUID,
+        stream_id: uuid.UUID | None = None,
     ) -> StreamKey:
+        base = f"agent-stream:{workspace_id}:{session_id}"
         return super().__new__(
             cls,
-            f"agent-stream:{str(workspace_id)}:{str(session_id)}",
+            f"{base}:{stream_id}" if stream_id else base,
         )
 
 
-# TypeAdapters for pydantic-ai message types - created lazily to avoid import overhead
-# These are used by the legacy pydantic-ai harness, not the sandbox runtime
 ClaudeSDKMessageTA: TypeAdapter[ClaudeSDKMessage] = TypeAdapter(ClaudeSDKMessage)
-
-
-class _LazyTypeAdapter:
-    """Lazy wrapper for TypeAdapter that imports pydantic-ai only when used."""
-
-    def __init__(self, import_path: str, type_name: str):
-        self._import_path = import_path
-        self._type_name = type_name
-        self._adapter: TypeAdapter[Any] | None = None
-
-    def _ensure_adapter(self) -> TypeAdapter[Any]:
-        if self._adapter is None:
-            import importlib
-
-            module = importlib.import_module(self._import_path)
-            type_cls = getattr(module, self._type_name)
-            self._adapter = TypeAdapter(type_cls)
-        return self._adapter
-
-    def validate_python(self, obj: Any) -> Any:
-        return self._ensure_adapter().validate_python(obj)
-
-    def dump_python(self, obj: Any, **kwargs: Any) -> Any:
-        return self._ensure_adapter().dump_python(obj, **kwargs)
-
-    def validate_json(self, data: bytes | str) -> Any:
-        return self._ensure_adapter().validate_json(data)
-
-    def dump_json(self, obj: Any, **kwargs: Any) -> bytes:
-        return self._ensure_adapter().dump_json(obj, **kwargs)
-
-
-# Lazy TypeAdapters that only import pydantic-ai when methods are called
-ModelMessageTA: Any = _LazyTypeAdapter("pydantic_ai.messages", "ModelMessage")
-ModelResponseTA: Any = _LazyTypeAdapter("pydantic_ai", "ModelResponse")
-
-# Union type for messages from either harness
-# At runtime, ModelMessage is Any so this is effectively Any | ClaudeSDKMessage
-UnifiedMessage = ModelMessage | ClaudeSDKMessage
-
-
-@runtime_checkable
-class StreamingAgentDeps(Protocol):
-    stream_writer: StreamWriter
-
 
 type OutputType = (
     Literal[
@@ -131,6 +111,7 @@ class AgentConfig:
     actions: list[str] | None = None
     namespaces: list[str] | None = None
     tool_approvals: dict[str, bool] | None = None
+    tool_tunnels: dict[str, str] | None = None
     # MCP
     model_settings: dict[str, Any] | None = None
     mcp_servers: list[MCPServerConfig] | None = None
@@ -143,20 +124,31 @@ class AgentConfig:
     enable_thinking: bool = True
     enable_internet_access: bool = False
     resolved_skills: list[ResolvedSkillRef] | None = None
+    builtin_skills: list[str] | None = None
+    """Server-owned image asset keys for the platform skill plugin.
+
+    The executor resolves these through the platform catalog, independently of
+    workspace ``resolved_skills``. Asset contents are pinned by the executor
+    image; no host paths or user-supplied origin claims cross this boundary.
+    """
+    library_skills: list[str] | None = None
+    """Installed platform library skill slugs, staged in the platform plugin."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def read_reasoning_effort(cls, data: Any) -> Any:
+        """Accept Temporal payloads that a newer worker wrote."""
+        return read_reasoning_effort_as_enable_thinking(data)
 
 
 # --- Tool Types (Harness-Agnostic) ---
-# These types decouple Tracecat from pydantic-ai's internal types,
-# enabling plug-and-play support for different agent harnesses (pydantic-ai, Claude SDK, etc.)
 
 
 @dataclass(kw_only=True, slots=True)
 class Tool:
     """Harness-agnostic tool definition.
 
-    Uses canonical action names (with dots) throughout. Harness-specific adapters
-    are responsible for converting to their required format (e.g., pydantic-ai
-    requires underscores for Python function names).
+    Uses canonical action names with dots throughout.
 
     Canonical names are used for:
     - JWT token authorization (mcp/executor.py checks canonical names)

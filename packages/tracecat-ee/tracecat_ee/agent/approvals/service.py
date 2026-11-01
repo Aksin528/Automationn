@@ -8,24 +8,23 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, cast
 
-from pydantic_ai.messages import (
-    ToolCallPart,
-)
-from pydantic_ai.tools import (
-    DeferredToolApprovalResult,
-    DeferredToolResults,
-    ToolApproved,
-    ToolDenied,
-)
-from sqlalchemy import select
+from sqlalchemy import func, null, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from temporalio import activity, workflow
 from temporalio.client import WorkflowExecution, WorkflowExecutionStatus, WorkflowHandle
 
 from tracecat.agent.aliases import build_agent_alias
 from tracecat.agent.approvals.enums import ApprovalStatus
+from tracecat.agent.common.stream_types import ToolCallContent
 from tracecat.agent.mcp.metadata import strip_proxy_tool_metadata
 from tracecat.agent.schemas import AgentOutput
 from tracecat.agent.session.types import AgentSessionEntity
+from tracecat.agent.types import (
+    DeferredToolApprovalResult,
+    DeferredToolResults,
+    ToolApproved,
+    ToolDenied,
+)
 from tracecat.auth.types import Role
 from tracecat.common import all_activities
 from tracecat.db.models import AgentSession, Approval, User, Workflow
@@ -358,6 +357,17 @@ class ApprovalService(BaseWorkspaceService):
     async def get_session(self, session_id: uuid.UUID) -> SessionDescription | None:
         """Get a session by ID."""
 
+        # This legacy view parses durable-workflow metadata. Other backends use
+        # the shared session approval API and must never be looked up as oss.
+        backend_id = await self.session.scalar(
+            select(AgentSession.backend_id).where(
+                AgentSession.id == session_id,
+                AgentSession.workspace_id == self.workspace_id,
+            )
+        )
+        if backend_id is not None and backend_id != "oss":
+            return None
+
         # Query workflow executions using the agent session key
         agent_wf_id = AgentWorkflowID(session_id)
 
@@ -491,7 +501,8 @@ class ApprovalService(BaseWorkspaceService):
         await self.session.commit()
 
 
-type ApprovalMap = dict[str, bool | DeferredToolApprovalResult]
+type ApprovalResult = bool | DeferredToolApprovalResult
+type ApprovalMap = dict[str, ApprovalResult]
 
 
 class ApprovalManagerStatus(StrEnum):
@@ -506,14 +517,14 @@ class ApprovalManager:
     def __init__(self, role: Role) -> None:
         self._approvals: ApprovalMap = {}
         self._decision_metadata_by_tool_call_id: dict[str, dict[str, Any]] = {}
+        self._approved_by_by_tool_call_id: dict[str, uuid.UUID] = {}
         self._status: ApprovalManagerStatus = ApprovalManagerStatus.IDLE
         self.role = role
         agent_ctx = AgentContext.get()
         if agent_ctx is None:
             raise RuntimeError("Agent context is not set")
         self.session_id = agent_ctx.session_id
-        self._expected_tool_calls: dict[str, ToolCallPart] = {}
-        self._approved_by: uuid.UUID | None = None
+        self._expected_tool_calls: dict[str, ToolCallContent] = {}
 
     @classmethod
     def get_activities(cls) -> list[Callable[..., Any]]:
@@ -533,46 +544,54 @@ class ApprovalManager:
         approved_by: uuid.UUID | None = None,
         decision_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        # A turn can have multiple pending tool-call approvals at once, and a
-        # reviewer decides them one at a time (one card, one click). Merge
-        # each submission into the accumulated decisions instead of
-        # replacing them, and only flip to READY once every expected
-        # tool_call_id has a decision - a partial submission keeps waiting
-        # for the rest instead of failing validation or resuming early.
+        """Record approval decisions, accepting partial submissions.
+
+        Parallel tool calls surface as individual approval cards that are
+        decided one by one, so decisions are merged across submissions. The
+        manager only becomes READY (resuming the run) once every expected
+        tool call has a decision.
+        """
         self._approvals.update(approvals)
+        if approved_by is not None:
+            for tool_call_id in approvals:
+                self._approved_by_by_tool_call_id[tool_call_id] = approved_by
         if decision_metadata:
             self._decision_metadata_by_tool_call_id.update(decision_metadata)
-        if approved_by is not None:
-            self._approved_by = approved_by
+
         expected_ids = set(self._expected_tool_calls.keys())
-        if expected_ids and expected_ids <= self._approvals.keys():
+        if expected_ids.issubset(self._approvals.keys()):
             self._status = ApprovalManagerStatus.READY
+        else:
+            self._status = ApprovalManagerStatus.PENDING
+            logger.info(
+                "Partial approval decisions recorded",
+                decided=sorted(self._approvals.keys()),
+                awaiting=sorted(expected_ids - set(self._approvals.keys())),
+            )
 
     async def wait(self) -> None:
         await workflow.wait_condition(lambda: self.is_ready())
 
     async def prepare(
         self,
-        approvals: list[ToolCallPart],
+        approvals: list[ToolCallContent],
         *,
         request_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._approvals.clear()
         self._decision_metadata_by_tool_call_id.clear()
         self._status = ApprovalManagerStatus.IDLE
-        self._expected_tool_calls = {
-            approval.tool_call_id: approval for approval in approvals
-        }
-        self._approved_by = None
+        self._expected_tool_calls = {approval.id: approval for approval in approvals}
+        self._approved_by_by_tool_call_id.clear()
 
         # Preserve per-tool proxy metadata on approval rows for display and
         # decision reconciliation.
         approval_payloads = [
             ToolApprovalPayload(
-                tool_call_id=approval.tool_call_id,
-                tool_name=approval.tool_name,
-                args=approval.args,
-                metadata=(request_metadata or {}).get(approval.tool_call_id),
+                tool_call_id=approval.id,
+                tool_name=approval.name,
+                args=approval.input,
+                metadata=(request_metadata or {}).get(approval.id),
             )
             for approval in approvals
         ]
@@ -598,7 +617,7 @@ class ApprovalManager:
         """Get the approval decision for a specific tool call ID."""
         return self._approvals.get(tool_call_id)
 
-    def get_expected_tool_call(self, tool_call_id: str) -> ToolCallPart | None:
+    def get_expected_tool_call(self, tool_call_id: str) -> ToolCallContent | None:
         """Look up the pending tool call this approval was requested for.
 
         Used to eagerly execute a single newly-approved tool as soon as its
@@ -608,16 +627,12 @@ class ApprovalManager:
         return self._expected_tool_calls.get(tool_call_id)
 
     def validate_responses(self, approvals: ApprovalMap) -> None:
-        """Validate a (possibly partial) batch of approval responses.
+        """Validate approval responses against the expected tool calls.
 
-        A turn can have several pending tool-call approvals at once, and a
-        reviewer typically decides them one card at a time rather than all
-        together, so this intentionally does NOT require every expected
-        tool_call_id to be present in a single submission - see `set()`,
-        which merges each submission and only resumes the agent once every
-        expected id has been decided across one or more calls. This still
-        rejects a submission that is empty, decides a tool_call_id that
-        isn't actually pending, or carries a null decision.
+        Partial submissions are valid: parallel tool calls are decided one
+        card at a time, and ``set`` accumulates decisions until every expected
+        tool call is covered. Responses for unknown tool calls or with missing
+        decisions are rejected.
         """
         if not self._expected_tool_calls:
             raise ValueError("No pending approvals to validate")
@@ -643,7 +658,7 @@ class ApprovalManager:
 
         for tool_call_id in provided_ids:
             if approvals[tool_call_id] is None:
-                tool_name = self._expected_tool_calls[tool_call_id].tool_name
+                tool_name = self._expected_tool_calls[tool_call_id].name
                 logger.warning(
                     "Approval response is None",
                     tool_call_id=tool_call_id,
@@ -686,7 +701,7 @@ class ApprovalManager:
             reason=reason,
             decision=decision,
             decision_metadata=self._decision_metadata_by_tool_call_id.get(tool_call_id),
-            approved_by=self._approved_by,
+            approved_by=self._approved_by_by_tool_call_id.get(tool_call_id),
         )
 
     async def apply_single_decision(self, tool_call_id: str) -> None:
@@ -718,10 +733,46 @@ class ApprovalManager:
         )
 
     async def handle_decisions(self) -> None:
-        decisions: list[ApprovalDecisionPayload] = [
-            self._build_decision_payload(tool_call_id, result)
-            for tool_call_id, result in self._approvals.items()
-        ]
+        decisions: list[ApprovalDecisionPayload] = []
+
+        for tool_call_id, result in self._approvals.items():
+            approved = False
+            reason: str | None = None
+            decision: bool | dict[str, Any] | None = None
+
+            match result:
+                case bool(value):
+                    approved = value
+                    decision = value
+                case ToolApproved(override_args=override_args):
+                    approved = True
+                    decision_payload: dict[str, Any] = {"kind": "tool-approved"}
+                    if override_args is not None:
+                        decision_payload["override_args"] = override_args
+                    decision = decision_payload
+                case ToolDenied(message=message):
+                    approved = False
+                    reason = message
+                    decision_payload = {"kind": "tool-denied"}
+                    if message:
+                        decision_payload["message"] = message
+                    decision = decision_payload
+                case _:
+                    raise RuntimeError(
+                        "Invalid approval result", approval_result=result
+                    )
+            decisions.append(
+                ApprovalDecisionPayload(
+                    tool_call_id=tool_call_id,
+                    approved=approved,
+                    reason=reason,
+                    decision=decision,
+                    decision_metadata=self._decision_metadata_by_tool_call_id.get(
+                        tool_call_id
+                    ),
+                    approved_by=self._approved_by_by_tool_call_id.get(tool_call_id),
+                )
+            )
         if decisions:
             await workflow.execute_activity(
                 ApprovalManager.apply_approval_decisions,
@@ -732,7 +783,7 @@ class ApprovalManager:
                 ),
                 start_to_close_timeout=timedelta(seconds=30),
             )
-        self._approved_by = None
+        self._approved_by_by_tool_call_id.clear()
         self._decision_metadata_by_tool_call_id.clear()
 
     @staticmethod
@@ -751,40 +802,16 @@ class ApprovalManager:
             return
 
         async with ApprovalService.with_session(role=input.role) as service:
+            now = datetime.now(tz=UTC)
+            # Untyped: these are SQLAlchemy insert values keyed by column name,
+            # where each value may be a Python scalar or a SQL element (null()).
+            rows: list[dict[str, Any]] = []
             for decision in input.decisions:
-                # Get or create approval record
-                approval = await service.get_approval_by_session_and_tool(
-                    session_id=input.session_id,
-                    tool_call_id=decision.tool_call_id,
-                )
-
-                if approval is None:
-                    # Create placeholder record if it doesn't exist
-                    approval = await service.create_approval(
-                        ApprovalCreate(
-                            session_id=input.session_id,
-                            tool_call_id=decision.tool_call_id,
-                            tool_name="unknown",
-                            tool_call_args=None,
-                        )
-                    )
-
-                # Determine status and calculate approved_at timestamp
                 status = (
                     ApprovalStatus.APPROVED
                     if decision.approved
                     else ApprovalStatus.REJECTED
                 )
-                approved_at = (
-                    datetime.now(tz=UTC) if status != ApprovalStatus.PENDING else None
-                )
-
-                # Build update payload - only include decision if it was explicitly set
-                update_data: dict[str, Any] = {
-                    "status": status,
-                    "reason": decision.reason,
-                    "approved_by": decision.approved_by,
-                }
                 resolved_decision = decision.decision
                 if decision.decision_metadata:
                     if isinstance(resolved_decision, dict):
@@ -799,18 +826,42 @@ class ApprovalManager:
                         }
                     elif resolved_decision is None:
                         resolved_decision = {"metadata": decision.decision_metadata}
-                if resolved_decision is not None:
-                    update_data["decision"] = resolved_decision
-
-                # Update the approval with decision
-                await service.update_approval(
-                    approval,
-                    ApprovalUpdate(**update_data),
+                rows.append(
+                    {
+                        "workspace_id": service.workspace_id,
+                        "session_id": input.session_id,
+                        "tool_call_id": decision.tool_call_id,
+                        "tool_name": "unknown",
+                        "tool_call_args": None,
+                        "status": status,
+                        "reason": decision.reason,
+                        "approved_by": decision.approved_by,
+                        "approved_at": now,
+                        # SQL NULL (not Python None) so COALESCE preserves a stored
+                        # decision instead of overwriting it with JSON null.
+                        "decision": resolved_decision
+                        if resolved_decision is not None
+                        else null(),
+                    }
                 )
 
-                # Manually set approved_at since it's not part of ApprovalUpdate
-                approval.approved_at = approved_at
-                await service.session.commit()
+            stmt = pg_insert(Approval).values(rows)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_approval_workspace_session_tool",
+                set_={
+                    "status": stmt.excluded.status,
+                    "reason": stmt.excluded.reason,
+                    "approved_by": stmt.excluded.approved_by,
+                    "approved_at": stmt.excluded.approved_at,
+                    "decision": func.coalesce(
+                        stmt.excluded.decision, Approval.decision
+                    ),
+                    # onupdate does not fire for ON CONFLICT DO UPDATE.
+                    "updated_at": func.now(),
+                },
+            )
+            await service.session.execute(stmt)
+            await service.session.commit()
 
     @staticmethod
     @activity.defn
