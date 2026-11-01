@@ -52,6 +52,7 @@ AuditAction = Literal[
 ]
 AuditResourceType = Literal[
     "user",
+    "security_key",
     "organization",
     "auth",
     "workspace",

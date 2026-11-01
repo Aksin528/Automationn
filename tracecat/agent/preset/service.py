@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from slugify import slugify
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import JSONB, aggregate_order_by
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import load_only, selectinload
 
 from tracecat import config
@@ -25,6 +26,7 @@ from tracecat.agent.common.types import (
     MCPServerConfig,
     MCPServerToolSummary,
     MCPStdioServerConfig,
+    is_stdio_mcp_server,
 )
 from tracecat.agent.mcp.utils import is_tracecat_registry_server_name
 from tracecat.agent.preset.resolver import resolve_agents_config
@@ -58,6 +60,7 @@ from tracecat.agent.preset.types import (
     EffectivePresetTools,
     PresetToolInputs,
     SkillBindingSpec,
+    StdioMCPIntegrationSnapshot,
 )
 from tracecat.agent.skill.bindings import (
     SkillBindingService,
@@ -79,6 +82,7 @@ from tracecat.agent.types import (
 )
 from tracecat.audit.logger import audit_log
 from tracecat.authz.controls import require_scope
+from tracecat.db.errors import is_unique_violation
 from tracecat.db.models import (
     AgentCatalog,
     AgentPreset,
@@ -564,7 +568,17 @@ class AgentPresetService(BaseWorkspaceService):
     @audit_log(resource_type="agent_preset", action="create")
     async def create_preset(self, params: AgentPresetCreate) -> AgentPreset:
         """Create a new agent preset scoped to the current workspace."""
+        try:
+            return await self._create_preset(params)
+        except IntegrityError as exc:
+            await self.session.rollback()
+            if not is_unique_violation(exc, "uq_agent_preset_workspace_slug_active"):
+                raise
+            raise TracecatValidationError(
+                "Agent preset slug is already in use for this workspace"
+            ) from exc
 
+    async def _create_preset(self, params: AgentPresetCreate) -> AgentPreset:
         slug = await self._normalize_and_validate_slug(
             proposed_slug=params.slug,
             fallback_name=params.name,
@@ -733,6 +747,19 @@ class AgentPresetService(BaseWorkspaceService):
         self, preset: AgentPreset, params: AgentPresetUpdate
     ) -> AgentPreset:
         """Update an existing preset."""
+        try:
+            return await self._update_preset(preset, params)
+        except IntegrityError as exc:
+            await self.session.rollback()
+            if not is_unique_violation(exc, "uq_agent_preset_workspace_slug_active"):
+                raise
+            raise TracecatValidationError(
+                "Agent preset slug is already in use for this workspace"
+            ) from exc
+
+    async def _update_preset(
+        self, preset: AgentPreset, params: AgentPresetUpdate
+    ) -> AgentPreset:
         set_fields = params.model_dump(exclude_unset=True, exclude={"skills"})
         execution_changed = False
         requested_skills = None
@@ -1504,7 +1531,7 @@ class AgentPresetService(BaseWorkspaceService):
                     active_tools = cast(
                         list[MCPServerToolSummary],
                         [
-                            tool.model_dump(exclude_none=True)
+                            tool.model_dump(exclude_none=True, exclude={"input_schema"})
                             for tool in stored_tools
                             if tool.enabled and tool.status == "available"
                         ],
@@ -1628,7 +1655,7 @@ class AgentPresetService(BaseWorkspaceService):
                 projected_config["tools"] = cast(
                     list[MCPServerToolSummary],
                     [
-                        policy.model_dump(exclude_none=True)
+                        policy.model_dump(exclude_none=True, exclude={"input_schema"})
                         for tool_name in sorted(grant.tool_names)
                         if (policy := policies.get(tool_name)) is not None
                     ],
@@ -1719,6 +1746,78 @@ class AgentPresetService(BaseWorkspaceService):
                 ) from e
             return None
         return server_config.get("headers", {})
+
+    async def resolve_stdio_mcp_integration(
+        self, mcp_integration_id: uuid.UUID, *, resolve_env: bool
+    ) -> StdioMCPIntegrationSnapshot | None:
+        """Load one stdio integration and derive its config, policy and env.
+
+        Everything comes from a single read of the workspace-scoped row, so a
+        concurrent edit can't pair the old command with the new env. Returns
+        ``None`` when the row is missing or isn't a stdio server.
+
+        Raises:
+            TracecatValidationError: If the saved command fails validation.
+            MCPSecretResolutionError: If ``resolve_env`` is set and the env
+                cannot be resolved.
+        """
+        integrations_service = IntegrationService(self.session, role=self.role)
+        integration = await integrations_service.get_mcp_integration(
+            mcp_integration_id=mcp_integration_id
+        )
+        if integration is None or integration.server_type != "stdio":
+            return None
+        refs = self._mcp_integration_refs(
+            [str(mcp_integration_id)], {mcp_integration_id: integration}
+        )
+        config = refs[0]
+        if not is_stdio_mcp_server(config):
+            return None
+        env: dict[str, str] | None = None
+        stored_env = (
+            integrations_service.decrypt_stdio_env(integration) if resolve_env else None
+        )
+        # Same order as resolve_mcp_integrations: drop runtime-controlled keys
+        # from legacy rows, resolve templates, then validate the resolved env.
+        if stored_env and (
+            stdio_env := self._sanitize_persisted_stdio_env(
+                mcp_integration_id=integration.id, env=stored_env
+            )
+        ):
+            try:
+                env = await self.resolve_stdio_env(
+                    stdio_env=stdio_env,
+                    mcp_integration_id=integration.id,
+                    mcp_integration_slug=integration.slug,
+                )
+            except Exception as e:
+                raise MCPSecretResolutionError(
+                    "Stdio MCP integration env could not be resolved",
+                    mcp_integration_id=integration.id,
+                    server_name=integration.name,
+                    server_slug=integration.slug,
+                ) from e
+            env_valid = True
+            try:
+                validate_mcp_command_config(
+                    command=config["command"],
+                    args=config.get("args"),
+                    env=env,
+                    name=integration.slug,
+                )
+            except MCPValidationError:
+                env_valid = False
+            # Raise outside the handler: the validation error can quote
+            # resolved values and must not ride along as __context__.
+            if not env_valid:
+                raise TracecatValidationError(
+                    "Stdio MCP integration env failed validation"
+                )
+        return StdioMCPIntegrationSnapshot(
+            config=config,
+            tools=self._mcp_tool_policies([integration]).get(integration.id, {}),
+            env=env,
+        )
 
     async def resolve_stdio_env(
         self,

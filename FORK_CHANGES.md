@@ -1,6 +1,7 @@
 # Fork changes register
 
-This fork (`Aksin528/Automationn`) is **upstream Tracecat `1.2.1` plus the changes listed here**.
+This fork (`Aksin528/Automationn`) is **upstream Tracecat `1.3.1` plus the changes listed here**
+(merged 2026-11-01 on branch `update/1.3.1`; before that 1.2.1 and 1.3.0-alpha.3).
 
 History: the fork started from a bulk copy of upstream commit `bf617e37d` (2026-06-11, version
 `1.0.0b48`) and had no common ancestor with upstream in git. On 2026-10-21 the histories were joined
@@ -44,11 +45,23 @@ API key; approvals are linked to a case.
 Used by: Telegram approval workflows and the DB workflow `Auto-reject stale approvals`
 (rejects approvals older than N hours through the API; has `dry_run`).
 
-### 1.3 LLM gateway / custom model provider (Ollama)
-`tracecat/agent/sandbox/llm_proxy.py` (+51: `enable_thinking` override, `verify=False`),
-`tracecat/agent/service.py` (+36: `resolve_catalog_id`), `agent/gateway.py` (+7),
-`agent/session/title_generator.py` (+25), `agent/litellm_config.yaml`, `litellm_config.yaml`,
-`agent/provider/service.py` (+2: 404 on `/models` means an empty list).
+### 1.3 LLM gateway / custom model provider (Qwen on vLLM, Ollama)
+`tracecat/agent/sandbox/llm_proxy.py`: `LLMRoute.enable_thinking`; for `custom-model-provider` routes with
+thinking off the proxy sends `thinking: disabled` and `chat_template_kwargs: {enable_thinking: false}` (vLLM
+ignores the Anthropic-shaped field; without this Qwen3 answers start with a `<think>` block), and caps
+`max_tokens` at 4096. Since 1.3.1 the routing plan is built in `llm_proxy.build_llm_routing_plan` /
+`_direct_passthrough_route(s)` (upstream moved it out of `executor/activity.py`); the fork passes
+`enable_thinking` there for the managed route and every root/subagent passthrough route. 1.3.1 has no own fix
+(no `chat_template_kwargs` anywhere): **upstream PR candidate** (tests: the three `test_custom_model_provider_*`
+tests and `test_build_llm_routing_plan_passes_enable_thinking_to_every_route`).
+`tracecat/agent/service.py` (+36: `resolve_catalog_id`), `agent/session/title_generator.py` (+25),
+`agent/litellm_config.yaml` (`ssl_verify: false` only), `agent/provider/service.py` (+2: 404 on `/models` means
+an empty list).
+Removed in the 1.3.1 merge: the Groq model entries, LiteLLM `master_key`, the `sk-tracecat-internal` bypass in
+`agent/gateway.py` (any caller with that fixed key was accepted as an internal LiteLLM user; nothing used it),
+and the proxy's `verify=False` (1.3.1 uses `_upstream_ssl_context()`, which honours `SSL_CERT_FILE`; the CA
+wrappers add the company CA). If a self-signed LLM endpoint now fails with a TLS error, add its CA to
+`certs/` instead of turning verification off.
 Check after a merge: upstream now has `catalog/service.py::resolve_catalog_id_by_model`; the fork's
 `resolve_catalog_id` may be redundant.
 
@@ -93,7 +106,8 @@ Files that exist only in the fork and are bind-mounted into containers by `docke
   Until 1.0.x the last line called `/app/entrypoint.sh`; upstream deleted that script (#3147), so 1.2.1 images
   fail with `/app/entrypoint.sh: No such file or directory` (exit 127) unless the wrapper ends with `exec "$@"`.
 - `defaults.py` is mounted over `tracecat/tiers/defaults.py` (both `/app/tracecat/...` and the venv copy). It is
-  upstream's file with two changes: `service_accounts=True` and `watchtower=True` on both paths. It is a full
+  upstream's file with two changes: `service_accounts=True` and `watchtower=True` on both paths (re-copied from
+  1.3.1 on 2026-11-01; the 1.2.1 copy lacked `has_installed_agent_backend`). It is a full
   copy, so it must be re-copied from upstream on every update (1.2.1 added `multi_workspace`, `agent_channels`,
   `semantic_search`, `forms`, `tunnels`, `external_secret_stores`; the old copy did not know them).
 - `minio` is pinned to `minio/minio:RELEASE.2025-09-07T16-13-09Z` in the override: upstream 1.2.1 moved MinIO to
@@ -130,7 +144,8 @@ DB (workflows, `run_python` scripts, tables, presets), which is not in git.
 
 ## 3. Checklist after taking anything from upstream
 1. `grep -n fork-local tracecat/cases/router.py` is not empty.
-2. One alembic head (`alembic heads`); the fork chain above is intact.
+2. One alembic head (`alembic heads`); the fork chain above is intact. Merge revisions so far: `261af2786dda`
+   (1.2.1), `51e26899440a` (1.3.0-alpha.3), `9f37f23e2c32` (1.3.1).
 3. Regenerate the frontend client (`just gen-client-ci`) and run `pnpm -C frontend check`.
 4. `.env`: `TRACECAT__OUTBOUND_ALLOWED_PRIVATE_CIDRS` lists the private addresses Tracecat must reach (soc-mcp,
    Ollama); upstream blocks private targets for MCP and custom LLM requests by default.
@@ -147,3 +162,8 @@ DB (workflows, `run_python` scripts, tables, presets), which is not in git.
     default false). Sources created before 1.2.1 keep `false`, so agent requests go through the managed LiteLLM and
     vLLM answers `System message must be at the beginning` (HTTP 400, `invalid_request_error`). After the update:
     Organization settings > Agent > Configuration > Custom sources > Edit > enable **Passthrough mode**, Save, Refresh.
+11. Import the app after resolving conflicts (`uv run python -c "import tracecat.api.app, tracecat.dsl.worker"`):
+    a clean textual auto-merge can still be invalid Python (1.3.1: `verify=` passed twice to `httpx.AsyncClient`
+    in `llm_proxy.py`).
+12. `ruff check` has `fix = true` in `pyproject.toml`: running it over the tree rewrites fork-only files (for
+    example `soc-mcp/`). Check `git diff --name-only` afterwards and restore files that are not part of the change.

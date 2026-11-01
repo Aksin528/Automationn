@@ -135,7 +135,7 @@ variable "tracecat_ui_image" {
 
 variable "tracecat_image_tag" {
   type    = string
-  default = "1.3.0-alpha.3"
+  default = "1.3.1"
 }
 
 variable "tracecat_migrations_image" {
@@ -274,6 +274,12 @@ variable "result_externalization_enabled" {
 variable "platform_admin_ip_allowlist_bypass" {
   type        = bool
   description = "Break-glass: skip the platform admin IP allowlist so platform admins can recover after a lockout. Organization IP allowlists are unaffected."
+  default     = false
+}
+
+variable "platform_admin_mfa_bypass" {
+  type        = bool
+  description = "Break-glass override that skips security key (MFA) sign-in and step-up checks for platform admins. Remove after recovery."
   default     = false
 }
 
@@ -1032,4 +1038,34 @@ variable "sentry_dsn" {
   type        = string
   default     = null
   sensitive   = true
+}
+
+variable "background_queue" {
+  type    = string
+  default = "shared-background-queue"
+}
+
+variable "background_worker_cpu" {
+  type    = number
+  default = 1024
+}
+
+variable "background_worker_memory" {
+  type    = number
+  default = 2048
+}
+
+variable "background_worker_desired_count" {
+  type    = number
+  default = 1
+}
+
+variable "background_worker_max_concurrent_activities" {
+  type    = number
+  default = 4
+
+  validation {
+    condition     = var.background_worker_max_concurrent_activities > 0 && floor(var.background_worker_max_concurrent_activities) == var.background_worker_max_concurrent_activities
+    error_message = "background_worker_max_concurrent_activities must be a positive integer."
+  }
 }

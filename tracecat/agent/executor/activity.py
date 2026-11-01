@@ -32,7 +32,6 @@ from tracecat.agent.common.config import (
     TRACECAT__EXECUTOR_BACKEND,
 )
 from tracecat.agent.common.exceptions import (
-    AgentPreparationError,
     AgentSandboxExecutionError,
     AgentSandboxValidationError,
 )
@@ -60,16 +59,12 @@ from tracecat.agent.executor.loopback import (
     LoopbackResult,
 )
 from tracecat.agent.filesystem import hydrate_agent_work_dir, persist_agent_work_dir
-from tracecat.agent.llm_routing import get_litellm_route_model
-from tracecat.agent.mcp.stdio_probe import (
-    probe_stdio_mcp_tools_in_sandbox,
-)
 from tracecat.agent.mcp.stdio_probe_types import (
-    MCP_STDIO_PROBE_TIMEOUT_CAP,
     StdioMCPProbeInput,
     StdioMCPProbeResult,
     sanitize_stdio_probe_error,
 )
+from tracecat.agent.mcp.stdio_runner import StdioMCPServer, get_stdio_mcp_runner
 from tracecat.agent.otel_config import (
     AgentOtelConfig,
     ResolvedAgentOtelConfig,
@@ -89,9 +84,8 @@ from tracecat.agent.runtime_services import (
 from tracecat.agent.sandbox.llm_proxy import (
     LLM_SOCKET_NAME,
     LLMProxyError,
-    LLMRoute,
-    LLMRoutingPlan,
     LLMSocketProxy,
+    build_llm_routing_plan,
 )
 from tracecat.agent.sandbox.otel_relay import (
     OTEL_SOCKET_NAME,
@@ -433,7 +427,7 @@ class SandboxedAgentExecutor:
             self._fatal_error = error
             self._fatal_error_event.set()
 
-        routing_plan = self._llm_routing_plan()
+        routing_plan = build_llm_routing_plan(self.input.config, self.input.subagents)
         runtime_routing_plan = await routing_plan.materialize(self.input.role)
 
         logger.info(
@@ -445,119 +439,6 @@ class SandboxedAgentExecutor:
             socket_path=socket_path,
             routing_plan=runtime_routing_plan,
             on_error=on_error,
-        )
-
-    def _llm_routing_plan(self) -> LLMRoutingPlan:
-        """Build the socket proxy routing table from each agent's model config.
-
-        Each agent's passthrough setting determines its transport. Managed
-        requests use the shared LiteLLM gateway, which selects the model and
-        provider from the signed token. Passthrough requests use an exact-model
-        route with their own endpoint, credentials, and upstream model name.
-        Root and subagent requests follow the same rules.
-
-        Returns:
-            Routing plan for the host-side LLM socket proxy.
-        """
-        # Keep all root/subagent semantics on the executor side. The proxy only
-        # receives model-key routes and does not know which agent emitted them.
-        config = cast(Any, self.input.config)
-        return LLMRoutingPlan(
-            managed_route=LLMRoute(
-                base_url=app_config.TRACECAT__LITELLM_BASE_URL.rstrip("/"),
-                model_provider=config.model_provider,
-                mode="managed",
-                # Managed subagent requests use synthetic LiteLLM route keys, so
-                # the proxy should let LiteLLM do provider-specific body cleanup.
-                local_provider_cleanup=not self.input.subagents,
-                enable_thinking=config.enable_thinking,
-            ),
-            direct_routes=self._direct_passthrough_routes(),
-        )
-
-    def _direct_passthrough_routes(self) -> dict[str, LLMRoute]:
-        """Build direct passthrough routes from each agent's own model config.
-
-        Each entry is keyed by the exact model string the runtime will send in
-        the request body. The proxy can then make a local routing decision
-        without needing to know which agent produced the request.
-
-        A single execution can include a passthrough root agent and multiple
-        passthrough subagents. Passthrough requests go straight to their
-        provider endpoint instead of through managed LiteLLM, so the shared
-        proxy needs one direct route per exact runtime model key rather than
-        one global passthrough destination. Agents without passthrough need no
-        entry here; their requests use the managed route.
-
-        Returns:
-            Direct passthrough routes keyed by request model.
-        """
-        routes: dict[str, LLMRoute] = {}
-        config = cast(Any, self.input.config)
-        if config.passthrough:
-            # Root routing is keyed by the model string the root agent sends.
-            routes[config.model_name] = self._direct_passthrough_route(
-                config.base_url,
-                model_provider=config.model_provider,
-                catalog_id=config.catalog_id,
-                enable_thinking=config.enable_thinking,
-            )
-
-        for subagent in self.input.subagents:
-            config = subagent.config
-            if not config.passthrough:
-                continue
-            # Subagents usually send a synthetic scoped model key. If that subagent
-            # is passthrough, the scoped key should direct-route to its own gateway.
-            request_model = subagent.model_route or get_litellm_route_model(
-                model_provider=config.model_provider,
-                model_name=config.model_name,
-                passthrough=True,
-            )
-            routes[request_model] = self._direct_passthrough_route(
-                config.base_url,
-                model_provider=config.model_provider,
-                catalog_id=config.catalog_id,
-                upstream_model_name=config.model_name,
-                enable_thinking=config.enable_thinking,
-            )
-        return routes
-
-    @staticmethod
-    def _direct_passthrough_route(
-        base_url: str | None,
-        *,
-        model_provider: str,
-        catalog_id: uuid.UUID | None,
-        upstream_model_name: str | None = None,
-        enable_thinking: bool = True,
-    ) -> LLMRoute:
-        """Create one direct passthrough route.
-
-        Args:
-            base_url: Resolved provider base URL.
-            model_provider: Provider behind the direct route.
-            catalog_id: Optional provider catalog row for credentials.
-            upstream_model_name: Optional model name to send to the upstream.
-            enable_thinking: This route's own agent config's thinking toggle.
-
-        Returns:
-            Direct route for the model config.
-
-        Raises:
-            AgentPreparationError: If passthrough is enabled without a
-                resolved base URL.
-        """
-        if base_url is None:
-            raise AgentPreparationError(
-                "Model provider passthrough requires a resolved base_url."
-            )
-        return LLMRoute(
-            base_url=base_url,
-            model_provider=model_provider,
-            catalog_id=catalog_id,
-            upstream_model_name=upstream_model_name,
-            enable_thinking=enable_thinking,
         )
 
     async def _resolve_agent_otel_config(self) -> ResolvedAgentOtelConfig:
@@ -1386,13 +1267,10 @@ async def _resolve_and_probe_stdio_config(
     *,
     preset_svc: AgentPresetService,
     integrations_svc: IntegrationService,
-    command: str,
-    args: list[str] | None,
+    server: StdioMCPServer,
     stdio_env: dict[str, str] | None,
-    mcp_integration_id: uuid.UUID,
-    mcp_integration_slug: str,
 ) -> StdioMCPProbeResult:
-    """Resolve env templates, validate, and probe an stdio config on the sandbox.
+    """Resolve env templates, validate, and list an stdio server's tools.
 
     ``stdio_env`` carries template references and workspace-owned plaintext
     config loaded from the saved integration row; secrets are resolved here
@@ -1402,8 +1280,8 @@ async def _resolve_and_probe_stdio_config(
         try:
             stdio_env = await preset_svc.resolve_stdio_env(
                 stdio_env=stdio_env,
-                mcp_integration_id=mcp_integration_id,
-                mcp_integration_slug=mcp_integration_slug,
+                mcp_integration_id=server.mcp_integration_id,
+                mcp_integration_slug=server.name,
             )
         except (TracecatException, ValueError) as exc:
             return StdioMCPProbeResult(
@@ -1414,8 +1292,8 @@ async def _resolve_and_probe_stdio_config(
 
     try:
         integrations_svc.validate_stdio_server_config(
-            command=command,
-            args=args,
+            command=server.command,
+            args=list(server.args),
             env=stdio_env,
         )
     except ValueError as exc:
@@ -1425,11 +1303,25 @@ async def _resolve_and_probe_stdio_config(
             error=sanitize_stdio_probe_error(str(exc), env=stdio_env),
         )
 
-    return await probe_stdio_mcp_tools_in_sandbox(
-        command=command,
-        args=args,
-        env=stdio_env,
-        timeout=MCP_STDIO_PROBE_TIMEOUT_CAP,
+    # An installed runner sees the resolved env. Redact it from the result's
+    # diagnostics before they cross into workflow history.
+    try:
+        result = await get_stdio_mcp_runner().list_tools(server, stdio_env)
+    except Exception as exc:
+        return StdioMCPProbeResult(
+            success=False,
+            message="Failed to run stdio MCP probe",
+            error=sanitize_stdio_probe_error(
+                f"{type(exc).__name__}: {exc}", env=stdio_env
+            ),
+        )
+    return result.model_copy(
+        update={
+            "message": sanitize_stdio_probe_error(result.message, env=stdio_env),
+            "error": sanitize_stdio_probe_error(result.error, env=stdio_env)
+            if result.error is not None
+            else None,
+        }
     )
 
 
@@ -1467,11 +1359,15 @@ async def probe_stdio_mcp_connection_activity(
         result = await _resolve_and_probe_stdio_config(
             preset_svc=preset_svc,
             integrations_svc=integrations_svc,
-            command=integration.stdio_command,
-            args=integration.stdio_args,
+            server=StdioMCPServer(
+                workspace_id=integration.workspace_id,
+                mcp_integration_id=integration.id,
+                name=integration.slug,
+                command=integration.stdio_command,
+                args=tuple(integration.stdio_args or ()),
+                timeout=integration.timeout,
+            ),
             stdio_env=integrations_svc.decrypt_stdio_env(integration),
-            mcp_integration_id=integration.id,
-            mcp_integration_slug=integration.slug,
         )
         activity.heartbeat(f"Finished stdio MCP probe: {input.mcp_integration_id}")
         return result
