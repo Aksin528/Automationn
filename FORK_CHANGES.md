@@ -100,7 +100,8 @@ Upstream added `TRACECAT__TRUSTED_PROXY_CIDRS` (default `127.0.0.1/32`): set it 
 
 Files that exist only in the fork and are bind-mounted into containers by `docker-compose.override.yml`
 (none of them is in upstream, so they never conflict, but they depend on upstream internals):
-- `ca_wrapper.sh` (api, agent-executor, agent-worker, litellm) and `ca_wrapper_minio_only.sh` (worker, executor):
+- `ca_wrapper.sh` (api, agent-executor, agent-worker, litellm) and `ca_wrapper_minio_only.sh` (worker,
+  background-worker, executor):
   entrypoint that appends `certs/dgk_ca.pem` (company CA) and/or `caddy_certs/server.crt` (self-signed MinIO/Caddy
   certificate) to the `certifi` bundle on every start, then runs the original command with `exec "$@"`.
   Until 1.0.x the last line called `/app/entrypoint.sh`; upstream deleted that script (#3147), so 1.2.1 images
@@ -157,7 +158,10 @@ DB (workflows, `run_python` scripts, tables, presets), which is not in git.
 8. `ca_wrapper*.sh`: check that the upstream `Dockerfile` still has no `ENTRYPOINT` (or that the wrapper still
    hands over to it correctly); after `up -d` no container may be in `Restarting`.
 9. `docker-compose.override.yml`: compare the pinned MinIO image and the list of mounted files with upstream's
-   `docker-compose.yml` (a renamed service or a moved file breaks the mount silently).
+   `docker-compose.yml` (a renamed service or a moved file breaks the mount silently). A new upstream service
+   arrives with upstream's `image:` line without a conflict (1.3.1 `background-worker`): `grep -n 'image:'
+   docker-compose.yml` must show `ghcr.io/aksin528/...` for every Tracecat service, and the service needs the
+   same override block as `worker`.
 10. Custom LLM source (Qwen/vLLM): 1.2.1 added a per-source `passthrough` flag (`agent_custom_provider.passthrough`,
     default false). Sources created before 1.2.1 keep `false`, so agent requests go through the managed LiteLLM and
     vLLM answers `System message must be at the beginning` (HTTP 400, `invalid_request_error`). After the update:

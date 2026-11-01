@@ -45,6 +45,14 @@ services:
       - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
     entrypoint: ["/bin/bash", "/ca_wrapper_minio_only.sh"]
 
+  background-worker:
+    volumes:
+      - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
+      - ./ca_wrapper_minio_only.sh:/ca_wrapper_minio_only.sh:ro
+      - ./defaults.py:/app/tracecat/tiers/defaults.py:ro
+      - ./defaults.py:/app/.venv/lib/python3.12/site-packages/tracecat/tiers/defaults.py:ro
+    entrypoint: ["/bin/bash", "/ca_wrapper_minio_only.sh"]
+
   executor:
     volumes:
       - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
