@@ -62,6 +62,9 @@ services:
     entrypoint: ["/bin/bash", "/ca_wrapper_minio_only.sh"]
 
   agent-executor:
+    environment:
+      # cap on max_tokens for custom-model-provider routes (read by llm_proxy.py)
+      TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP: ${TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP:-16384}
     volumes:
       - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
       - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro
@@ -72,6 +75,8 @@ services:
     entrypoint: ["/bin/bash", "/ca_wrapper.sh"]
 
   agent-worker:
+    environment:
+      TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP: ${TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP:-16384}
     volumes:
       - ./certs/dgk_ca.pem:/tmp/dgk_ca.pem:ro
       - ./caddy_certs/server.crt:/tmp/minio_ca.pem:ro

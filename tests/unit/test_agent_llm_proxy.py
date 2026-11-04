@@ -3049,3 +3049,21 @@ def test_build_llm_routing_plan_passes_enable_thinking_to_every_route() -> None:
         ).managed_route.enable_thinking
         is True
     )
+
+
+def test_custom_model_provider_clamps_max_tokens_to_the_configured_cap() -> None:
+    """The CLI asks for ~32000 tokens; a custom-model-provider route clamps that to
+    the configured cap (TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP) and leaves a smaller
+    request alone. Other providers are not touched."""
+    cap = llm_proxy._CUSTOM_MODEL_PROVIDER_MAX_TOKENS_CAP
+    custom = LLMRoute(
+        base_url="https://llm.example.test/v1", model_provider="custom-model-provider"
+    )
+
+    clamped = custom._forward_data({"max_tokens": cap + 1000})
+    assert clamped is not None
+    assert clamped["max_tokens"] == cap
+    assert custom._forward_data({"max_tokens": 100}) is None
+
+    other = LLMRoute(base_url="https://llm.example.test/v1", model_provider="openai")
+    assert other._forward_data({"max_tokens": cap + 1000}) is None

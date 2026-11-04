@@ -108,8 +108,14 @@ LLM_SOCKET_NAME = "llm.sock"
 MAX_BODY_SIZE = 10 * 1024 * 1024
 
 # TEMPORARY: cap on requested max_tokens forwarded to custom-model-provider
-# routes. See usage in LLMRoute._forward_data for context.
-_CUSTOM_MODEL_PROVIDER_MAX_TOKENS_CAP = 4096
+# routes. See usage in LLMRoute._forward_data for context. It was a fixed 4096
+# (sized for small-context Ollama models); a large-context vLLM model cut about
+# 2% of the agent answers there, so it is now TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP
+# (default 16384). Read here, not in config.py, because this file is bind-mounted
+# into the agent containers while config.py is part of the image.
+_CUSTOM_MODEL_PROVIDER_MAX_TOKENS_CAP = int(
+    os.environ.get("TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP") or 16384
+)
 
 # Non-critical endpoints that should not trigger fatal errors on failure.
 _NON_CRITICAL_PATHS = frozenset(

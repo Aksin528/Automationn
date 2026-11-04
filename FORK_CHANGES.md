@@ -49,11 +49,14 @@ Used by: Telegram approval workflows and the DB workflow `Auto-reject stale appr
 `tracecat/agent/sandbox/llm_proxy.py`: `LLMRoute.enable_thinking`; for `custom-model-provider` routes with
 thinking off the proxy sends `thinking: disabled` and `chat_template_kwargs: {enable_thinking: false}` (vLLM
 ignores the Anthropic-shaped field; without this Qwen3 answers start with a `<think>` block), and caps
-`max_tokens` at 4096. Since 1.3.1 the routing plan is built in `llm_proxy.build_llm_routing_plan` /
+`max_tokens` at `TRACECAT__CUSTOM_MODEL_MAX_TOKENS_CAP` (default 16384; it was a fixed 4096 until 2026-11-04,
+when it cut about 2.4% of the agent answers on prod: `stop_reason: max_tokens` in `agent_session_history`, vLLM
+`finished_reason="length"`). The variable is read in `llm_proxy.py` itself and passed to `agent-executor` and
+`agent-worker` by `docker-compose.override.yml`, so changing it needs no image rebuild. Since 1.3.1 the routing plan is built in `llm_proxy.build_llm_routing_plan` /
 `_direct_passthrough_route(s)` (upstream moved it out of `executor/activity.py`); the fork passes
 `enable_thinking` there for the managed route and every root/subagent passthrough route. 1.3.1 has no own fix
 (no `chat_template_kwargs` anywhere): **upstream PR candidate** (tests: the three `test_custom_model_provider_*`
-tests and `test_build_llm_routing_plan_passes_enable_thinking_to_every_route`).
+tests, `test_custom_model_provider_clamps_max_tokens_to_the_configured_cap` and `test_build_llm_routing_plan_passes_enable_thinking_to_every_route`).
 `tracecat/agent/service.py` (+36: `resolve_catalog_id`), `agent/session/title_generator.py` (+25),
 `agent/litellm_config.yaml` (`ssl_verify: false` only), `agent/provider/service.py` (+2: 404 on `/models` means
 an empty list).
